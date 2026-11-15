@@ -49,11 +49,13 @@ public struct FrameRate: Sendable, Hashable, CustomStringConvertible {
     public var numerator: Int32
     public var denominator: Int32
 
-    public init(numerator: Int32, denominator: Int32) {
+    public init(numerator: Int64, denominator: Int64) {
         precondition(numerator > 0 && denominator > 0, "frame rate must be positive")
-        let g = Self.gcd(Int64(numerator), Int64(denominator))
-        self.numerator = Int32(Int64(numerator) / g)
-        self.denominator = Int32(Int64(denominator) / g)
+        let g = Self.gcd(numerator, denominator)
+        let n = numerator / g, d = denominator / g
+        precondition(n <= Int64(Int32.max) && d <= Int64(Int32.max), "frame rate does not fit Int32")
+        self.numerator = Int32(n)
+        self.denominator = Int32(d)
     }
 
     public static let ntscFilm = FrameRate(numerator: 24_000, denominator: 1_001)     // 23.976
@@ -68,9 +70,19 @@ public struct FrameRate: Sendable, Hashable, CustomStringConvertible {
     /// n 帧めのフレーム先頭にあるべき時刻。丸めを積算しないため、長尺でも_drift_が出ない（01 §2）。
     public func presentationTime(frameIndex n: Int64, timescale: Int32) -> MediaTime {
         let num = CMTimeValue(n) * CMTimeValue(timescale) * CMTimeValue(denominator)
-        let den = CMTimeValue(numerator)
-        let value = Self.divideRoundHalfEven(num, den)
+        let value = MediaMath.roundHalfEvenDivide(num, CMTimeValue(numerator))
         return CMTime(value: value, timescale: timescale)
+    }
+
+    /// 2 つの有理数の積。既約に保つ（MPEG-2 の frame_rate = code × (extension+1) の導出に使う）。
+    public func multiplying(_ other: FrameRate) -> FrameRate {
+        FrameRate(numerator: Int64(numerator) * Int64(other.numerator),
+                  denominator: Int64(denominator) * Int64(other.denominator))
+    }
+
+    /// 符号なし整数値から作る（MPEG-2 の frame_rate_code など既知の小さい値からの構築）。
+    public init(value: Int32) {
+        self.init(numerator: Int64(value), denominator: 1)
     }
 
     /// 指定時刻を含むフレーム番号の近似（`presentationTime(frameIndex:)` の逆関数）。
@@ -205,4 +217,108 @@ public enum MediaMath {
         if r != 0 && ((r > 0) == (b > 0)) { return q + 1 }
         return q
     }
+}
+
+/// ビット列の小さなリーダ。MPEG-2 のヘッダ解析など、byte 境界に落ちない語を読むために使う（01 §2）。
+/// 境界外読みは nil を返す（例外を投げない。壊れたストリームは「読めなかった」扱う）。
+public struct BitReader: Sendable {
+    private let bytes: [UInt8]
+    private var bitIndex: Int = 0
+
+    public init(_ data: Data) { bytes = [UInt8](data) }
+    public init(_ bytes: [UInt8]) { self.bytes = bytes }
+
+    public var bitsRead: Int { bitIndex }
+    public var remainingBits: Int { bytes.count * 8 - bitIndex }
+
+    /// 先頭から 32 bit 先読みする（start code 探索用。消費しない）。
+    public func peekBits(_ count: Int) -> UInt32? {
+        guard count >= 0, count <= 32, remainingBits >= count else { return nil }
+        var value: UInt32 = 0
+        for i in 0..<count {
+            let bit = bitIndex + i
+            let byte = bytes[bit / 8]
+            let flag = UInt32((byte >> UInt8(7 - (bit % 8))) & 1)
+            value = (value << 1) | flag
+        }
+        return value
+    }
+
+    public mutating func readBits(_ count: Int) -> UInt32? {
+        guard let v = peekBits(count) else { return nil }
+        bitIndex += count
+        return v
+    }
+
+    public mutating func skipBits(_ count: Int) -> Bool {
+        guard remainingBits >= count else { return false }
+        bitIndex += count
+        return true
+    }
+
+    /// byte 境界まで進める（MPEG-2 の user_data / extension_and_user_data の後に必要）。
+    public mutating func alignToByte() -> Bool {
+        let pad = (8 - (bitIndex % 8)) % 8
+        return skipBits(pad)
+    }
+
+    /// MPEG-2 の start code（24 bit の 0x000001 + 6 bit の stream_id）を探す。
+    /// 見つけた位置（次の payload の先頭 bit）を返す。見つからなければ nil。
+    public mutating func advanceToStartCode() -> Int? {
+        while remainingBits >= 32 {
+            if let v = peekBits(32), v & 0xFFFFFF00 == 0x0000_0100 {
+                bitIndex += 32
+                return bitIndex
+            }
+            bitIndex += 8
+        }
+        return nil
+    }
+
+    /// `picture_start_code` の直後など、32 bit を読み飛ばす。
+    public mutating func readStartCode() -> UInt8? {
+        guard let v = readBits(24), v == 0x0000_01 else { return nil }
+        return UInt8(truncatingIfNeeded: readBits(8) ?? 0)
+    }
+}
+
+extension MediaMath {
+    /// 16 bit の 2 の補数を Int に直す（MPEG-2 の offset / extension の符号付き語）。
+    public static func signed16(_ value: UInt32) -> Int {
+        let v = Int(value & 0xFFFF)
+        return v >= 0x8000 ? v - 0x1_0000 : v
+    }
+}
+
+/// 既知の標準レートに一致する場合だけ、その有理数値を返す（01 §2）。
+/// 容器が frame rate を渡さない素材（MPEG-PS など）で、PTS の積算から特定する用途。
+/// 標準に一致しない場合は nil を返す（推測で近い標準に倒さない。呼び出し側が `.formatRejected` で断る）。
+/// sample の PTS 列からフレームレート特定する（01 §2 の追加経路）。
+///
+/// 実測（docs/experiments/EXP-001）: AVFoundation の sample 列は **decode 順**（B 帧のある素材では
+/// PTS が昇順ではない）。先頭と末尾の差分で割ると GOP 構造で値が壊れる。PTS を重複除去して整列させ、
+/// 中央値ではなく「フレーム間隔の分布」ではなく **総フレーム数 / 総時間** で測る
+/// （GOP 内で間隔が不均一でも平均はレートに収束するため）。
+public func frameRate(fromPTSs pts: [MediaTime]) -> FrameRate? {
+    guard pts.count >= 8, let scale = pts.first?.timescale, scale != 0 else { return nil }
+    let unique = Set(pts.filter { $0.timescale == scale }.map(\.value)).sorted()
+    guard unique.count >= 8 else { return nil }
+    let frameCount = unique.count - 1
+    let spanSeconds = Double(unique.last! - unique.first!) / Double(scale)
+    guard spanSeconds > 0, spanSeconds.isFinite else { return nil }
+    let measuredFPS = Double(frameCount) / spanSeconds
+    guard measuredFPS > 0, measuredFPS.isFinite else { return nil }
+    let thousandth = FrameRate(numerator: 1_000, denominator: 1_001)
+    let candidates = [
+        FrameRate.film24,
+        FrameRate.film24.multiplying(thousandth),
+        FrameRate.pal,
+        FrameRate(value: 25).multiplying(thousandth),
+        FrameRate(value: 30).multiplying(thousandth),
+        FrameRate(value: 30),
+    ]
+    for candidate in candidates where abs(measuredFPS - candidate.framesPerSecond) / candidate.framesPerSecond < 2e-4 {
+        return candidate
+    }
+    return nil
 }

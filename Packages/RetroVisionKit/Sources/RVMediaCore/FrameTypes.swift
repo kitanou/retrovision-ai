@@ -33,6 +33,27 @@ public final class DecodedVideoFrame: @unchecked Sendable {
     /// 使用中であることを示すトークンを取る。返却前に離すと診断に出る。
     public func retainForUse(reason: String) -> FrameLeaseToken { lease.acquire(reason: reason) }
     public var activeLeaseCount: Int { lease.count }
+
+    /// 復号器・生成側からの作成入口。`pool` を渡すと、lease が尽きた時点でプールに返却される（04 §3）。
+    /// 返却先にプールが無い（VT の出力 pool など外部管理）場合は nil のままでもよい。
+    public static func make(id: FrameID, pixelBuffer: CVPixelBuffer, format: VideoFormatDescription,
+                            pts: MediaTime, duration: MediaTime, isKey: Bool,
+                            onLeaseViolation: (([String: String]) -> Void)? = nil) -> DecodedVideoFrame {
+        let handler: ([String: String]) -> Void = onLeaseViolation ?? { _ in }
+        return DecodedVideoFrame(id: id, pixelBuffer: pixelBuffer, format: format, pts: pts,
+                                 duration: duration, isKey: isKey,
+                                 lease: FrameLease(frameID: id, onViolation: handler))
+    }
+}
+
+/// CVPixelBuffer プールからの返却口。復号側が pool を保持していることを示すための薄い契約（04 §3）。
+public protocol PixelBufferPoolHost: Sendable {
+    func recycle(_ buffer: CVPixelBuffer)
+}
+
+extension DecodedVideoFrame {
+    /// 資源の返却可否（プール返却前に呼ぶ。lease が残っている場合は診断に残り、上書きはされない。01 §4）。
+    public func canRecycleIntoPool() -> Bool { lease.assertReleased() }
 }
 
 /// 資源の寿命管理。実数はアトミックに保つ（ロックを取らない）。

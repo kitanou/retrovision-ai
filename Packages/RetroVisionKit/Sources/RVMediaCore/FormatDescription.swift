@@ -7,19 +7,22 @@ public struct VideoFormatDescription: Sendable, Hashable {
     public var statedCleanAperture: PixelRect?
     /// サンプルアスペクト比の断片（BT.601 NTSC / PAL など）。解決は AspectResolver が行う。
     public var sampleAspect: AspectRatio?
-    public var frameRate: FrameRate
+    public var frameRate: FrameRate?
     public var interlace: InterlaceInfo
     public var color: ColorInfo
     /// MPEG-2 display extension / DVD flag などの比率指示。
     public var aspectSignals: AspectSignals
+    /// 容器が示した codec code（'mp2v' など）。診断表示用で、挙動の分岐には使わない（04 §2）。
+    public var rawFormatType: UInt32
 
     public init(codedSize: PixelSize,
                 statedCleanAperture: PixelRect? = nil,
                 sampleAspect: AspectRatio? = nil,
-                frameRate: FrameRate,
+                frameRate: FrameRate? = nil,
                 interlace: InterlaceInfo = .progressive,
                 color: ColorInfo = .unspecified,
-                aspectSignals: AspectSignals = AspectSignals()) {
+                aspectSignals: AspectSignals = AspectSignals(),
+                rawFormatType: UInt32 = 0) {
         self.codedSize = codedSize
         self.statedCleanAperture = statedCleanAperture
         self.sampleAspect = sampleAspect
@@ -27,6 +30,7 @@ public struct VideoFormatDescription: Sendable, Hashable {
         self.interlace = interlace
         self.color = color
         self.aspectSignals = aspectSignals
+        self.rawFormatType = rawFormatType
     }
 
     /// known standard からのサンプルアスペクト比推定（05 §6 の 3）。
@@ -40,21 +44,34 @@ public struct VideoFormatDescription: Sendable, Hashable {
 }
 
 public struct InterlaceInfo: Sendable, Hashable {
+    /// field 情報がどこから取れたか（04 §3 の OQ-08 判定に使う。失われた場合物語で区別する）。
+    public enum FieldSource: String, Sendable {
+        case none                       // progressive
+        case formatDescription          // container / bitstream の descriptor
+        case decodedBufferAttachment    // 復号出力の pixel buffer に付いていた
+        case guessedByDetector          // 05 §5 の detector による推定（assumption を plan に焼き込む）
+        case lostByDecoder              // 復号器が失った（weave を避ける判断に使う）
+    }
+
     public var fieldCount: Int16
     public var fieldOrder: FieldOrder
     public var cadence: Cadence
+    public var fieldSource: FieldSource
 
-    public init(fieldCount: Int16, fieldOrder: FieldOrder, cadence: Cadence) {
+    public init(fieldCount: Int16, fieldOrder: FieldOrder, cadence: Cadence,
+                fieldSource: FieldSource = .none) {
         self.fieldCount = fieldCount
         self.fieldOrder = fieldOrder
         self.cadence = cadence
+        self.fieldSource = fieldSource
     }
 
     public static let progressive = InterlaceInfo(fieldCount: 0, fieldOrder: .progressive, cadence: .progressive)
     public static let ntscInterlaced = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22)
     public static let palInterlaced = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22)
     public static let telecine = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .telecine32)
-    public static let unknown = InterlaceInfo(fieldCount: 2, fieldOrder: .unknown, cadence: .unknown)
+    public static let unknown = InterlaceInfo(fieldCount: 2, fieldOrder: .unknown, cadence: .unknown,
+                                             fieldSource: .formatDescription)
 
     public var isInterlaced: Bool { fieldCount == 2 }
 }
@@ -92,36 +109,75 @@ public struct ColorInfo: Sendable, Hashable {
     }
 
     /// SD DVD の MPEG-2 で最も多い構成。assumption なので isStated = false。
+    /// （合成 fixture でも color attachments は付かなかった。実測は docs/experiments/EXP-001）
     public static let unspecified = ColorInfo(primaries: .unspecified, transfer: .unspecified,
                                              matrix: .unspecified, range: .videoRange, isStated: false)
-    public static let bt601VideoRange = ColorInfo(primaries: .bt601, transfer: .bt709,
-                                                  matrix: .bt601, range: .videoRange, isStated: true)
+    /// BT.601 系（NTSC = SMPTE C、PAL = EBU 3213）で確実だと分かったときの表記。
+    public static let bt601VideoRange = ColorInfo(primaries: .bt601SMPTEC, transfer: .bt709OrBT601,
+                                                  matrix: .bt601_4, range: .videoRange, isStated: true)
 }
 
-public enum ColorPrimaries: String, Sendable { case bt601, bt709, smpte240, unspecified }
-public enum TransferFunction: String, Sendable { case bt709, gamma22, linear, unspecified }
-public enum MatrixCoefficients: String, Sendable { case bt601, bt709, fcc, unspecified }
+/// 色域。CoreVideo / CoreMedia の attachment 文字列と 1 対 1 で対応取る（01 §2）。
+public enum ColorPrimaries: String, Sendable {
+    case bt709
+    /// PAL 系 BT.601（kCVImageBufferColorPrimaries_EBU_3213）。
+    case bt601EBU
+    /// NTSC 系 BT.601（kCVImageBufferColorPrimaries_SMPTE_C）。
+    case bt601SMPTEC
+    case smpte240m
+    case bt2020
+    case unspecified
+
+    /// YCbCr→RGB の行列の仮定として BT.601 系かどうか（05 §3）。
+    public var isBT601Family: Bool { self == .bt601EBU || self == .bt601SMPTEC }
+}
+
+public enum TransferFunction: String, Sendable {
+    /// BT.709 と BT.601 の転送特性は同一（525/625 ラインのガマ特性）。
+    case bt709OrBT601
+    case gamma22
+    case gamma18
+    case linear
+    case sRGB
+    case pq
+    case hlg
+    case unspecified
+}
+
+public enum MatrixCoefficients: String, Sendable {
+    case bt601_4
+    case bt709_2
+    case smpte240M
+    case fcc
+    case bt2020NonConstantLuminance
+    case unspecified
+}
 public enum YCbCrRange: String, Sendable { case videoRange, fullRange }
 
 /// 音声トラックの記述（#4）。
 public struct AudioFormatDescription: Sendable, Hashable {
     public enum Codec: String, Sendable { case ac3, dts, lpcm16, aac, mp1, mp2, mp3, unknown }
     public var codec: Codec
+    /// 容器が示した codec code。`.unknown` のときに診断で実コードを表示できる（04 §2）。
+    public var rawFormatType: UInt32
     public var sampleRate: Int32
     public var channelCount: Int32
     public var bitDepth: Int32?
     public var bitrate: Int32?
     public var language: String?
 
-    public init(codec: Codec, sampleRate: Int32, channelCount: Int32,
+    public init(codec: Codec, rawFormatType: UInt32 = 0, sampleRate: Int32, channelCount: Int32,
                 bitDepth: Int32? = nil, bitrate: Int32? = nil, language: String? = nil) {
         self.codec = codec
+        self.rawFormatType = rawFormatType
         self.sampleRate = sampleRate
         self.channelCount = channelCount
         self.bitDepth = bitDepth
         self.bitrate = bitrate
         self.language = language
     }
+
+    public var rawFormatTypeString: String { FourCC.string(rawFormatType) }
 }
 
 /// 字幕トラックの記述（04 §7）。

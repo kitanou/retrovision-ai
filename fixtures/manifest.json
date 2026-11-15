@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "root": "unresolved://retrovision-fixtures/v0/",
-  "notes": "素材は Git に載せない。取得と sha256 検証は Scripts/check-fixtures.py で検査する（09 §2）。storage が未決のため status=pending の間は CI でスキップ扱い。",
+  "notes": "素材マニフェスト（09 §2）。実在素材（status=pending）の取得元とライセンスは未決のまま。合成素材（status=generated・kind=generatedFile）は Scripts/gen-fixtures.sh で生成し、生成物自体は Git に載せる（第三者権利なし。再生成の bit 一致は ffmpeg 版に依存するため、sha256 は記録値として扱いテスト実行時の照合はしない）。統合テスト（RVDecodeTests）は generated 素材の実在を要求する（欠けていれば失敗）。",
   "fixtures": [
     {
       "id": "ntsc480i-mixed-01",
@@ -9,7 +9,14 @@
       "kind": "videoTsFolder",
       "sha256": null,
       "seconds": 60,
-      "properties": ["interlaced22", "4x3", "mpeg2", "ac3", "spuSubtitle", "blockNoise"],
+      "properties": [
+        "interlaced22",
+        "4x3",
+        "mpeg2",
+        "ac3",
+        "spuSubtitle",
+        "blockNoise"
+      ],
       "license": "unresolved",
       "expectations": {
         "cadence": "interlaced22",
@@ -26,7 +33,12 @@
       "kind": "videoTsFolder",
       "sha256": null,
       "seconds": 60,
-      "properties": ["interlaced22", "4x3", "mpeg2", "pcm"],
+      "properties": [
+        "interlaced22",
+        "4x3",
+        "mpeg2",
+        "pcm"
+      ],
       "license": "unresolved",
       "expectations": {
         "cadence": "interlaced22",
@@ -41,9 +53,16 @@
       "kind": "videoTsFolder",
       "sha256": null,
       "seconds": 30,
-      "properties": ["telecine32", "filmBased", "4x3"],
+      "properties": [
+        "telecine32",
+        "filmBased",
+        "4x3"
+      ],
       "license": "unresolved",
-      "expectations": { "cadence": "telecine32", "inverseTelecineTarget": "24p" }
+      "expectations": {
+        "cadence": "telecine32",
+        "inverseTelecineTarget": "24p"
+      }
     },
     {
       "id": "animation-480i-01",
@@ -51,9 +70,15 @@
       "kind": "videoTsFolder",
       "sha256": null,
       "seconds": 30,
-      "properties": ["lineArt", "flatAreas", "interlaced22"],
+      "properties": [
+        "lineArt",
+        "flatAreas",
+        "interlaced22"
+      ],
       "license": "unresolved",
-      "expectations": { "cadence": "interlaced22" }
+      "expectations": {
+        "cadence": "interlaced22"
+      }
     },
     {
       "id": "progressive-sd-mp4-01",
@@ -61,9 +86,14 @@
       "kind": "plainFile",
       "sha256": null,
       "seconds": 30,
-      "properties": ["progressive", "h264"],
+      "properties": [
+        "progressive",
+        "h264"
+      ],
       "license": "unresolved",
-      "expectations": { "cadence": "progressive" }
+      "expectations": {
+        "cadence": "progressive"
+      }
     },
     {
       "id": "damaged-video-ts-01",
@@ -71,9 +101,18 @@
       "kind": "videoTsFolder",
       "sha256": null,
       "seconds": 10,
-      "properties": ["missingVOB", "unreadableIFO"],
+      "properties": [
+        "missingVOB",
+        "unreadableIFO"
+      ],
       "license": "unresolved",
-      "expectations": { "structureWarnings": ["missingVOB", "unreadableIFO"], "mustNotCrash": true }
+      "expectations": {
+        "structureWarnings": [
+          "missingVOB",
+          "unreadableIFO"
+        ],
+        "mustNotCrash": true
+      }
     },
     {
       "id": "damaged-iso-01",
@@ -81,9 +120,273 @@
       "kind": "discImage",
       "sha256": null,
       "seconds": 10,
-      "properties": ["malformedStructure"],
+      "properties": [
+        "malformedStructure"
+      ],
       "license": "unresolved",
-      "expectations": { "error": "malformedStructure", "mustNotCrash": true }
+      "expectations": {
+        "error": "malformedStructure",
+        "mustNotCrash": true
+      }
+    },
+    {
+      "id": "ntsc480i-22-01",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "5fa64cddcbfdc4f68dd066729c50fb37e381e51294fa505cb8f822fff31b151c",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "interlaced22",
+        "4x3",
+        "720x480"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/ntsc480i-22-01.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "fieldCount": 2,
+        "fieldOrderFromBitstream": "bottom-first",
+        "targetDAR": "4:3"
+      }
+    },
+    {
+      "id": "ntsc480i-22-01-in-mp4",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "b3fa2a561a12620f5bcc09e3d21210fe5ec9398c854f78a4a8ac02bb50a1c3ff",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "interlaced22",
+        "4x3",
+        "mp4Container"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/ntsc480i-22-01-in-mp4.mp4",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "fieldCount": 2,
+        "containerFieldDetailPresent": true
+      }
+    },
+    {
+      "id": "pal576i-22-01",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "e0ffd88a87e43de241e6b55c747ec7d8f4f839ef26cc185152b23351f39cfb69",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "interlaced22",
+        "4x3",
+        "720x576"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/pal576i-22-01.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x576",
+        "frameRate": "25/1",
+        "fieldCount": 2,
+        "fieldOrderFromBitstream": "bottom-first",
+        "targetDAR": "4:3"
+      }
+    },
+    {
+      "id": "film24p-01",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "4d3d2246a996a7d0cc473eb7f7165f763d2a203c8c48026c54499e186933f4f9",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "progressive24",
+        "720x480"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/film24p-01.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "24/1",
+        "progressiveSequence": true
+      }
+    },
+    {
+      "id": "telecine-32-generated",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "eddfc1fed7cf7d19cd425ff19d0daf29001640da9bd01f07a470637880f9780f",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "telecine32",
+        "720x480"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/telecine-32-01.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "fieldCount": 2,
+        "perPictureCadenceFlags": true
+      }
+    },
+    {
+      "id": "ntsc480i-h264-generated",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "f9ef57fbc002bcbfe42c166ed1f582d7078e5c30501cf174a1add81ede788bc6",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "h264",
+        "tffEncoded",
+        "yuv420p",
+        "720x480"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/ntsc480i-h264-01.mp4",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "decoderFieldSignals": "lost (EXP-001 F11)"
+      }
+    },
+    {
+      "id": "progressive-sd-mp4-generated",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "3b084484c40cd9d0ae2e80197bd26424537f727738b635e173215c8869b9495b",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "h264",
+        "progressive"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/progressive-sd-mp4-01.mp4",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "progressive": true
+      }
+    },
+    {
+      "id": "ntsc480i-ac3-generated",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "80bd81ee36c4f4d5a057092fd00d9f2a5eb89c06230b0dae81eb9f64698cd0ce",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "ac3",
+        "interlaced22"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/ntsc480i-ac3-01.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "audioTracks": 1,
+        "audioCodec": "ac3"
+      }
+    },
+    {
+      "id": "truncated-01",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "dc70918e34b98aa6dc793ae01891fc584f3aa47009311bda9ddfa16f6644b637",
+      "seconds": 4,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "truncated"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/truncated-01.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "frameRate": "30000/1001",
+        "mustEndCleanly": true
+      }
+    },
+    {
+      "id": "truncated-01-cut",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "8e8fd4ad0fe1cdd7e323fd2fdf0e1a978f62d62343b5d749b6fcd12d148f155c",
+      "seconds": 1,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "corruptCut"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/truncated-01-cut.mpg",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "mustEndWithoutError": true,
+        "demuxedSampleCountRange": [
+          1,
+          59
+        ]
+      }
     }
   ]
 }

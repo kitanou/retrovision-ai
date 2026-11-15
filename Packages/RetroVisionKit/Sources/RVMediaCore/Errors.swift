@@ -60,7 +60,11 @@ public enum AlternativeStrategy: Sendable, Hashable {
 public struct StructureWarning: Sendable, Hashable {
     public enum Code: String, Sendable, Codable {
         case ifoShorterThanVob, missingVOB, unreadableIFO, aspectMismatch,
-             unknownAudioCodec, unsupportedSubtitleCodec
+             unknownAudioCodec, unsupportedSubtitleCodec,
+             /// 映像トラックが無い（容器は読めたが再生できない）。
+             noVideoTrack,
+             /// 容器そのものが読めない。FFmpeg shim での対応判断材料にする（OQ-02）。
+             containerUnreadable
     }
     public let code: Code
     public let detail: String

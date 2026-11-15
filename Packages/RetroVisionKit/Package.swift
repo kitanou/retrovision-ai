@@ -1,10 +1,10 @@
 // swift-tools-version:6.0
 // RetroVisionKit — 設計 docs/design/00-architecture.md §2 のモジュール分割に対応する。
 //
-// 現在の状態（Phase 0）:
+// 現在の状態:
 //   - FFmpeg / libdvdnav / libdvdread の C ターゲットは未作成。
-//     導入形態が決まるまで置かない（docs/design/10-open-questions.md の OQ-01 / OQ-02）。
-//     対応モジュール（RVDecode / RVMediaSources）はプロトコルと純粋ロジックのみを持つ。
+//     AVFoundation / VideoToolbox で足りる範囲を先に実装し、足りない箇所が確定してから C シムを追加する
+//     （docs/design/10-open-questions.md の OQ-01 / OQ-02。実験結果は docs/experiments/EXP-001）。
 //   - 製品のデプロイメント下限は未決（OQ-12）。CI の実行機に合わせるため、
 //     ここでは macOS 15 を暫定下限とする。
 import PackageDescription
@@ -23,9 +23,10 @@ let package = Package(
         .library(name: "RVMLRuntime", targets: ["RVMLRuntime"]),
         .library(name: "RVEnhancement", targets: ["RVEnhancement"]),
         .library(name: "RVPlaybackEngine", targets: ["RVPlaybackEngine"]),
+        .executable(name: "rvprobe", targets: ["RVDecodeProbe"]),
     ],
     targets: [
-        // 値型のみ。Foundation / CoreMedia 以外の依存を持たない（00 §2）。
+        // 値型のみ。Foundation / CoreMedia / CoreVideo の attachment キー以外の依存を持たない（00 §2）。
         .target(name: "RVMediaCore"),
 
         // メトリクスバスとベンチマーク出力（08）。
@@ -34,7 +35,8 @@ let package = Package(
         // ソース抽象（03）。DVD / ISO の実装は C シムが決まってから追加する。
         .target(name: "RVMediaSources", dependencies: ["RVMediaCore"]),
 
-        // デコード・同期契約（04）。
+        // デコード・同期契約と、AVFoundation / VideoToolbox 経路の実装（04）。
+        // RVMediaSources は import しない（00 §2 の依存規則。構造の語彙は RVMediaCore 側にある）。
         .target(name: "RVDecode", dependencies: ["RVMediaCore"]),
 
         // 描画契約と、純粋ロジック部分（提示パ計画など）（05）。
@@ -58,6 +60,12 @@ let package = Package(
             ]
         ),
 
+        // 能力測定・実験の記録用実行体（docs/experiments/）。再生経路には載せない。
+        .executableTarget(
+            name: "RVDecodeProbe",
+            dependencies: ["RVMediaCore", "RVMediaSources", "RVDecode"]
+        ),
+
         // 境界の機械検査（00 §2 の禁止 import）。
         .testTarget(
             name: "ArchitectureTests",
@@ -68,6 +76,10 @@ let package = Package(
         .testTarget(name: "RVMediaCoreTests", dependencies: ["RVMediaCore"]),
         .testTarget(name: "RVDiagnosticsTests", dependencies: ["RVDiagnostics"]),
         .testTarget(name: "RVVideoPipelineTests", dependencies: ["RVVideoPipeline"]),
+        .testTarget(
+            name: "RVDecodeTests",
+            dependencies: ["RVDecode", "RVMediaCore", "RVMediaSources"]
+        ),
         .testTarget(name: "RVPlaybackEngineTests", dependencies: ["RVPlaybackEngine"]),
     ]
 )

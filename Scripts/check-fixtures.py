@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 REQUIRED_FIXTURE_KEYS = {"id", "status", "kind", "sha256", "seconds", "properties", "license", "expectations"}
-VALID_KINDS = {"videoTsFolder", "discImage", "plainFile", "opticalDisc"}
-VALID_STATUS = {"pending", "available"}
+VALID_KINDS = {"videoTsFolder", "discImage", "plainFile", "opticalDisc", "generatedFile"}
+VALID_STATUS = {"pending", "available", "generated"}
 
 
 def main() -> int:
@@ -56,7 +56,8 @@ def main() -> int:
             print(f"NG: {e}", file=sys.stderr)
         return 1
     if pending:
-        print("NOTE: 素材の取得元（storage）と sha256 が未決です（09 §2）。Phase 1 の統合テストはスキップ扱いになります。")
+        print("NOTE: 実在素材（pending）の取得元（storage）が未決です（09 §2）。"
+              "合成素材（generated）に対する統合テスト（RVDecodeTests）は実行されます。")
     return 0
 
 

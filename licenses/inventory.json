@@ -1,40 +1,40 @@
 {
   "schemaVersion": 1,
-  "notes": "依存とモデルのライセンス記録（#3 #6 #9 の受入基準、09 §6）。status=integrated の項目はすべてのライセンス項目が埋まっていることを CI で検査する。status=planned の項目は TBD のまま許容する（まだリンクされていないため）。",
+  "notes": "依存とモデルのライセンス記録（#3 #6 #9 の受入基準、09 §6）。status=integrated の項目はすべてのライセンス項目が埋まっていることを CI で検査する。status=planned の項目も spdx / version は**実測値**を載せる（期待値や推測を書かない。libdvdread / libdvdnav の MIT 表記は実測（GPL-2.0-or-later）に訂正済み）。",
   "thirdParty": [
     {
       "name": "ffmpeg",
       "status": "planned",
-      "version": "TBD",
-      "spdx": "LGPL-2.1-or-later OR GPL-2.0-or-later（configure により異なる）",
+      "version": "9.0.2（Homebrew。fixture 生成用の dev 利用で、アプリには未リンク）",
+      "spdx": "GPL-3.0-or-later（Homebrew bottle の実測値。自前ビルドでは configure により LGPL-2.1-or-later にもなる）",
       "buildFlagsRecord": "third_party/ffmpeg/build-flags.txt",
-      "distribution": "static / 再配布形は未決（OQ-02）",
+      "distribution": "現時点で配布しない（生成物・テストのみ）。将来リンクする場合は自前ビルドの LGPL/GPL 境界を確定させる（OQ-02）",
       "sourceURL": "https://ffmpeg.org",
       "modified": false,
-      "obligations": ["著作権表記", "ソース提供条件の確認", "configure オプションの記録"],
-      "blockingItems": ["LGPL/GPL の線引きをビルド構成で確定させる", "商標表記の確認"]
+      "obligations": ["リンクする場合の著作権表記・ソース提供条件", "configure オプションの記録"],
+      "blockingItems": ["実測（brew info / EXP-001）: Homebrew 9.0.2 は GPL-3.0-or-later。アプリへ組み込むなら自前ビルドで LGPL/GPL の線引きを確定させる", "商標表記の確認"]
     },
     {
       "name": "libdvdread",
       "status": "planned",
-      "version": "TBD",
-      "spdx": "MIT",
-      "distribution": "static（予定）",
-      "sourceURL": "https://www.videolan.org/developers/libdvdcss.html",
+      "version": "7.1.1（Homebrew にインストール済み。未リンク）",
+      "spdx": "GPL-2.0-or-later（実測: brew info / Homebrew bottle。旧記述の MIT は誤りだった）",
+      "distribution": "static（予定）。GPL のリンク範囲が配布形態を決めるまで未決（OQ-01）",
+      "sourceURL": "https://www.dvdutils.com/",
       "modified": false,
-      "obligations": ["著作権表記"],
-      "blockingItems": ["導入形態の決定（OQ-01）"]
+      "obligations": ["著作権表記", "GPL-2.0-or-later に基づくソース提供（static link は衍生範囲になる）"],
+      "blockingItems": ["導入形態の決定（OQ-01）", "EXP-001 の実測ではファイル再生に不要と確認済み。DVD の IFO/VOB 制御限定の用途に絞る"]
     },
     {
       "name": "libdvdnav",
       "status": "planned",
-      "version": "TBD",
-      "spdx": "MIT",
-      "distribution": "static（予定）",
-      "sourceURL": "https://www.videolan.org/developers/libdvdnav.html",
+      "version": "7.0.0（Homebrew にインストール済み。未リンク）",
+      "spdx": "GPL-2.0-or-later（実測: brew info / Homebrew bottle。旧記述の MIT は誤りだった）",
+      "distribution": "static（予定）。GPL のリンク範囲が配布形態を決めるまで未決（OQ-01）",
+      "sourceURL": "https://www.dvdutils.com/",
       "modified": false,
-      "obligations": ["著作権表記"],
-      "blockingItems": ["menu / angle 解釈を使う範囲の決定（OQ-01）"]
+      "obligations": ["著作権表記", "GPL-2.0-or-later に基づくソース提供（static link は衍生範囲になる）"],
+      "blockingItems": ["menu / angle 解釈を使う範囲の決定（OQ-01）", "静的リンク時の衍生作品范围の確認"]
     },
     {
       "name": "libdvdcss",

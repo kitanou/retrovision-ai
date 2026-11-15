@@ -58,7 +58,9 @@ def main() -> int:
             print(f"NG: {e}", file=sys.stderr)
         return 1
     if integrated == 0:
-        print("NOTE: まだ依存を組み込んでいません（Phase 0 の OQ-01 / OQ-02 が未決）。")
+        print("NOTE: 第三者ライブラリは一つもリンクしていません（実測: docs/experiments/EXP-001 — "
+              "ファイル再生経路は AVFoundation + VideoToolbox で成立）。planned は DVD 制御（OQ-01）と "
+              "フォールバックが必要になった場合の FFmpeg（OQ-02）の調査のみ。")
     return 0
 
 

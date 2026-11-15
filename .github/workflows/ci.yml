@@ -55,4 +55,10 @@ jobs:
       - name: Full test with verbose output
         working-directory: Packages/RetroVisionKit
         run: swift test --parallel
+      - name: Probe measurements over generated fixtures
+        run: make probe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-measurements
+          path: bench/captures/probe-*.json
       # bench-full / quality / model-convert は Phase 1 以降にジョブを追加する（09 §7）。

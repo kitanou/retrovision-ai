@@ -221,7 +221,14 @@ public actor EngineCore {
                                                        userMessage: "計測点のない段が plan に含まれています")))
         }
         // 予算検証（05 §1）。超える plan は作らない。
-        guard plan.budget.isFeasible(for: format.frameRate) else {
+        // frame rate は demux の時点で解決済みであることが前提（01 §2）。unknown のまま plan まで
+        // 来たら作らない（推測で NTSC 扱いにしない）。
+        guard let frameRate = format.frameRate else {
+            throw PlaybackError(kind: .decode(.formatRejected),
+                                recovery: .giveUp(reason: "probe"),
+                                userMessage: "フレームレートが未解決のため再生計画を作れません")
+        }
+        guard plan.budget.isFeasible(for: frameRate) else {
             throw PlaybackError(kind: .internalFailure("budget"),
                                 recovery: .retryWith(.lowerTier),
                                 userMessage: "フレーム予算を超える描画計画です")
