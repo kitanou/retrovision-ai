@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "notes": "依存とモデルのライセンス記録（#3 #6 #9 の受入基準、09 §6）。status=integrated の項目はすべてのライセンス項目が埋まっていることを CI で検査する。status=planned の項目は TBD のまま許容する（まだリンクされていないため）。",
+  "thirdParty": [
+    {
+      "name": "ffmpeg",
+      "status": "planned",
+      "version": "TBD",
+      "spdx": "LGPL-2.1-or-later OR GPL-2.0-or-later（configure により異なる）",
+      "buildFlagsRecord": "third_party/ffmpeg/build-flags.txt",
+      "distribution": "static / 再配布形は未決（OQ-02）",
+      "sourceURL": "https://ffmpeg.org",
+      "modified": false,
+      "obligations": ["著作権表記", "ソース提供条件の確認", "configure オプションの記録"],
+      "blockingItems": ["LGPL/GPL の線引きをビルド構成で確定させる", "商標表記の確認"]
+    },
+    {
+      "name": "libdvdread",
+      "status": "planned",
+      "version": "TBD",
+      "spdx": "MIT",
+      "distribution": "static（予定）",
+      "sourceURL": "https://www.videolan.org/developers/libdvdcss.html",
+      "modified": false,
+      "obligations": ["著作権表記"],
+      "blockingItems": ["導入形態の決定（OQ-01）"]
+    },
+    {
+      "name": "libdvdnav",
+      "status": "planned",
+      "version": "TBD",
+      "spdx": "MIT",
+      "distribution": "static（予定）",
+      "sourceURL": "https://www.videolan.org/developers/libdvdnav.html",
+      "modified": false,
+      "obligations": ["著作権表記"],
+      "blockingItems": ["menu / angle 解釈を使う範囲の決定（OQ-01）"]
+    },
+    {
+      "name": "libdvdcss",
+      "status": "excluded",
+      "version": null,
+      "spdx": "GPL-2.0-or-later",
+      "distribution": "配布しない（保護 Disc の扱いは OQ-03 で決まるまで差し替え可能バックエンドの内側に留める）",
+      "sourceURL": "https://www.videolan.org/developers/libdvdcss.html",
+      "modified": false,
+      "obligations": ["配布する場合のソース開示範囲の確認"],
+      "blockingItems": ["保護 Disc の再生権利と、複号後フレームの処理権の確認（OQ-03）"]
+    }
+  ],
+  "models": [],
+  "modelNotes": "モデルを追加した時点で models に id / revision / spdx / weightsLicense / outputRightsConfirmed を載せる。outputRightsConfirmed=false のモデルは開発ビルドのみで動作し、リリースビルドでは警告を出す（06 §2）。"
+}

@@ -1,0 +1,237 @@
+import Foundation
+import RVDiagnostics
+import RVEnhancement
+import RVMediaCore
+import RVMediaSources
+import RVVideoPipeline
+
+// MARK: - EngineCore（02 §2 の実体）
+//
+// Phase 0 の範囲では、状態機械・設定適用・plan 生成までを持つ。
+// 実際のデコード・描画は RVDecode / RVVideoPipeline の実装が入ってから接続する（Phase 1）。
+
+public actor EngineCore {
+    public struct Deps: Sendable {
+        public var time: any TimeSource
+        public var metrics: MetricHandle
+        public init(time: any TimeSource = SystemTimeSource(), metrics: MetricHandle = MetricHandle()) {
+            self.time = time
+            self.metrics = metrics
+        }
+    }
+
+    /// 計測ハンドル。INV-6 に従い、plan の各段が計測点を持つことを生成時に検査する。
+    public struct MetricHandle: Sendable {
+        public init() {}
+    }
+
+    private var phase: EnginePhase = .empty
+    private var structure: MediaStructure?
+    private var settings = PlayerSettings()
+    private var selection: PlaybackSelection?
+    private var openedSource: OpenedSource?
+
+    /// INV-3: 生成済み plan は差し替えない。新しい plan は frame 境界で切り替える。
+    private var activePlan: RenderPlan?
+    private var pendingPlan: RenderPlan?
+    private var planCounter: UInt64 = 0
+    private var preSeekPhase: EnginePhase?
+    private var controller = AdaptivePolicyEngine()
+    private var continuation: AsyncStream<PlayerEvent>.Continuation?
+    private var stream: AsyncStream<PlayerEvent>?
+
+    public init(deps: Deps = Deps()) {
+        let (s, c) = AsyncStream.makeStream(of: PlayerEvent.self, bufferingPolicy: .bufferingNewest(256))
+        self.stream = s
+        self.continuation = c
+    }
+
+    public func events() -> AsyncStream<PlayerEvent> {
+        if let stream { return stream }
+        let (s, c) = AsyncStream.makeStream(of: PlayerEvent.self, bufferingPolicy: .bufferingNewest(256))
+        self.stream = s
+        self.continuation = c
+        return s
+    }
+
+    public func snapshot() -> PlayerStateSnapshot {
+        var quality = QualityPresentation(requestedTier: settings.enhancement.tier,
+                                         activeTier: controller.state.activeTier)
+        quality.appliedStages = activePlan?.stages.map(\.stage) ?? []
+        return PlayerStateSnapshot(phase: phase,
+                                   position: .zero,
+                                   duration: structure?.items.first?.duration,
+                                   selected: selection,
+                                   available: structure?.items.first?.trackTable ?? [],
+                                   quality: quality)
+    }
+
+    public func currentStructure() -> MediaStructure? { structure }
+    public func currentPlan() -> RenderPlan? { activePlan }
+
+    // MARK: 開く
+
+    public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws {
+        transition(to: .preparing)
+        self.selection = selection
+        do {
+            let opened = try await source.open()
+            self.openedSource = opened
+            self.structure = opened.structure
+            continuation?.yield(.structureChanged(opened.structure))
+            continuation?.yield(.tracksChanged(opened.structure.items.first?.trackTable ?? []))
+            try rebuildPlan()
+            transition(to: .ready)
+        } catch let error as PlaybackError {
+            transition(to: .failed(error))
+            throw error
+        } catch {
+            let wrapped = PlaybackError(kind: .source(.unreadable),
+                                       causeDescription: String(describing: error),
+                                       recovery: .giveUp(reason: "open"),
+                                       userMessage: "メディアを開けません")
+            transition(to: .failed(wrapped))
+            throw wrapped
+        }
+    }
+
+    public func close() async {
+        openedSource = nil
+        structure = nil
+        activePlan = nil
+        pendingPlan = nil
+        transition(to: .empty)
+    }
+
+    // MARK: 運送
+
+    public func play() async {
+        guard phase == .ready || phase == .paused || phase == .stalled(reason: .mediaSlow) else { return }
+        promotePendingPlan()
+        transition(to: .playing)
+    }
+
+    public func pause() async {
+        guard phase == .playing else { return }
+        transition(to: .paused)
+    }
+
+    public func seek(to time: MediaTime, tolerance: SeekTolerance = .default) async {
+        guard phase == .playing || phase == .paused else { return }
+        preSeekPhase = phase
+        transition(to: .seeking(target: time))
+        // 実際のシーク手順（音声 0.2 s 前から・映像は keyframe から）は RVDecode の実装と共に入れる（04 §6）。
+        transition(to: preSeekPhase ?? .paused)
+    }
+
+    public func step(_ direction: StepDirection) async {
+        guard phase == .paused else { return }
+        // 1 帧送りは seek を使わない（04 §6）。実デコードが載るまで phase はそのまま。
+    }
+
+    public func setRate(_ rate: Double) async {
+        // 1.0 以外はまだサポートしない（OQ-09）。
+    }
+
+    // MARK: 選択・設定
+
+    public func select(_ track: TrackID, for kind: TrackKind) async {
+        guard var selection else { return }
+        switch kind {
+        case .audio: selection.audio = track
+        case .subtitle: selection.subtitle = .specific(track)
+        default: return
+        }
+        self.selection = selection
+        continuation?.yield(.selectionChanged(selection))
+    }
+
+    public func select(item: ItemID) async {
+        guard structure?.items.contains(where: { $0.id == item }) == true else { return }
+        selection?.item = item
+    }
+
+    /// 設定変更は phase を変えない（02 §3）。plan は pending に入り、frame 境界で昇格する（INV-3）。
+    public func apply(_ settings: PlayerSettings) async {
+        self.settings = settings
+        controller.state.requestedTier = settings.enhancement.tier
+        do {
+            try rebuildPlan()
+        } catch let error as PlaybackError {
+            continuation?.yield(.warning(error))
+        } catch {
+            continuation?.yield(.warning(PlaybackError(kind: .internalFailure("plan"),
+                                                       recovery: .retryWith(.lowerTier),
+                                                       userMessage: "描画計画を作り直せませんでした")))
+        }
+    }
+
+    /// 適応制御から届いた action を適用する（08 §5）。plan の作り直しは frame 境界で行う。
+    public func applyControlActions(_ actions: [ControlAction]) {
+        for action in actions {
+            switch action {
+            case .setTier:
+                break // controller 側で state は更新済み
+            case .bypassStage(let stage):
+                noteDegradation(.loadHigh)
+                _ = stage
+            case .disableTemporalBlend, .useLighterModelVariant, .reduceInferenceScale,
+                 .enhanceEveryNFrames, .setInFlightLimit, .unloadModel:
+                noteDegradation(.loadHigh)
+            }
+        }
+        try? rebuildPlan()
+    }
+
+    private func noteDegradation(_ reason: DegradeReason) {
+        continuation?.yield(.enhancementDegraded(reason: reason, to: controller.state.activeTier))
+    }
+
+    // MARK: 内部
+
+    private func transition(to next: EnginePhase) {
+        phase = next
+        continuation?.yield(.phaseChanged(next))
+    }
+
+    /// plan を作る。INV-2（AI なし経路が常に成立）と INV-6（計測点）をここで検査する。
+    private func rebuildPlan() throws {
+        guard let item = structure?.items.first, let format = item.videoFormat else { return }
+        let aspect = AspectResolver.resolve(codedSize: format.codedSize,
+                                           signals: format.aspectSignals,
+                                           policy: settings.aspectPolicy)
+        if aspect.source == .unresolved {
+            throw PlaybackError(kind: .internalFailure("aspect"),
+                                recovery: .needsUserAction(.chooseAspect),
+                                userMessage: "表示比率を決定できません")
+        }
+        planCounter += 1
+        let stages = StageGraphBuilder.stageRequests(for: .init(
+            userPolicy: settings.enhancement,
+            activeTier: controller.state.activeTier,
+            deinterlace: settings.deinterlaceMode))
+        let output = OutputContract(displayPixels: format.codedSize, aspect: aspect)
+        let plan = RenderPlan(id: PlanID(planCounter), tier: controller.state.activeTier,
+                              stages: stages, output: output)
+
+        // INV-6: 計測を持たない段をplanに入れた場合、生成は通すが記録して指摘する。
+        for stage in plan.stages.map(\.stage) where !MetricBus.measuredSet.contains(stage) {
+            continuation?.yield(.warning(PlaybackError(kind: .internalFailure("unmeasured-stage:\(stage.rawValue)"),
+                                                       recovery: .giveUp(reason: "diagnostics"),
+                                                       userMessage: "計測点のない段が plan に含まれています")))
+        }
+        // 予算検証（05 §1）。超える plan は作らない。
+        guard plan.budget.isFeasible(for: format.frameRate) else {
+            throw PlaybackError(kind: .internalFailure("budget"),
+                                recovery: .retryWith(.lowerTier),
+                                userMessage: "フレーム予算を超える描画計画です")
+        }
+        pendingPlan = plan
+    }
+
+    private func promotePendingPlan() {
+        guard let pendingPlan else { return }
+        activePlan = pendingPlan
+        self.pendingPlan = nil
+    }
+}

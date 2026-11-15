@@ -1,0 +1,58 @@
+name: CI
+
+# 設計: docs/design/09-testing.md §7。ジョブ名と同じに揃える。
+# macOS runner でビルド・単体テスト・GPU なし検証・限定的ベンチを回す。
+# 絶対的な性能値は runner 依存なので、比較は同一 runner 種別間で行う（09 §4）。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 18 * * *"   # nightly (UTC)
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: xcodebuild -version
+      - name: Build packages
+        working-directory: Packages/RetroVisionKit
+        run: swift build --build-tests
+      - name: Build release
+        working-directory: Packages/RetroVisionKit
+        run: swift build -c release
+
+  unit:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test (pure logic + architecture)
+        working-directory: Packages/RetroVisionKit
+        run: swift test
+
+  licenses:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check dependency license inventory
+        run: python3 Scripts/check-licenses.py
+
+  fixtures:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify fixture manifest schema
+        run: python3 Scripts/check-fixtures.py
+
+  night-only:
+    if: github.event_name == 'schedule'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full test with verbose output
+        working-directory: Packages/RetroVisionKit
+        run: swift test --parallel
+      # bench-full / quality / model-convert は Phase 1 以降にジョブを追加する（09 §7）。

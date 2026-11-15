@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "root": "unresolved://retrovision-fixtures/v0/",
+  "notes": "素材は Git に載せない。取得と sha256 検証は Scripts/check-fixtures.py で検査する（09 §2）。storage が未決のため status=pending の間は CI でスキップ扱い。",
+  "fixtures": [
+    {
+      "id": "ntsc480i-mixed-01",
+      "status": "pending",
+      "kind": "videoTsFolder",
+      "sha256": null,
+      "seconds": 60,
+      "properties": ["interlaced22", "4x3", "mpeg2", "ac3", "spuSubtitle", "blockNoise"],
+      "license": "unresolved",
+      "expectations": {
+        "cadence": "interlaced22",
+        "targetDAR": "4:3",
+        "codedSize": "720x480",
+        "cleanApertureWidth": 704,
+        "audioTracks": 2,
+        "subtitleTracks": 1
+      }
+    },
+    {
+      "id": "pal576i-mixed-01",
+      "status": "pending",
+      "kind": "videoTsFolder",
+      "sha256": null,
+      "seconds": 60,
+      "properties": ["interlaced22", "4x3", "mpeg2", "pcm"],
+      "license": "unresolved",
+      "expectations": {
+        "cadence": "interlaced22",
+        "targetDAR": "4:3",
+        "codedSize": "720x576",
+        "cleanApertureWidth": 704
+      }
+    },
+    {
+      "id": "telecine-32-01",
+      "status": "pending",
+      "kind": "videoTsFolder",
+      "sha256": null,
+      "seconds": 30,
+      "properties": ["telecine32", "filmBased", "4x3"],
+      "license": "unresolved",
+      "expectations": { "cadence": "telecine32", "inverseTelecineTarget": "24p" }
+    },
+    {
+      "id": "animation-480i-01",
+      "status": "pending",
+      "kind": "videoTsFolder",
+      "sha256": null,
+      "seconds": 30,
+      "properties": ["lineArt", "flatAreas", "interlaced22"],
+      "license": "unresolved",
+      "expectations": { "cadence": "interlaced22" }
+    },
+    {
+      "id": "progressive-sd-mp4-01",
+      "status": "pending",
+      "kind": "plainFile",
+      "sha256": null,
+      "seconds": 30,
+      "properties": ["progressive", "h264"],
+      "license": "unresolved",
+      "expectations": { "cadence": "progressive" }
+    },
+    {
+      "id": "damaged-video-ts-01",
+      "status": "pending",
+      "kind": "videoTsFolder",
+      "sha256": null,
+      "seconds": 10,
+      "properties": ["missingVOB", "unreadableIFO"],
+      "license": "unresolved",
+      "expectations": { "structureWarnings": ["missingVOB", "unreadableIFO"], "mustNotCrash": true }
+    },
+    {
+      "id": "damaged-iso-01",
+      "status": "pending",
+      "kind": "discImage",
+      "sha256": null,
+      "seconds": 10,
+      "properties": ["malformedStructure"],
+      "license": "unresolved",
+      "expectations": { "error": "malformedStructure", "mustNotCrash": true }
+    }
+  ]
+}

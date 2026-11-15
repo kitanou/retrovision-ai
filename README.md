@@ -36,6 +36,19 @@ Initial target is 29.97 fps playback with an approximately 33.4 ms end-to-end fr
 
 ## Development plan
 
+A sequenced execution plan (phases, dependency order, decision gates, acceptance criteria and risks) is in [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) (Japanese).
+
+Detailed design (module layout, type and protocol contracts, threading model, adaptive control, test strategy) is in [docs/design/README.md](docs/design/README.md) (Japanese).
+
+## Build and check
+
+```sh
+make check    # build + unit tests + license check + fixture-manifest check
+make test     # swift test only
+```
+
+The Swift package lives in `Packages/RetroVisionKit`. Third-party C libraries (FFmpeg, libdvdnav) are not integrated yet; their packaging decision is tracked as OQ-01 / OQ-02 in the design docs.
+
 See [Epic #1](https://github.com/kitanou/retrovision-ai/issues/1) and its implementation issues:
 
 - #2 Native SwiftUI player shell
