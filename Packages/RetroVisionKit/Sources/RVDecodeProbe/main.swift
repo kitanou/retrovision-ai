@@ -197,6 +197,12 @@ final class ProbeReport: @unchecked Sendable {
                  "fieldSource": frame.format.interlace.fieldSource.rawValue,
                  "fieldOrder": frame.format.interlace.fieldOrder.rawValue]
             }
+
+            // (5) 音声経路の実験（OQ-19 / issue #10）: AC-3 → PCM を AVFoundation だけでできるか。
+            // 再生線には載せず、判定材料だけを JSON に残す。
+            if stream.tracks.contains(where: { $0.kind == .audio }) {
+                await audioExperiment(url: url, entry: &entry)
+            }
         } catch let error as PlaybackError {
             entry["openStatus"] = "failed"
             entry["error"] = error.userMessage
@@ -208,6 +214,122 @@ final class ProbeReport: @unchecked Sendable {
         }
         entries.append(entry)
         dump(entry)
+    }
+
+    /// 音声実験（OQ-19）。2 経路を測る:
+    ///  a) passthrough（outputSettings=nil）— 自作 AudioDecoder に ES を渡す前提のサンプルと PTS
+    ///  b) linearPCM 要求 — AVFoundation 内蔵の復号が成立するか、実際の出力仕様と実時間率
+    private func audioExperiment(url: URL, entry: inout [String: Any]) async {
+        var results: [[String: Any]] = []
+        let asset = AVURLAsset(url: url)
+        let tracks: [AVAssetTrack]
+        do {
+            tracks = try await asset.loadTracks(withMediaType: .audio)
+        } catch {
+            entry["audioExperiment"] = [["error": "loadTracks: \(error)"]]
+            return
+        }
+        for track in tracks {
+            var one: [String: Any] = [:]
+            let descriptions = (try? await track.load(.formatDescriptions)) ?? []
+            one["sourceSubtypes"] = descriptions.map { FourCC.string(CMFormatDescriptionGetMediaSubType($0)) }
+            one["estimatedDataRate"] = (try? await track.load(.estimatedDataRate)) ?? -1
+            one["passthrough"] = await audioStep(track: track, asset: asset, settings: nil)
+            one["linearPCM"] = await audioStep(track: track, asset: asset, settings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ])
+            results.append(one)
+        }
+        entry["audioExperiment"] = results
+    }
+
+    private func audioStep(track: AVAssetTrack, asset fallbackAsset: AVAsset, settings: [String: Any]?) async -> [String: Any] {
+        var step: [String: Any] = [:]
+        do {
+            let reader = try AVAssetReader(asset: track.asset ?? fallbackAsset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+            guard reader.canAdd(output) else {
+                step["status"] = "cannot-add"
+                return step
+            }
+            reader.add(output)
+            guard reader.startReading() else {
+                step["status"] = "start-failed"
+                step["readerError"] = reader.error?.localizedDescription ?? "?"
+                return step
+            }
+            let began = Date()
+            var count = 0
+            var totalBytes = 0
+            var firstPTS: CMTime = .invalid
+            var lastPTS: CMTime = .invalid
+            var firstFrames = 0
+            var maxFrames = 0
+            var firstOutputFormat: [String: Any] = [:]
+            while let sample = output.copyNextSampleBuffer() {
+                let frames = CMSampleBufferGetNumSamples(sample)
+                if count == 0 {
+                    firstPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                    firstFrames = frames
+                    if let description = CMSampleBufferGetFormatDescription(sample) {
+                        firstOutputFormat = describeAudioFormat(description)
+                    }
+                }
+                maxFrames = max(maxFrames, frames)
+                if frames > 0, let block = CMSampleBufferGetDataBuffer(sample) {
+                    totalBytes += CMBlockBufferGetDataLength(block)
+                }
+                lastPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                count += 1
+                if count >= 5_000 { reader.cancelReading(); break }   // 実験の保護上限
+            }
+            let elapsedMS = milliseconds(from: began)
+            step["status"] = (reader.error == nil) ? "ok" : reader.error?.localizedDescription ?? "error"
+            step["sampleBufferCount"] = count
+            step["totalBytes"] = totalBytes
+            step["wallMS"] = elapsedMS
+            step["firstOutputFormat"] = firstOutputFormat
+            // 音声サンプルの PTS が有效か（クロックの原料にできるかの一次判定）
+            step["firstPTSValid"] = firstPTS.isValid
+            step["lastPTSValid"] = lastPTS.isValid
+            // 1 バッファあたりのフレーム数（結合の実態。04 §4 の quantum 分割ポリシーの材料）
+            step["firstBufferFrames"] = firstFrames
+            step["maxBufferFrames"] = maxFrames
+            if count > 1, firstPTS.isValid, lastPTS.isValid {
+                let span = CMTimeGetSeconds(lastPTS) - CMTimeGetSeconds(firstPTS)
+                step["spanSeconds"] = span
+                // 1.0 以上なら「実時間再生の間に解ける」。音声だけのバースト計測である点に注意（EXP-002 に明記）。
+                step["realtimeFactor"] = span * 1_000 / max(elapsedMS, 0.001)
+            }
+        } catch {
+            step["status"] = "exception"
+            step["error"] = String(describing: error)
+        }
+        return step
+    }
+
+    private func describeAudioFormat(_ description: CMFormatDescription) -> [String: Any] {
+        var value: [String: Any] = ["subtype": FourCC.string(CMFormatDescriptionGetMediaSubType(description))]
+        if let pointer = CMAudioFormatDescriptionGetStreamBasicDescription(description) {
+            let asbd = pointer.pointee
+            value["formatID"] = FourCC.string(asbd.mFormatID)
+            value["sampleRate"] = asbd.mSampleRate
+            value["channelsPerFrame"] = Int(asbd.mChannelsPerFrame)
+            value["bitsPerChannel"] = Int(asbd.mBitsPerChannel)
+            value["bytesPerFrame"] = Int(asbd.mBytesPerFrame)
+            value["framesPerPacket"] = Int(asbd.mFramesPerPacket)
+            value["formatFlags"] = Int(asbd.mFormatFlags)
+        }
+        if let layoutPointer = CMAudioFormatDescriptionGetChannelLayout(description, sizeOut: nil) {
+            value["channelLayoutTag"] = Int(layoutPointer.pointee.mChannelLayoutTag)
+        }
+        return value
     }
 
     private func videoFormat(of stream: ProbedStream) -> VideoFormatDescription? {

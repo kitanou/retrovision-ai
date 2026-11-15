@@ -94,6 +94,11 @@ gen ntsc480i-ac3-01.mpg \
   -f lavfi -i "$SRC_NTSC" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" \
   -vf "fieldorder=tff" -c:v $M2 $M2I $M2DVD $M2SEQ -c:a ac3 -b:a 192k
 
+# 8b. DTS 音声（AVFoundation が開けるか・復号できるか。OQ-02 の音声側の口の測定。EXP-002 §5）
+gen ntsc480i-dts-01.mpg \
+  -f lavfi -i "$SRC_NTSC" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" \
+  -vf "fieldorder=tff" -c:v $M2 $M2I $M2DVD $M2SEQ -strict -2 -c:a dca -b:a 768k -ar 48000 -ac 2
+
 # 9. 破損 program stream（切り落とし。#4 の失敗系テスト）
 gen truncated-01.mpg \
   -f lavfi -i 'testsrc2=size=720x480:rate=30000/1001:duration=6' \

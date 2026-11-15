@@ -77,7 +77,7 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | 適応制御（08 §4、§5） | 実装済み（`AdaptivePolicyEngine` の降格順序・hysteresis） |
 | `EngineCore`（02） | 状態機械・設定適用・plan 生成まで実装（復号への実接続は Phase 1 の残り作業） |
 | 未実装（03、05、06、07、音声・同期） | 契約と plan のみ（音声復号は OQ-19、SW 復号は OQ-20 のゲート待ち） |
-| 素材 | `fixtures/manifest.json` 17 登録（**10 を generated として Git 同梱**、実素材 7 は `pending`＝OQ-16）。`make gen-fixtures` で再生成 |
+| 素材 | `fixtures/manifest.json` 18 登録（**11 を generated として Git 同梱**、実素材 7 は `pending`＝OQ-16）。`make gen-fixtures` で再生成 |
 | ライセンス | `licenses/inventory.json`（Homebrew 版の実測 license・未リンクを区別。`make check-licenses` で検査） |
 | CI | `.github/workflows/ci.yml`（build / unit / integration / licenses / fixtures + nightly の probe 収集） |
 

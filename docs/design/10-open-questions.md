@@ -5,7 +5,7 @@
 | ID | 決定が必要な事項 | 当面の既定値 | 決めるために必要な実験・情報 | ゲート | 時期 |
 |---|---|---|---|---|---|
 | OQ-01 | libdvdread / libdvdnav の導入形態（ビルド設定、`DVDFileIO` / file-image 経由で `BlockReader` を差し込めるか） | **縮小済み（2026-11-16、EXP-001）**。ファイル source の demux/decode は AVFoundation + VideoToolbox 直（FFmpeg 不使用で全 fixture 通過、F1）。残る判断は DVD 制御（IFO 読み・NAV、`DVDFileIO` の block-reader hook）だけ。Phase 4 の WMV1 ゲートで追加検討 | libdvdread の block-reader hook で VIDEO_TS フォルダ・ISO・raw device の 3 種が通るかの実験 | G2 前 | Phase 2 |
-| OQ-02 | FFmpeg の版・ビルド構成（どの codec / demuxer を含めるか、LGPL 構成に留めるか）と配布形態 | **縮小済み（2026-11-16）**。Phase 1 の配布物に FFmpeg は含めない（未リンク、inventory 実測記録参照）。導入は DVD 制御 or WMV1 復号（Phase 4 ゲート）の決定時点。Homebrew ffmpeg 9.0.2 は GPL-3.0 系であることも実測済み | 導入 decided 後に、配布物に現れる記述義務の整理と build-flags の再現 CI | WMV1 / DVD 制御の決定時点 | Phase 4 前 |
+| OQ-02 | FFmpeg の版・ビルド構成（どの codec / demuxer を含めるか、LGPL 構成に留めるか）と配布形態 | **縮小済み（2026-11-16）**。Phase 1 の配布物に FFmpeg は含めない（未リンク、inventory 実測記録参照）。導入は DVD 制御 or WMV1 / DTS の復号（Phase 4 ゲート。DTS は AVFoundation がトラックとして列挙しないことを実測済み＝EXP-002 A6、dca fixture 登録済み）。Homebrew ffmpeg 9.0.2 は GPL-3.0 系であることも実測済み | 導入 decided 後に、配布物に現れる記述義務の整理と build-flags の再現 CI | WMV1 / DTS / DVD 制御の決定時点 | Phase 4 前 |
 | OQ-03 | 保護 Disc（CSS）および将来の AACS の扱い。libdvdcss で足りるか、商用再生 SDK が必要か | 非保護 / ユーザーオーサリングのみ対応。CSS 盤は `.protectedNeedsLicense` | ライセンサー・SDK ベンダーへの問い合わせ（再生だけでなく**復号後のフレーム処理の権利**も含む） | G2（対応範囲）/ Phase 3 以降（契約） | Phase 2 で問い合わせ開始 |
 | OQ-04 | ISO 内のファイル構造解決（UDF / 領域跨ぎ / ブリッジ Disc）の対応範囲 | ISO9660 の主形態のみ。UDF は要検証 | 市販盤の ISO サンプルで open できる割合を測る | G2 後 | Phase 2 |
 | OQ-05 | プロセス分割（外部プロセス化）が要るか | しない（[00 §4](00-architecture.md)） | 保護 Disc のライセンス済み SDK が分離実行を要求するか | G2 | Phase 2〜3 |
@@ -29,7 +29,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 | OQ-16 | 実素材フィクスチャの入手元と再配布権（manifest の `pending` 7 件: 実 DVD の VOB、保護盤、市販 H.264 素材等） | 開発は generated 合成素材。検証素材は所有盤から自己抽出し、repo には同梱しない | 素材提供元（自作盤で足りるか）と抽出・非公開利用の可否 | G2 | Phase 2 で着手 |
 | OQ-17 | MP4 mux の MPEG-2 で残る `CVFieldDetail` の読み了と、検出器への供給順位（PCE とどちらを優先するか） | PCE 優先。detail 値は読むだけで使わない | 同一素材の field 声明をコンテナ・bitstream・detail で突き合わせる（mp4-01 fixture） | G2 | Phase 1 残作業 |
 | OQ-18 | 初回フレームのスパイク（44〜70 ms）の warmup 設計（open 直後の使い捨てデコード、セッション预热、測定の除外方法） | open 直後に先頭 2〜3 枚を warmup として復号し、統計から除く | 起動遅延と warmup コストの実測。マルチストリーム切替時の再 warmup 要否 | G2 | Phase 1 残作業 |
-| OQ-19 | 音声復号とクロックの実現（AC-3 を AVAssetReader の PCM outputSettings で復号できるか。AudioClock の jitter） | AVAssetReaderTrackOutput の PCM 変換出力を試す。駄目なら AudioToolbox の変換、最後に FFmpeg shim | ac3 fixture を PCM 化できたか。rendered frame 読取りと drift p95 | G1 | Phase 1 残作業 |
+| OQ-19 | 音声復号とクロックの実現（AC-3 を AVFoundation の PCM outputSettings で復号できるか。AudioClock の jitter） | **復号経路は決定済み（2026-11-16、EXP-002 A1）**: AVAssetReader の linear PCM 出力で AC-3 を復号する（依存ゼロ維持）。quantum 分割は AudioDecoder 実装側（A2）。クロックの原料は PCM 経路の valid PTS + 帧数（A3）。残るは AudioSink/clock の実装と jitter 実測 | 実測済み（realtimeFactor ≈1100、in-line 計測は #11）。5.1 配置は実盤で再測（OQ-16） | G1（clock 部分） | Phase 1 残作業 |
 | OQ-20 | SW 復号フォールバック（`SoftwareDecoder`）の実現方式（VideoToolbox が弾く pixfmt・codec — WMV1 等） | libavcodec shim。ただし**実際に対象素材が現れるまで作らない**（無依存方針を壊さない） | WMV1 fixture が AVFoundation で開けるかの測定（未実施） | Phase 4 | 対象が判明した時点 |
 | OQ-21 | 合成 fixture の再生成一致性（ffmpeg の版で bit が変わりうる。sha を検証にするか記録にするか） | **決定済み（下記決定ログ）**: `status: generated` で Git 同梱。sha は記録（検査しない） | CI の ffmpeg バージョン漂移の実測 | — | 決定 |
 | OQ-22 | 60i 素材のキャデンス（film-origin pull-down）対応の範囲と ground truth | 未対応（現セットに flag 付き pull-down 素材がない） | 市販 DVD 映画素材の flags と検出器の突合 | G2 | Phase 2 |
@@ -48,6 +48,14 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **field 順序の供給元**: MPEG-PS では順序は PCE の `top_field_first` のみに載る（container の `CVFieldCount` は本数だけ）。全 fixture で bottom-first を実測。H.264 interlaced では復号段階で field 信号が全て失われるため、**05 §5 の detector 経路は補助ではなく必須の経路**である（OQ-17/OQ-25 で継続）。
 - **提示順序の責任**（04 §3 に反映済み）: 同期 `VTDecompressionSession` の出力は decode 順。decoder が 1 サンプル分保持して PTS 順に組み替え、提示可能分だけ返す。統合テストで固定。
 - **色キャリア**: 復号 pix_fmt は `420v`（BT.601・映像 range）でメタデータと一致。ただし `Guesses` フラグが立つ component range があるため、声明値の優先読みは component range 側（01 §2 に反映済み）。
+
+### 2026-11-16 — EXP-002 にもとづく決定（根拠: [docs/experiments/EXP-002](../experiments/EXP-002-audio-pcm-path.md)）
+
+- **OQ-19（復号経路部分）**: **AC-3 → PCM は AVFoundation の linear PCM 出力で復号する**（A1。実時間率 ≈1100×、要求仕様どおりの 48 kHz/int16/packed 出力）。FFmpeg shim・AudioToolbox 自前管理は音声には使わない。依存ゼロ方針は音声にも及ぶ。
+  - 副次的事実として設計へ反映: 変換出力は 8192 帧（≈171 ms）に結合されるため 10 ms quantum 分割は AudioDecoder 実装側の責任（A2）。passthrough 経路は ES が ~1.5 s 結合で末尾 PTS が invalid（A3）— クロック原料は PCM 経路の valid PTS + 帧数を使う。
+  - 未決のまま残る: AudioSink/clock の jitter 実測（#10 の実装作業）、5.1ch 配置（実盤＝OQ-16）。
+- **OQ-18（拡張）**: 音声側にも初期化コスト（passthrough 計 24 ms の初バッチ）がある（A5）。warmup は映像・音声で一括设计すること。
+- **DTS（OQ-02 の測定された例）**: AVFoundation は MPEG-PS 内の DTS をトラックとして列挙しない（A6、警告も出ない = 黙って消える不是）。DVD-Video で音声必須は LPCM/AC-3。**当面の既定: Phase 4 の FFmpeg shim ゲートまで DTS 非対応**。shim 実装時の受け入れ素材として `ntsc480i-dts-01.mpg`（ffmpeg `-strict -2 -c:a dca` で生成、manifest 登録済み）を使う。
 
 ### 2026-11-15〜16 — 運用面の実施決定（実験ゲート外の自己決定）
 

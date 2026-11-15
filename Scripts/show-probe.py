@@ -34,6 +34,20 @@ def main() -> None:
             print(f"fieldRetention: n={len(fr)} first={json.dumps(fr[0], sort_keys=True) if fr else None}")
             if len(fr) > 1:
                 print(f"                last={json.dumps(fr[-1], sort_keys=True)}")
+            for audio in e.get("audioExperiment") or []:
+                if "error" in audio:
+                    print(f"audioExperiment: {json.dumps(audio, ensure_ascii=False)}")
+                    continue
+                print(f"audio: source={audio.get('sourceSubtypes')} dataRate={audio.get('estimatedDataRate')}")
+                for mode in ("passthrough", "linearPCM"):
+                    step = audio.get(mode) or {}
+                    brief = {k: step.get(k) for k in (
+                        "status", "sampleBufferCount", "totalBytes", "wallMS", "realtimeFactor",
+                        "spanSeconds", "firstPTSValid", "lastPTSValid", "firstBufferFrames", "maxBufferFrames")}
+                    print(f"  {mode}: {json.dumps(brief, sort_keys=True)}")
+                    fmt = step.get("firstOutputFormat")
+                    if fmt:
+                        print(f"    format: {json.dumps(fmt, sort_keys=True)}")
             print()
 
 if __name__ == "__main__":

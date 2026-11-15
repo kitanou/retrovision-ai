@@ -14,7 +14,7 @@
 | ソースコード | Phase 0 の足場と Phase 1 の demux/decode が実装済み（`Packages/RetroVisionKit`。`make check` で検証） |
 | ビルド・CI | 設定済み（build / unit / integration / licenses / fixtures。nightly に probe 収集） |
 | 依存関係 | 製品は**依存ゼロ**（AVFoundation + VideoToolbox 直行を EXP-001 で実証）。ffmpeg / libdvdnav 系は開発機にのみ導入（fixture 生成用。未リンク） |
-| テスト素材・ベンチマーク | 合成 fixture 10 本を Git 同梱・manifest 登録（実素材 7 は pending＝OQ-16）。`make probe` で測れる |
+| テスト素材・ベンチマーク | 合成 fixture 11 本を Git 同梱・manifest 登録（実素材 7 は pending＝OQ-16）。`make probe` で測れる |
 | サードパーティライセンス棚卸し | 実施済み（`licenses/inventory.json` に実測値。すべて planned/未リンク） |
 
 つまり計画の初盤は「機能追加」ではなく、**再生の基本線を計測付きで通せる土台づくり**から始めます。
@@ -197,14 +197,14 @@ Phase 1〜5 がゲートを通過した時点で、MVP としての判断材料�
 | 2 | 計測基盤とレポート形式（#9 の前倒し） | 完了（`MetricBus`、JSONL、`BenchmarkReport`。実測値での閾値改定は未了） |
 | 3 | 純粋ロジックの先行実装（比・キャデンス計画・適応制御） | 完了（テストで固定） |
 | 4 | 依存の導入方針（FFmpeg / libdvdnav のビルド・配布形） | **縮小**（2026-11-16、EXP-001）: ファイル再生に依存なし。残りは DVD 制御（Phase 2 の block-reader 実験）と WMV1（Phase 4 ゲート、OQ-20）。OQ-01 / OQ-02 の決定ログ参照 |
-| 5 | テスト素材セットの取得元と sha256（#7 / #8 の共通基盤） | 合成 10 本を Git 同梱・manifest 登録（`kind: generatedFile` + 実測 sha、sha は記録扱い）。実素材 7 は pending（OQ-16） |
+| 5 | テスト素材セットの取得元と sha256（#7 / #8 の共通基盤） | 合成 11 本を Git 同梱・manifest 登録（`kind: generatedFile` + 実測 sha、sha は記録扱い）。実素材 7 は pending（OQ-16） |
 | 6 | 保護ディスク（CSS）と Blu-ray のライセンス問い合わせ | 未着手。OQ-03 / OQ-15（リードタイムがあるため早期に問い合わせる） |
 | 7 | player-engine プロトコルの実装（#2 の本体 UI は未着手） | プロトコル・状態機械・plan 生成まで実装。UI とデコード接続は Phase 1 |
 | 8 | Python / coremltools 環境（モデル変換） | 未着手。OQ-07 |
 | 9 | 映像 demux + VideoToolbox 復号（#4 の映像本体） | **完了**（AVFoundation ES パススルー + VT 直行。全 10 fixture 通過、提示順の順序保証を統合テストで固定） |
 | 10 | MPEG-2 bitstream 解析（frame rate / field 順序の一次情報） | **完了**（ffprobe と byte-for-byte 突合。PCE 解析。回帰テスト 14 本） |
 | 11 | 合成 fixture 生成・登録・検査（gen-fixtures / check-fixtures） | **完了**（10 本 Git 同梱。実素材は OQ-16） |
-| 12 | probe 計測基盤（`make probe` + nightly 収集） | **完了**（映像のみ。音声・clock・in-loop は未計測 → OQ-19 / OQ-18） |
+| 12 | probe 計測基盤（`make probe` + nightly 収集） | **完了**（映像 + 音声復号実験＝[EXP-002](experiments/EXP-002-audio-pcm-path.md)。clock・in-line は未計測 → OQ-19 残り / OQ-18） |
 
 ## 10. 関連
 

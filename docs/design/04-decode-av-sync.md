@@ -10,7 +10,7 @@ RVDecode/
   AVFoundationDemuxer.swift    # ファイル source の demux（AVAssetReader パススルー ES）
   VideoToolboxDecoder.swift    # HW path（VTDecompressionSession）
   AudioDecoding/
-    AudioDecoder.swift         # PCM 化（AC-3 / DTS / LPCM / AAC）
+    AudioDecoder.swift         # PCM 化（AC-3 は AVFoundation の PCM 変換出力。LPCM passthrough。DTS は Phase 4 shim ゲートまで非対応＝EXP-002 A6）
     AudioSink.swift            # AVAudioEngine 実装
     AudioClock.swift           # audio master clock
   Sync/
@@ -96,8 +96,8 @@ public final class AudioSink: Sendable {
 }
 ```
 
-- PCM quantum は 480 サンプル（10 ms @48 kHz）で生成し、10〜12 本（0.10〜0.12 s 初期値）を先に積む。render thread では allocation をしない。
-- AC-3 / DTS のデコードは `AudioDecoder` 経由（FFmpeg libavcodec の SW）。DVD の LPCM は passthrough でよい。
+- PCM quantum は 480 サンプル（10 ms @48 kHz）で生成し、10〜12 本（0.10〜0.12 s 初期値）を先に積む。render thread では allocation をしない。**AVFoundation の変換出力は 8192 帧（≈171 ms）に結合されて返る（EXP-002 A2）ので、この quantum への分割は AudioDecoder 実装側の責任**。
+- **AC-3 復号は AVFoundation の linear PCM 出力で行う（OQ-19 決定・EXP-002 A1。依存ゼロ）**。 AudioDecoder は passthrough の ES サンプルではなく、PCM 変換 outputSettings を使った track output を読む形になる。DVD の LPCM は passthrough でよい。**passthrough 経路を使う場合、ES は ~1.5 s 単位で結合され末尾サンプルの PTS が invalid（A3）**。クロックは PCM 経路の valid PTS + 帧数から進め、passthrough の PTS だけを信用しない。**DTS はトラックとして存在しなくなる（EXP-002 A6 実測: AVFoundation は MPEG-PS 内の DTS を列挙しない、警告も出ない）**。DVD-Video 仕様で音声必須は LPCM/AC-3 で DTS は拡張。当面の既定は **Phase 4 の FFmpeg shim ゲートまで DTS 非対応**（受け入れ検査には `ntsc480i-dts-01.mpg` を使う）。
 - 出力デバイスの遅延は `outputLatency` を引いて video 側に補正する（初期値 0.01〜0.03 s を実測で置く）。
 - device 変更（`AVCaptureDevice`/HAL 変更 notification）は再構成が必要。その間は `stalled` にせず、PCM を 0.2 s まで保持して繋ぐ。
 
