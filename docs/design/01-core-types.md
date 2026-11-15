@@ -36,22 +36,34 @@ public protocol TimeSource: Sendable { func now() -> HostTime }
 
 ## 2. 映像の論理記述
 
+（実装契約として確定。実測は [docs/experiments/EXP-001](../experiments/EXP-001-dependency-and-videotoolbox.md)）
+
 ```swift
 public struct VideoFormatDescription: Sendable, Hashable {
-    public var codedSize: CMVideoDimensions          // エンコード時の像素（例 720x480）
-    public var cleanAperture: CMRectCoordinate        // 表示すべき領域（crop）
-    public var pixelAspect: AspectRatio               // サンプルアスペクト比（NTSC ITU-R BT.601 では 10:11 等）
-    public var frameRate: FrameRate                   // 29970/1001、25/1 など有理数で保持
+    public var codedSize: PixelSize                  // エンコード時の像素（例 720x480）
+    public var statedCleanAperture: PixelRect?       // ソースが主張する切り出し。**無いことがある**（05 §6 で補完）
+    public var sampleAspect: AspectRatio?            // サンプルアスペクト比の断片。**無い・標準と違う値で来ることがある**（実測 F4）
+    public var frameRate: FrameRate?                 // 解決に失敗しても埋めない。nil のまま .formatRejected で断る（下記）
     public var interlace: InterlaceInfo
     public var color: ColorInfo
+    public var aspectSignals: AspectSignals          // IFO flag / MPEG aspect code などの断片（ resolver 用）
+    public var rawFormatType: UInt32                 // 容器の codec code（'mp2v' 等）。診断表示専用
 }
 
-public struct FrameRate: Sendable, Hashable { public var numerator: Int32; public var denominator: Int32 }  // 30000/1001 など。double は使わない
+public struct FrameRate: Sendable, Hashable { public var numerator: Int64; public var denominator: Int64 }  // 30000/1001 など。double は使わない
 
 public struct InterlaceInfo: Sendable, Hashable {
+    public enum FieldSource: String {
+        case none                          // progressive
+        case formatDescription             // container / bitstream の descriptor
+        case decodedBufferAttachment       // 復号出力の pixel buffer に付いていた
+        case guessedByDetector             // 05 §5 の detector による推定（assumption を plan に焼き込む）
+        case lostByDecoder                 // 復号器が失った（weave を避ける判断に使う）
+    }
     public var fieldCount: Int16          // 0 = progressive, 2 = interlaced
     public var fieldOrder: FieldOrder     // .topFirst / .bottomFirst / .progressive / .unknown
     public var cadence: Cadence           // .progressive / .interlaced22 / .telecine32 / .mixed / .unknown
+    public var fieldSource: FieldSource   // 信号の出所。失われた場合物語で区別する（実測 F5/F6/F11）
 }
 
 public enum Cadence: Sendable { case progressive, interlaced22, telecine32, mixed, unknown }
@@ -60,11 +72,11 @@ public enum FieldOrder: Sendable { case topFirst, bottomFirst, progressive, unkn
 public struct AspectRatio: Sendable, Hashable { public var w: Int32; public var h: Int32 }  // 既約化して保持
 
 public struct ColorInfo: Sendable, Hashable {
-    public var primaries: ColorPrimaries           // .bt601 / .bt709 / .smpte240 / .unspecified
-    public var transfer: TransferFunction          // .bt709 / .gamma22 / .linear / .unspecified
-    public var matrix: MatrixCoefficients          // .bt601 / .bt709 / .fcc / .unspecified
+    public var primaries: ColorPrimaries           // .bt601EBU / .bt601SMPTEC / .bt709 / .smpte240 / .unspecified
+    public var transfer: TransferFunction          // .bt709OrBT601 / .gamma22 / .linear / .unspecified
+    public var matrix: MatrixCoefficients          // .bt601_4 / .bt709 / .fcc / .unspecified
     public var range: YCbCrRange                   // .videoRange / .fullRange
-    public var isFrequentlyUsedFlag: Bool          // 「メタデータが信用できるか」のフラグ（05 §6 で扱う）
+    public var isStated: Bool                      // 「宣言として信用できるか」。false のとき 05 §3 の assumption を plan に焼き込む
 }
 ```
 

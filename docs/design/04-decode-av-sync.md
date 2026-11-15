@@ -1,78 +1,85 @@
 # 04. デコードと音声同期（Issue #4）
 
-対象: FFmpeg demux、VideoToolbox デコード、音声出力、同期クロック、seek。Phase 1 の中心。
+対象: demux（**ファイル source は AVFoundation ベース。EXP-001 で FFmpeg 不要を確認済み**）、VideoToolbox デコード、音声出力、同期クロック、seek。Phase 1 の中心。映像復号は MPEG-2 / H.264 は VideoToolbox。サンプル中の WMV1 は未検証（AVFoundation で開けるか未測定。開かない場合は Phase 4 の FFmpeg shim ゲートで扱う）。
 
 ## 1. モジュールの内側
 
 ```
 RVDecode/
-  Demuxer.swift              # FFmpeg 経由のパケット化。トラック表の生成
-  VideoDecoding/
-    VideoDecoder.swift       # プロトコル
-    VideoToolboxDecoder.swift # HW path
-    SoftwareDecoder.swift     # SW path（libavcodec）
-    FramePool.swift          # CVPixelBuffer プール
+  Probe.swift                  # 開いた瞬間のフォーマット推定（測定値を JSON に落とす。make probe）
+  AVFoundationDemuxer.swift    # ファイル source の demux（AVAssetReader パススルー ES）
+  VideoToolboxDecoder.swift    # HW path（VTDecompressionSession）
   AudioDecoding/
-    AudioDecoder.swift       # PCM 化（AC-3 / DTS / LPCM / AAC）
-    AudioSink.swift          # AVAudioEngine 実装
-    AudioClock.swift         # audio master clock
+    AudioDecoder.swift         # PCM 化（AC-3 / DTS / LPCM / AAC）
+    AudioSink.swift            # AVAudioEngine 実装
+    AudioClock.swift           # audio master clock
   Sync/
-    SyncController.swift     # drift 判定と補正方針
-    SeekController.swift     # seek の組立
-  Probe.swift                # 開いた瞬間のフォーマット推定
+    SyncController.swift       # drift 判定と補正方針
+    SeekController.swift       # seek の組立
+RVMediaCore/
+  CoreMediaBridging.swift      # CMSampleBuffer / CMFormatDescription / CVPixelBuffer の橋渡し＋CoreMedia 固有の初期化規則
+  MPEG2Bitstream.swift         # sequence / picture / picture-coding 拡張の解析（C API 不使用）
 ```
 
-C API は `CRetroffmpegShim` に閉じる（[00 §2](00-architecture.md)）。Swift 側は `AVFrame` のポインタを見ない。
+C API を呼ぶ箇所は上記の橋渡しモジュールに閉じる（[00 §2](00-architecture.md)。`RVMediaCore` の纯値型は不変）。当初計画した `CRetroffmpegShim` は Phase 1 では未作成（OQ-01 の決定ログ参照）。`AVFrame` のポインタはどのモジュールも見ない。
 
 ## 2. Demuxer
 
 ```swift
 public protocol Demuxer: Sendable {
-    func probe() async throws -> ProbedStream            // トラック表・フォーマット決定
-    func packets(for track: TrackID) -> AsyncThrowingStream<Packet, any Error>
+    func probe() async throws -> ProbedStream
+    func samples(for track: TrackID) -> AsyncThrowingStream<CompressedSample, any Error>
     func seek(to target: MediaTime, tolerance: SeekTolerance) async throws -> SeekEffect
     var streamInfo: ProbedStream { get }
 }
 
-public struct Packet: Sendable {
+public struct CompressedSample: @unchecked Sendable {
     public let track: TrackID
-    public let bytes: Data            // 所有権は Swift 側。FFmpeg の buffer 参照は shim 内でコピーまたは参照管理
-    public let pts: MediaTime?
-    public let dts: MediaTime?
-    public let duration: MediaTime?
-    public let flags: PacketFlags     // .key / .beginningOfFrame / …
+    public let sampleBuffer: CMSampleBuffer   // ES サンプルのパススルー。生存中は base buffer が ES を保持する
+    public var pts: MediaTime? { get }
+    public var duration: MediaTime? { get }
+    public var isKeySample: Bool { get }
+    public var hasSampleData: Bool { get }   // 空サンプルの判別（下記）
 }
 ```
 
-- `Data` に載せるかどうか: FFmpeg の `AVPacket` は参照カウントを持つ。Phase 1 は**コピーして Swift 側で所有**し、寿命事故を先に潰す。コピー原価（DVD MPEG-2 では 1 パケット数百バイト）は demux 段の予算に含めて測る（04 §9）。ゼロコピーへ切り替える判断は、計測後に取る（OQ-06）。
-- DVD の MPEG-PS には `dts` が無いことが多い。`pts` だけで順序を扱うため、**decode 順序は demux 順に一致しない**前提でキューを持つ。
-- probe では「再生できるか」だけを返し、codec 名や profile は診断用に表示する（`DecodePathInfo`、02 §4）。
+- **所有権（OQ-06）**: `CMSampleBuffer` の参照をそのまま渡す。ES コピーは demux 段で発生しない。パケットを `Data` にコピーする設計は不要であることが**実測で確認できた**（[EXP-001](../experiments/EXP-001-dependency-and-videotoolbox.md) F2。デコードへ渡す直前まで参照を遅延させる）。
+- **空サンプルの扱い**: AVFoundation はトラック先頭にサンプルデータゼロのバグッファを出す。VideoToolbox はこれを `-12902`（kVTParameterErr）で弾く（F5）。`hasSampleData == false` のサンプルはスキップし、**PTS 補完にも使わない**（ダミー PTS が復号順序を狂わせる）。
+- MPEG-PS の ES サンプルは `dts` を運ばない（F2）。**decode 順序は PTS 順に一致しない**ため、PTS 全集の推定は「ソート済みユニーク PTS ÷ 総フレーム数」で行う（F6。demux 順＝decode 順で平均间隔を取ると GOP 並べ替えで約 4 倍ずれる）。
+- probe は `ProbedStream` を返す。フォーマット決定は [01 §2](01-core-types.md) の resolver と同じ規則（フレームレート解決鎖: container hint → MPEG-2 bitstream → PTS span。既知標準に一致しない hint は使わない。**NTSC既定に倒さない**）。bitstream と PCE、PTS ゲイン（p50/p90/p99/max）を `probe-report` に記録する。
 
 ## 3. VideoToolbox デコード
 
-方針: FFmpeg の demux + **VideoToolbox の復号**を使い、出力は `CVPixelBuffer` を直接受け取る。FFmpeg の videotoolbox hwdevice を経由する経路と、`VTDecompressionSessionCreate` を自力で扱う経路の 2 案がある。
+方針: **`VTDecompressionSession` を直接使う**（下表の案 B）。案 A（FFmpeg hwdevice 経由）は比較対象ですらなくなった — demux 自体が AVFoundation になったため、FFmpeg を経由する理由が消えた（[EXP-001](../experiments/EXP-001-dependency-and-videotoolbox.md) F1、OQ-01/OQ-08 の決定ログ）。
 
-| 案 | 長所 | 短所 | 採用 |
+| 案 | 長所 | 短所 | 結果 |
 |---|---|---|---|
-| A. FFmpeg hwdevice（`AV_HWDEVICE_TYPE_VIDEOTOOLBOX`）経由 | 実装量が少ない。interlaced MPEG-2 の処理も FFmpeg 側が面倒を見る | hwaccel の挙動がビルド設定に依存。フィールド情報が失われることがある | **Phase 1 の既定** |
-| B. `VTDecompressionSession` を直接（FFmpeg は bitstream 供給のみ） | フィールド／キャデンス制御と output pool を握れる。deint の品質に直結 | 実装量が多い。MPEG-2 の field-based coding の扱い | Phase 2 で A と比較して勝敗を決める（OQ-08） |
+| A. FFmpeg hwdevice（`AV_HWDEVICE_TYPE_VIDEOTOOLBOX`）経由 | 実装量が少ない。interlaced MPEG-2 の処理も FFmpeg 側が面倒を見る | hwaccel の挙動がビルド設定に依存。フィールド情報が失われることがある | **不採用**（FFmpeg 非依存で全 fixture が通った） |
+| B. `VTDecompressionSession` を直接（ES サンプルをそのまま供給） | フィールド／キャデンス制御と出力プールを握れる。コピーなしで IOSurface を取得できる | 実装量が多い | **採用**（Phase 1 実装済み。スループット 176〜1555 fps、p50 0.4〜1.7 ms を実測） |
 
-どちらの案でも、復号出力の契約は同じにする:
+復号器の契約（実装済み。`RVDecode/Contracts.swift`）:
 
 ```swift
 public protocol VideoDecoder: Sendable {
-    var path: DecodePath { get }               // .videoToolbox / .software
-    var outputDescription: VideoFormatDescription { get }
-    func configure(_ format: FormatDescription, policy: DecodePolicy) async throws
-    func decode(_ packet: Packet) async throws -> DecodedVideoFrame?
+    var path: DecodePath { get async }
+    var pathInfo: DecodePathInfo { get async }            // 選択理由の診断（02 §4）
+    var sourceFormat: VideoFormatDescription? { get async }
+    var decodedFormat: VideoFormatDescription? { get async }
+    func configure(_ format: VideoFormatDescription, policy: DecodePolicy,
+                   formatDescriptionHint: CMVideoFormatDescription?) async throws
+    func decode(_ sample: CompressedSample) async throws -> DecodedVideoFrame?
     func flush() async -> [DecodedVideoFrame]
     func reset(at pts: MediaTime) async
 }
 ```
 
+- **format description hint**: AVFoundation は sample 自身に description を添えないことがある（MPEG-PS で実測）。probe 段の track description を hint として復号器に渡す（`FormatDescriptionHolder` の実測注記）。
+- **出力順序（F13・実測で確定）**: 同期的な `VTDecompressionSession` の出力ハンドラは**入力順（＝decode 順）でフレームを返す**。提示順は PTS 順であるため、`decode` は内部で受理済みフレームが 2 件以上になるまで 1 件を保持し（1 サンプル分遅延させて PTS 順に組み替え）、提示可能な次の 1 件だけを返す。`flush` で残りを PTS 順に返す。順序保証を decoder の責務として固定したので、上層は「受理順＝提示順」を前提にできる。統合テストで回帰固定済み（`DecodePathTests.framePresentationOrderIsPresentationOrderByPTS`）。
+- **field 順序の供給元（F10）**: MPEG-PS の container は `CVFieldCount`（本数）しか運ばず、順序は **PCE の `top_field_first`** から取る（全 fixture で tff=0 = bottom-first を実測）。H.264 の interlaced fixture は復号段階で field 信号が**全て消える**（F11。MP4 mux の MPEG-2 では `CVFieldDetail` が残るが未読了）。順序の最終確定は 05 §5 の detector 経路に依存する。復元できない場合は `.unknown` として扱い、既定の bob 相当に倒さない（誤った weave より安全な表示を選ぶ）。
+- 復号 pix_fmt は `420v`（映像 range・ITU-R BT.601）でメタデータと一致し、キャリアは container の声明値を保持する（F9）。ただし `Guesses` フラグの立つ component range があるため、色キャリアの優先読みは component range 側。
+
 - 出力 pool は `CVPixelBufferPool`（Metal 互換属性付き、01 §4）。`kCVPixelBufferIOSurfacePropertiesKey` を付け、IOSurface 経由で Metal・Core ML に**コピー 1 回で**（理想的にはゼロコピーで）渡る形を目標にする。
-- HW が使えない・拒否された場合は `SoftwareDecoder` に切替え、`DecodePathInfo` にその理由を残す（#4 の「hardware decode is selected when available and software fallback works」）。切替は**再生を止めずに**行う（frame boundary で差し替え、PTS の連続性は seek なしで保つ）。
-- interlaced MPEG-2 の復号で、フィールド情報が失われる場合は 05 §5 の field-match 側で復元する。復元できない場合は `.unknown` として扱い、既定の bob 相当に倒さない（誤った weave より安全な表示を選ぶ）。
+- HW が使えない・拒否された場合は `SoftwareDecoder` に切替え、`DecodePathInfo` にその理由を残す（#4 の「hardware decode is selected when available and software fallback works」。SW 復号器本体は Phase 1 の後続作業）。切替は**再生を止めずに**行う（frame boundary で差し替え、PTS の連続性は seek なしで保つ）。
 
 ## 4. 音声出力
 
@@ -173,3 +180,5 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 | dropped frames | present されなかった frame を理由付きで計上（late / skippedByPolicy / leaseViolation） | 08 §3 |
 | A/V drift | 0.1 s 間隔で drift を記録、p50/p95/max を集計 | 08 §4 |
 | 音声の underrun | schedule 済み buffer の残数 | 08 §3 |
+
+**確立済みの計測ツール（Phase 1）**: `make probe`（`rvprobe --json`）が fixture ごとに開く→全サンプル復号し、`probe-*.json` を残す（decode 時間分布、PTS ゲイン p50/p90/p99/max、フレームレート解決の根拠、decode 順と提示順、bitstream / PCE の声明値、PAR）。EXP-001 の再現手順がそのまま手順化されている。留意点として **初回フレームのスパイク（44〜70 ms）**が毎セッション観測されるため、常時再生の数値を取るには warmup が必要（OQ 追記参照・未着手）。音声側（`StageID.audioDecode`・underrun・drift）は未実測。

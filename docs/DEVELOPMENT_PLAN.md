@@ -11,11 +11,11 @@
 
 | 項目 | 状態 |
 |---|---|
-| ソースコード | なし（README と Epic / Issue のみ） |
-| ビルド・CI | 未設定 |
-| 依存関係（FFmpeg / libdvdnav など） | 未導入・未評価 |
-| テスト素材・ベンチマーク | 未整備 |
-| サードパーティライセンス棚卸し | 未実施 |
+| ソースコード | Phase 0 の足場と Phase 1 の demux/decode が実装済み（`Packages/RetroVisionKit`。`make check` で検証） |
+| ビルド・CI | 設定済み（build / unit / integration / licenses / fixtures。nightly に probe 収集） |
+| 依存関係 | 製品は**依存ゼロ**（AVFoundation + VideoToolbox 直行を EXP-001 で実証）。ffmpeg / libdvdnav 系は開発機にのみ導入（fixture 生成用。未リンク） |
+| テスト素材・ベンチマーク | 合成 fixture 10 本を Git 同梱・manifest 登録（実素材 7 は pending＝OQ-16）。`make probe` で測れる |
+| サードパーティライセンス棚卸し | 実施済み（`licenses/inventory.json` に実測値。すべて planned/未リンク） |
 
 つまり計画の初盤は「機能追加」ではなく、**再生の基本線を計測付きで通せる土台づくり**から始めます。
 
@@ -50,7 +50,9 @@
 意図: **#2 と #4 はこの順序で、ただし一つのかたまりとして**進めます。UI の再生操作は player-engine プロトコルを介して実行され、その実体が #4 のデコーダになります。
 
 1. #2: アプリシェル、比率維持のビデオ表示、Open File、再生操作、音量、全画面、設定 UI（状態はプレースホルダ）
-2. #4: FFmpeg による demux / VideoToolbox ハードウェアデコード（ソフトウェアフォールバック併設）、CVPixelBuffer への正規化、タイムスタンプ・フレーム長・色メタデータ・DAR の保持、AVFoundation / CoreAudio クロック、seek / pause / トラック選択
+2. #4: ~~FFmpeg による demux~~ → **AVFoundation demux（ES パススルー）/ VideoToolbox ハードウェアデコード**（EXP-001 で FFmpeg なしで成立と決定済み。ソフトウェアフォールバックは OQ-20 ゲート）、CVPixelBuffer への正規化、タイムスタンプ・フレーム長・色メタデータ・DAR の保持、AVFoundation / CoreAudio クロック、seek / pause / トラック選択
+
+**進捗（2026-11-16）**: #4 の映像経路（demux・復号・format 解決・probe 計測）は実装・測定完了。音声復号とクロック、`EngineCore` との実接続、#2 の UI は未着手（音声は OQ-19 を先に実験）。G1 の判定は接続完了後。
 
 ゲート G1（このフェーズ末で判定）: **AI なしの素の再生パスで、目標マシン（M5 Max 64GB）にて 29.97 / 25 fps が破綻せず、ステージ別の測定値から後段（Metal・Core ML）に使える残り予算が確定する。**
 
@@ -140,7 +142,7 @@ graph LR
 
 | 段階 | 仮予算 | 測定するまで不明な点 |
 |---|---|---|
-| Demux + HW decode | ≤ 5.5 ms | DVD MPEG-2 に対する VideoToolbox の実挙動 |
+| Demux + HW decode | ≤ 5.5 ms → **VideoToolbox 単体は実測で预算内**（decode p50 0.4〜1.7 ms、スループット 176〜1555 fps。[EXP-001](experiments/EXP-001-dependency-and-videotoolbox.md) §4）。open 1.4〜28.5 ms と**初帧 44〜70 ms の warmup**（OQ-18）が別枠 | in-loop（再生線接続後）の実測は未了 |
 | Deinterlace + 色変換 | ≤ 3 ms | 選択方式の GPU コスト |
 | Core ML 推論（2x） | ≤ 18 ms | ANE と GPU の差、テンソル変換の実コスト |
 | Post / ノイズ除去 | ≤ 2 ms | 各段を直列にした場合の合成コスト |
@@ -194,11 +196,15 @@ Phase 1〜5 がゲートを通過した時点で、MVP としての判断材料�
 | 1 | Phase 0 の足場（SPM 構成・ビルド・CI・make タスク） | 完了（`Packages/RetroVisionKit`、`.github/workflows/ci.yml`、`Makefile`） |
 | 2 | 計測基盤とレポート形式（#9 の前倒し） | 完了（`MetricBus`、JSONL、`BenchmarkReport`。実測値での閾値改定は未了） |
 | 3 | 純粋ロジックの先行実装（比・キャデンス計画・適応制御） | 完了（テストで固定） |
-| 4 | 依存の導入方針（FFmpeg / libdvdnav のビルド・配布形） | 未着手。OQ-01 / OQ-02 |
-| 5 | テスト素材セットの取得元と sha256（#7 / #8 の共通基盤） | _manifest と検査スクリプトのみ_。storage 未決（09 §2） |
+| 4 | 依存の導入方針（FFmpeg / libdvdnav のビルド・配布形） | **縮小**（2026-11-16、EXP-001）: ファイル再生に依存なし。残りは DVD 制御（Phase 2 の block-reader 実験）と WMV1（Phase 4 ゲート、OQ-20）。OQ-01 / OQ-02 の決定ログ参照 |
+| 5 | テスト素材セットの取得元と sha256（#7 / #8 の共通基盤） | 合成 10 本を Git 同梱・manifest 登録（`kind: generatedFile` + 実測 sha、sha は記録扱い）。実素材 7 は pending（OQ-16） |
 | 6 | 保護ディスク（CSS）と Blu-ray のライセンス問い合わせ | 未着手。OQ-03 / OQ-15（リードタイムがあるため早期に問い合わせる） |
 | 7 | player-engine プロトコルの実装（#2 の本体 UI は未着手） | プロトコル・状態機械・plan 生成まで実装。UI とデコード接続は Phase 1 |
 | 8 | Python / coremltools 環境（モデル変換） | 未着手。OQ-07 |
+| 9 | 映像 demux + VideoToolbox 復号（#4 の映像本体） | **完了**（AVFoundation ES パススルー + VT 直行。全 10 fixture 通過、提示順の順序保証を統合テストで固定） |
+| 10 | MPEG-2 bitstream 解析（frame rate / field 順序の一次情報） | **完了**（ffprobe と byte-for-byte 突合。PCE 解析。回帰テスト 14 本） |
+| 11 | 合成 fixture 生成・登録・検査（gen-fixtures / check-fixtures） | **完了**（10 本 Git 同梱。実素材は OQ-16） |
+| 12 | probe 計測基盤（`make probe` + nightly 収集） | **完了**（映像のみ。音声・clock・in-loop は未計測 → OQ-19 / OQ-18） |
 
 ## 10. 関連
 

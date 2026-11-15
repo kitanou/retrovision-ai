@@ -1,6 +1,6 @@
 # RetroVision AI 詳細設計
 
-[開発計画](../DEVELOPMENT_PLAN.md) の Phase / Issue に対応する実装レベルの設計です。コードはまだ存在せず、本書が最初の設計成果物になります。
+[開発計画](../DEVELOPMENT_PLAN.md) の Phase / Issue に対応する実装レベルの設計です。Phase 0 の足場と Phase 1 の demux/decode が動き始めており、**実測で確定した事実は [EXP-001](../experiments/EXP-001-dependency-and-videotoolbox.md) と決定ログ（[10-open-questions](10-open-questions.md)）に反映**しています。
 
 ## 前提として実測したツールチェーン（2026-11-15 実測）
 
@@ -10,7 +10,8 @@
 | macOS | 27.2.1 (Build 26B131) |
 | Xcode | 27.2 (Build 27B52) |
 | Swift | 6.4.2（target arm64-apple-macosx27.2.0） |
-| ffmpeg / libdvdnav / libdvdread | 未導入（pkg-config に見つからない） |
+| ffmpeg | Homebrew 9.0.2（**fixture 生成と probe 用途のみ**。製品にはリンクしない。GPL-3.0 系であることも実測） |
+| libdvdnav / libdvdread / libdvdcss | Homebrew 7.0.0 / 7.1.1 / 1.6.0（**未リンク**。license 実測値として inventory に記録） |
 | coremltools | 未導入。システム Python は 3.9.6 のため、モデル変換には version 管理された venv が必要 |
 
 SDK ヘッダで**存在を確認済み**の API（設計の依存先にしてよい）:
@@ -18,6 +19,19 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 
 **見つからなかった** API（設計では依存しない。使う場合は Phase 0 で検証、[#10 open-questions](10-open-questions.md) の OQ-07）:
 `MTLTextureFeatureProvider` / `MTLBufferFeatureProvider`（Core ML の Metal feature provider）、`MTLModelCommandEncoder`。
+
+### Swift から使ったときに実測した API の事実（04 の実装中に確認。繰り返し調べるコストを下げるための記録）
+
+- CoreVideo / CoreMedia の CFString キー定数は `String(k… as NSString)` として読む。
+- `CMVideoFormatDescriptionGetNominalFrameRate` は**存在しない**。フレームレートは container hint（`AVAssetTrack.nominalFrameRate`、Float）と bitstream・PTS span から解決する（04 §2）。
+- `AVAssetReader.canAdd(_:)` は add しない。追加は `reader.add(output)`。
+- `track.formatDescriptions` / `track.nominalFrameRate` は非同期 form（`track.load(.formatDescriptions)`）で読む。
+- トラックの language・表示名は `AVMediaSelectionOption` 側にしかない。
+- output-handler 版の VT 呼び出しは `VTDecompressionSessionDecodeFrame(_:sampleBuffer:flags:infoFlagsOut:outputHandler:)` として import される。
+- `kVTDecodeInfo_FrameDropped` は import されない（`flags.rawValue & (1 << 1)` で見る）。
+- async context で NSLock は使えない（serial DispatchQueue で直列化する）。
+- エラー値の実測意味: `-12902` = kVTParameterErr（0 長 sample 投入）、`-8969` = H.264 4:2:2 の bad data（この機械）。
+- 新規ビルドの **unsigned SPM debug binary は SIGKILL（exit 137）で殺される**ことがある → `codesign --force --sign -`（OQ-24）。再ビルド每次に再署名。
 
 ## 文書と読み順
 
@@ -27,7 +41,7 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | [01-core-types.md](01-core-types.md) | 共通の値型（時間・フレーム記述・比・エラー体系）と診断 ID | #2〜#9 共通 |
 | [02-player-engine.md](02-player-engine.md) | 再生エンジン API、状態機械、UI との境界 | #2 |
 | [03-media-sources.md](03-media-sources.md) | DVD ソース抽象、光学ドライブ / VIDEO_TS / ISO、libdvdnav 統合 | #3 |
-| [04-decode-av-sync.md](04-decode-av-sync.md) | FFmpeg / VideoToolbox デコード、音声出力、同期制御 | #4 |
+| [04-decode-av-sync.md](04-decode-av-sync.md) | AVFoundation demux + VideoToolbox デコード、音声出力、同期制御 | #4 |
 | [05-metal-pipeline.md](05-metal-pipeline.md) | Metal レンダーグラフ、デインターレース、比・色、提示と計測 | #5 |
 | [06-ml-runtime.md](06-ml-runtime.md) | Core ML 実行層、モデル契約、ゼロコピー、障害分離 | #6 |
 | [07-enhancement.md](07-enhancement.md) | 超解像・ノイズ除去のステージ設計と順序設定 | #7、#8 |
@@ -48,28 +62,31 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | #8 | 07（denoise）＋ 05 | INV-2、INV-3 | — |
 | #9 | 08 | INV-1、INV-6 | — |
 
-## 現在の実装状況（Phase 0 の足場）
-
-コードが動き始めました。設計どおりの境界で進むため、まず純粋ロジックから実装しています。
+## 現在の実装状況（Phase 0 完了 + Phase 1 の demux/decode、2026-11-16）
 
 | 場所 | 状態 |
 |---|---|
-| `Packages/RetroVisionKit` | SPM パッケージ（`RVMediaCore` / `RVDiagnostics` / `RVMediaSources` / `RVDecode` / `RVVideoPipeline` / `RVMLRuntime` / `RVEnhancement` / `RVPlaybackEngine`） |
-| 時刻・フレームレート（01 §1） | 実装済み（有理数の `FrameRate`、half-even 整数演算、`MediaMath`） |
+| `Packages/RetroVisionKit` | SPM パッケージ（`RVMediaCore` / `RVDiagnostics` / `RVMediaSources` / `RVDecode` / `RVDecodeProbe` / `RVVideoPipeline` / `RVMLRuntime` / `RVEnhancement` / `RVPlaybackEngine`） |
+| 時刻・フレームレート（01 §1） | 実装済み（有理数の `FrameRate`、half-even 整数演算、`MediaMath`、PTS span 推定） |
 | 比の解決（01 §2、05 §6） | 実装済み（目標 DAR 優先 + clean aperture 逆算。704/720 の注意をテストで固定） |
+| **MPEG-2 bitstream 解析（04 §2）** | 実装済み（sequence / picture / **picture-coding 拡張（PCE）**。ffprobe と byte-for-byte で突合。`BitstreamTests` に fixture 実バイトの回帰固定） |
+| **demux + VideoToolbox 復号（04 §2・§3）** | 実装済み（AVFoundation ES パススルー、zero-sample ゲート、hint 供給、PCE field 順序、提示順の遅延組み替え）。統合テスト 6 本で回帰固定 |
+| **フォーマット probe（04 §2・09）** | 実装済み（`make probe` → `bench/captures/probe-*.json`。nightly CI が収集） |
 | 表示スケジュール（05 §5.3） | 実装済み（vsync 整数本の計画、59.94/60/50/24fps のパターンをテストで固定） |
 | 計測とレポート（08 §7） | 実装済み（窓集計の `MetricBus`、JSONL、`BenchmarkReport` の null 保持） |
 | 適応制御（08 §4、§5） | 実装済み（`AdaptivePolicyEngine` の降格順序・hysteresis） |
-| `EngineCore`（02） | 状態機械・設定適用・plan 生成まで実装（デコード・描画は未接続） |
-| 契約のみ（03、04、06、07） | プロトコルと値型の実装（FFmpeg / libdvdnav / Core ML の実装は Phase 1 以降） |
-| CI | `.github/workflows/ci.yml`（build / unit / licenses / fixtures） |
-| 素材・ライセンス | `fixtures/manifest.json`、`licenses/inventory.json` と検査スクリプト（取得元と SHA は未決） |
+| `EngineCore`（02） | 状態機械・設定適用・plan 生成まで実装（復号への実接続は Phase 1 の残り作業） |
+| 未実装（03、05、06、07、音声・同期） | 契約と plan のみ（音声復号は OQ-19、SW 復号は OQ-20 のゲート待ち） |
+| 素材 | `fixtures/manifest.json` 17 登録（**10 を generated として Git 同梱**、実素材 7 は `pending`＝OQ-16）。`make gen-fixtures` で再生成 |
+| ライセンス | `licenses/inventory.json`（Homebrew 版の実測 license・未リンクを区別。`make check-licenses` で検査） |
+| CI | `.github/workflows/ci.yml`（build / unit / integration / licenses / fixtures + nightly の probe 収集） |
 
 確認手順:
 
 ```sh
-make check     # build + test + license 検査 + fixture 検査
-make test      # swift test
+make check          # build + test + license 検査 + fixture 検査
+make gen-fixtures   # 合成 fixture 生成（既存ファイルはスキップ）
+make probe          # 全素材の open→全復号を計測し bench/captures/probe-*.json に記録
 ```
 
 注: `Package.swift` のプラットフォーム下限は macOS 15（CI 互換のための暫定値）。製品の下限は OQ-12 で未決のまま。
