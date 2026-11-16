@@ -1,7 +1,7 @@
 # 開発の入口（09 §7 の CI と同じ手順をローカルで実行できるようにする）
 PKG := Packages/RetroVisionKit
 
-.PHONY: all build release test check licenses fixtures gen-fixtures probe probe-play clean
+.PHONY: all build release app run-app test check licenses fixtures gen-fixtures probe probe-play clean
 
 all: check
 
@@ -12,6 +12,13 @@ build:
 
 release:
 	 cd $(PKG) && swift build -c release
+
+# 起動できる .app を組み立てる（build/RetroVision AI.app）。
+app:
+	 sh Scripts/make-app.sh release
+
+run-app: app
+	 open "build/RetroVision AI.app"
 
 test:
 	 cd $(PKG) && swift test

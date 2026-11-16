@@ -8,3 +8,4 @@ bench/reports/
 bench/captures/
 .venv-tools/
 __pycache__/
+/build/
