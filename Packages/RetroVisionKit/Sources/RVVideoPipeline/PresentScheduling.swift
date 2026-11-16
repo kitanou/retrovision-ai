@@ -26,6 +26,13 @@ public struct DisplayRefresh: Sendable, Hashable, CustomStringConvertible {
 
     public var description: String { "\(numerator)/\(denominator)" }
 
+    /// 実数値（Hz）。検出した refresh を既知標準に丸める比較に使う（05 §5.3）。
+    public var hertzValue: Double { Double(numerator) / Double(denominator) }
+
+    /// vsync 1 本の周期（秒）。提示予約の時間計算はここでやる（CA host clock は秒単位 —
+    /// `MTLDrawable.present(at:)` と同一単位。ms にしない注意は呼び出し側で扱う）。
+    public var periodSeconds: Double { Double(denominator) / Double(numerator) }
+
     /// n 番目の vsync の時刻（秒、有理数の分子分母のまま）。
     public func vsyncTime(n: Int64) -> (num: Int64, den: Int64) { (n * denominator, numerator) }
 
