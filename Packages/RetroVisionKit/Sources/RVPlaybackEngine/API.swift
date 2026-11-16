@@ -130,7 +130,10 @@ public protocol VideoPresentSink: Sendable {
 
 @MainActor
 public protocol PlayerEngine: AnyObject {
-    func load(_ source: any MediaSource, selection: PlaybackSelection) async throws -> MediaStructure
+    /// selection nil = 構造駆動の既定選択（03 §5 の実挙動合わせ、メニュー増分）。
+    /// open 後、structure の先頭 item で解決される（VIDEO_TS では menu=VMGM が先頭、
+    /// 無い_disc では先頭タイトル）。UI は selectionChanged からのみ選択を導出する。
+    func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws -> MediaStructure
     func close() async
 
     func play() async

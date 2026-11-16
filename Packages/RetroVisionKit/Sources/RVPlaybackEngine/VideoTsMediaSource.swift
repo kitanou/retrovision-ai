@@ -10,10 +10,10 @@ import RVDecode
 // （IFO 実パースが権威になるのは増分。v1 は VOB 側の実測で構成する — 03 §4 の
 // 「IFO と VOB の長さが食い違う」を検出できる形にするため、ズレは warning で残す）。
 //
-// 多重 VOB（1 タイトル = VTS_nn_1..k.VOB）は ConcatPSDemuxer で 1 本のタイムラインに
-// 連結して読む（03 §4。実装の実測根拠は ConcatPSDemuxer の頭注）。
-// open 時の probe は連結のための一時コピーを伴う（実 DVD で 1〜8GB。ディスク空きが
-// 無い失敗はそのまま upper へ。将来の無連結経路は OQ のまま）。
+// 多重 VOB（1 タイトル = VTS_nn_1..k.VOB）は SegmentPSDemuxer で無連結・part 単位
+// demux + 時刻縫合として 1 本のタイムラインに読む（03 §4・§9.2。実測による設計差し替えは
+// SegmentPSDemuxer 頭注。open 時の走査は demuxQueue 側で走り、再 open では作らない —
+// 冪等 cache と同じ思想）。
 
 public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
     public let rootURL: URL
@@ -45,6 +45,8 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
         var warnings = found.warnings
         var items: [MediaItem] = []
         for chain in found.chains {
+            // menu chain（vtsNumber 0）は ItemID(0) / titleNumber 0。列の先頭に有る（実盤の
+            // first-play 入口。政策は PlayerViewModel — 03 §5 の実挙動合わせ）。
             let itemId = ItemID(UInt64(chain.vtsNumber))
             let demuxer = Self.makeDemuxer(for: chain)
             do {
@@ -54,8 +56,7 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
                 guard let video = stream.tracks.first(where: { $0.kind == .video }),
                       case .video(let videoFormat) = video.format else {
                     warnings.append(StructureWarning(code: .noVideoTrack,
-                                                    detail: "VTS_\(String(format: "%02d", chain.vtsNumber))"
-                                                        + " に映像トラックが無い（AVFoundation が読めなかった）"))
+                                                    detail: "\(chain.label) に映像トラックが無い（AVFoundation が読めなかった）"))
                     continue
                 }
                 items.append(MediaItem(id: itemId,
@@ -66,12 +67,10 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
                 warnings.append(contentsOf: stream.warnings)
             } catch let error as PlaybackError {
                 warnings.append(StructureWarning(code: .containerUnreadable,
-                                                detail: "VTS_\(String(format: "%02d", chain.vtsNumber))"
-                                                    + " が読めません: \(error.userMessage)"))
+                                                detail: "\(chain.label) が読めません: \(error.userMessage)"))
             } catch {
                 warnings.append(StructureWarning(code: .containerUnreadable,
-                                                detail: "VTS_\(String(format: "%02d", chain.vtsNumber))"
-                                                    + " の probe に失敗: \(error)"))
+                                                detail: "\(chain.label) の probe に失敗: \(error)"))
             }
         }
         guard let first = items.first else {
@@ -103,8 +102,10 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
             demuxers[itemId] = demuxer
             return demuxer
         }
-        // engine は structure の通った item しか選ばない。想定外は先頭タイトルに寄せる。
-        if let firstChain = chainsByID.values.min(by: { $0.vtsNumber < $1.vtsNumber }),
+        // engine は structure の通った item しか選ばない。想定外は先頭タイトルに寄せる
+        // （menu を飛ばす — menu 目的の呼び出しなら itemId が先にヒットしている）。
+        if let firstChain = chainsByID.values.filter({ !$0.isMenu })
+                .min(by: { $0.vtsNumber < $1.vtsNumber }),
            let d = demuxers[ItemID(UInt64(firstChain.vtsNumber))] {
             return d
         }
@@ -121,10 +122,10 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
     }
 
     private static func makeDemuxer(for chain: VideoTsChain) -> any Demuxer {
-        if chain.partURLs.count == 1 {
-            return AVFoundationDemuxer(url: chain.partURLs[0])
-        }
-        return ConcatPSDemuxer(partURLs: chain.partURLs)
+        // 単一 part も同じ経路（offset 0 で素の demux と逐語一致 — SegmentPSDemuxerTests §5 で実測。
+        // 単一 part 内部の程序再開始も ProgramStreamRepair で修復できる利点がある）。
+        // 旧 ConcatPSDemuxer は実写マルチパートで崩壊するため退場 — SegmentPSDemuxer 頭注。
+        return SegmentPSDemuxer(partURLs: chain.partURLs)
     }
 
     /// パスから決定的な SourceID（FNV-1a。FileMediaSource と同じ作り方）。

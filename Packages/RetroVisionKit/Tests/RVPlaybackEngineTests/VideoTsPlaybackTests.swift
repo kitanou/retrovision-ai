@@ -99,11 +99,15 @@ final class VideoTsPlaybackTests: XCTestCase {
         XCTAssertNil(box.failedMessage, "再生が失敗した: \(box.failedMessage ?? "")")
         XCTAssertTrue(box.endedFlag, "phase .ended に到達しない")
 
-        // 兼実測: VTS_01 は母素材（ntsc480i-ac3-01.mpg）の 2 分割で、連結後はバイト一致。
-        // engine 経由の demux 実数は母素材の単一ファイル実測（180。#10/#12 の続測）と一致する。
-        XCTAssertEqual(outcome.demuxedSampleCount, 180,
-                       "多重 VOB 経由の demux 実数が母素材の実測（180）と違う（境界で落ちている可能性）")
-        XCTAssertEqual(outcome.stats.presented, 180)
+        // 兼実測（2026-11-17、segment 経路への差し替え時): VTS_01 は母素材
+        // （ntsc480i-ac3-01.mpg 単一ファイル実測 180。#10/#12）の keyframe 整合 2 分割。
+        // 無連結 segment 経路の実測は 176 = 86 + 90。境界で落ちる 4 帧は open GOP 素材の
+        // forward reference による part 単体復号不能 frame（SegmentPSDemuxerTests §2 で
+        // 実測・契約化。実 DVD の closed-GOP cell 分割ではこの喪失は起きない — PICHI
+        // 実盤で part 全体が通る実測済み）。
+        XCTAssertEqual(outcome.demuxedSampleCount, 176,
+                       "多重 VOB 経由の demux 実数が segment 経路の実測（176）と違う（境界退行）")
+        XCTAssertEqual(outcome.stats.presented, 176)
 
         // 位置は part 境界（VTS_01_1 の track 終端 ≈ 3.04 s。実測）を跨いで進む。
         let positions = box.collectedPositions.map(\.seconds)
@@ -131,9 +135,20 @@ final class VideoTsPlaybackTests: XCTestCase {
             return XCTFail("structure が無い")
         }
         XCTAssertEqual(structure.itemKind, .dvdTitles)
-        // fixture の実測: VTS_01（多重）と VTS_02（単一）の 2 タイトル。IFO は 0 バイト。
-        XCTAssertEqual(structure.items.map(\.titleNumber), [1, 2], "タイトル列が engine に届かない")
-        let vts1 = structure.items[0]
+        // fixture の実測（2026-11-17 更新）: menu（VMGM・VIDEO_TS.VOB）+ VTS_01（多重）+
+        // VTS_02（単一）。menu は titleNumber 0 / ItemID(0) で列の先頭（03 §5 の menu 約束）。
+        // IFO は 0 バイト。
+        XCTAssertEqual(structure.items.map(\.titleNumber), [0, 1, 2], "タイトル列（menu 先頭）が engine に届かない")
+        XCTAssertEqual(structure.items.map(\.id), [ItemID(0), ItemID(1), ItemID(2)])
+        let menu = structure.items[0]
+        XCTAssertNotNil(menu.videoFormat, "menu の videoFormat が無い（first-play 配線の前提）")
+        if let menuDuration = menu.duration {
+            XCTAssertGreaterThan(menuDuration.seconds, 3.5, "menu duration が足りない（VIDEO_TS.VOB が probe できていない）: \(menuDuration.seconds)")
+            XCTAssertLessThan(menuDuration.seconds, 4.5, "menu duration が過大: \(menuDuration.seconds)")
+        } else {
+            XCTFail("menu item に duration が無い")
+        }
+        let vts1 = structure.items[1]
         XCTAssertEqual(vts1.trackTable.filter { $0.kind == .video }.count, 1,
                        "連結後のトラック表に映像が 1 本で無い（03 §4）")
         XCTAssertNotNil(vts1.videoFormat, "wirePipeline が要求する videoFormat が無い")
@@ -211,14 +226,14 @@ final class VideoTsPlaybackTests: XCTestCase {
 
         XCTAssertNil(box.failedMessage, "ISO 再生が失敗した: \(box.failedMessage ?? "")")
         XCTAssertTrue(box.endedFlag, "ISO 経由で phase .ended に到達しない")
-        XCTAssertEqual(outcome.demuxedSampleCount, 180,
-                       "ISO 経由の demux 実数が母素材の実測（180）と違う")
+        XCTAssertEqual(outcome.demuxedSampleCount, 176,
+                       "ISO 経由の demux 実数が segment 経路の実測（176。§2 の検査と同値）と違う")
     }
     // MARK: - 5. タイトル切り替え: 別素材のタイトル 2 を選ぶとそちらが再生される
     //
     // 実測（2026-11-17、vts2count probe）: VTS_02（truncated-01 複製）は
-    // total=122 / valid=120 / lastPTS=3.971s。タイトル 1（母素材連結 = 180）と
-    // 数値で区別できる。この検査が兼実測で、engine 側の厳密値を固定する。
+    // total=122 / valid=120 / lastPTS=3.971s。タイトル 1（母素材単一ファイル 180 /
+    // segment 経路 176）と数値で区別できる。この検査が兼実測で、engine 側の厳密値を固定する。
 
     func testTitleSwitchPlaysSecondTitle() async throws {
         let root = try dvdRoot()
@@ -275,11 +290,33 @@ final class VideoTsPlaybackTests: XCTestCase {
         let first = try await source.open()
         let second = try await source.open()
         XCTAssertEqual(second.structure.items.map(\.id), first.structure.items.map(\.id))
-        XCTAssertEqual(second.structure.items.count, 2)
+        XCTAssertEqual(second.structure.items.count, 3, "menu + 2 タイトルの冪等列にならない")
         // demuxer の同一实例契約: 再 open をまたいも同じ instance（track id 対応の担保 —
         // DemuxerProviding.swift の注記。切り替え経路で新しい instance になると壊れる）。
         let d1 = await source.makeDemuxer(itemId: ItemID(2))
         let d2 = await source.makeDemuxer(itemId: ItemID(2))
         XCTAssertTrue((d1 as AnyObject) === (d2 as AnyObject), "demuxer の实例が変わった")
+    }
+
+    // MARK: - 7. menu（VIDEO_TS.VOB）は通常の VOB チェーンとして engine を通って再生できる
+    //
+    // first-play の政策（auto-select/auto-play、menu ended → 本体タイトルへ自動進行）は
+    // PlayerViewModel 側（PlayerViewModelTests で検査）。ここでは engine 経路の材料
+    // （ItemID(0) が選べて最後まで読める）だけ固定する。menu 素材は truncated-01 の
+    // 複製（gen-dvd-fixture.sh）で、実測 120 sample（タイトル 2 と同一素材・同一実数。
+    // 数値の区別は item 列と duration で立つ — §2 の検査）。
+    func testMenuItemPlaysThroughEngineToTheEnd() async throws {
+        let root = try dvdRoot()
+        let (outcome, box) = try await playToEnd(VideoTsMediaSource(rootURL: root), item: ItemID(0))
+        XCTAssertNil(box.failedMessage, "menu 再生が失敗した: \(box.failedMessage ?? "")")
+        XCTAssertTrue(box.endedFlag, "menu で phase .ended に到達しない")
+        XCTAssertEqual(outcome.demuxedSampleCount, 120,
+                       "menu の demux 実数が素材実測（truncated-01 同一 = 120）と違う")
+        let positions = box.collectedPositions.map(\.seconds)
+        XCTAssertFalse(positions.isEmpty, "menu で position イベントが届かない")
+        for i in 1..<positions.count {
+            XCTAssertGreaterThanOrEqual(positions[i], positions[i - 1] - 1e-9, "position 逆行（02 §4）")
+        }
+        XCTAssertGreaterThan(positions.max() ?? -1, 3.5, "menu 終端付近まで進まない")
     }
 }

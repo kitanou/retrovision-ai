@@ -60,6 +60,9 @@ final class PlayerViewModel {
     private var eventTask: Task<Void, Never>?
     private var surface: SurfaceSink?
     private var lastOpenedURL: URL?
+    /// menu 再生終了の自動進行のガード（同一 .ended を複数回発火させない。
+    /// selectionChanged が観測されたら解除 — 単一更新経路の原則（#17）と同じ場所で行う）。
+    private var menuAdvancePending = false
 
     init(engine: any PlayerEngine) {
         self.engine = engine
@@ -89,6 +92,7 @@ final class PlayerViewModel {
             self.phase = phase
             if case .failed(let error) = phase { lastError = error }
             if case .empty = phase { lastError = nil }
+            if case .ended = phase { scheduleMenuAutoAdvance() }
         case .positionUpdated(let position, let duration, _):
             guard !timelineScrubbing else { return }   // ドラッグ中のつまみはユーザー操作に固定（#17）
             self.position = position
@@ -105,6 +109,7 @@ final class PlayerViewModel {
             availableTracks = tracks
         case .selectionChanged(let selection):
             selected = selection
+            menuAdvancePending = false   // 選択が動いた = 直前の menu 終端処理は完了
         case .qualityChanged(let presentation):
             quality = presentation
         case .enhancementDegraded:
@@ -169,10 +174,18 @@ final class PlayerViewModel {
         lastError = nil
         Task {
             do {
-                let selection = PlaybackSelection(item: ItemID(1))
                 // 一つの入口（#3）: ディレクトリ=VIDEO_TS、ディスクイメージ=ISO mount、
                 // 他=ファイル。型の判定は MediaSourceRouting（RVPlaybackEngineTests で検査）。
-                _ = try await engine.load(MediaSourceRouting.makeSource(for: url), selection: selection)
+                // 選択は構造駆動（selection nil → engine が structure の先頭 item で解決する。
+                // 03 §5 の実挙動合わせ — menu=VMGM が先頭に居ればそれが menu 優先になる）。
+                let structure = try await engine.load(MediaSourceRouting.makeSource(for: url),
+                                                      selection: nil)
+                // first-play 政策（menu 増分。03 §5 の実挙動合わせ）: DVD で menu が先頭に
+                // 居る場合、盤挿入 = 再生開始が実機の挙動なので menu を自动再生する
+                // （#17 の user gate は「menu の無い素材」では従来のまま変えない）。
+                if structure.items.contains(where: { $0.titleNumber == 0 }) {
+                    await engine.play()
+                }
                 // 開いた直後は再生しない（#17: preparing → ready。transport は user gate）。
             } catch let error as PlaybackError {
                 lastError = error
@@ -256,6 +269,27 @@ final class PlayerViewModel {
     func selectTitle(_ item: ItemID) {
         guard availableTitles.contains(where: { $0.id == item }) else { return }
         Task { await engine.select(item: item) }
+    }
+
+    /// DVD 実機の first-play 動作（03 §5 の実挙動合わせ、menu 増分）: menu item
+    /// （titleNumber 0 の約束 — VideoTsNavigator の VMGM 列）の再生が ended になったら、
+    /// 最初の本体タイトル（titleNumber 最小）を auto-select して再生を続ける。
+    /// 本体タイトルが無い盘（menu-only）では何もしない（盘の動作と同じくそこで終わり）。
+    private func scheduleMenuAutoAdvance() {
+        guard !menuAdvancePending,
+              let selectedID = selected?.item,
+              let playing = availableTitles.first(where: { $0.id == selectedID }),
+              playing.titleNumber == 0
+        else { return }
+        // 本体タイトル（titleNumber 最小）へ自動進行する（menu-only 盘では行わない）。
+        let titles = availableTitles.filter { (($0.titleNumber ?? 1) >= 1) }
+        guard let firstTitle = titles.min(by: { ($0.titleNumber ?? 0) < ($1.titleNumber ?? 0) }) else { return }
+        menuAdvancePending = true
+        Task { [weak self] in
+            guard let self else { return }
+            await self.engine.select(item: firstTitle.id)
+            await self.engine.play()
+        }
     }
 
     func setFullscreen(_ window: NSWindow?) {

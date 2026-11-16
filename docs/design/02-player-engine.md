@@ -17,7 +17,10 @@
 @MainActor
 public protocol PlayerEngine: AnyObject {
     // 開く
-    func load(_ source: any MediaSource, selection: PlaybackSelection) async throws -> LoadedItem
+    // 開く。selection nil = 構造駆動の既定選択（open 後、structure の先頭 item で解決。
+    // DVD は menu=VMGM が列の先頭なら menu 優先 — 03 §5・§9.7。2026-11-17 menu 増分で追加。
+    // 実装の戻り値は MediaStructure（LoadedItem は設計上の名称。03 §3 の実形に一致））。
+    func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws -> LoadedItem
     func close() async
 
     // 運送

@@ -11,25 +11,36 @@ import RVMediaCore
 // 純 Foundation: RVMediaSources は RVDecode を import しない（00 §2 / ArchitectureTests）。
 
 /// 1 タイトル = 1 VOB チェーン（VTS_nn_1.VOB .. VTS_nn_k.VOB、順序付き）。
+/// menu チェーン = VMGM（VIDEO_TS.VOB。03 §5 のメニュー増分）: vtsNumber 0、isMenu true。
+/// 列挙側はこれを常に先頭に置く（first-play 政策は PlayerViewModel。#17 系）。
 public struct VideoTsChain: Sendable, Hashable {
-    /// VTS_01 → 1。ファイル名の数字から取る。
+    /// VTS_01 → 1。ファイル名の数字から取る。menu は 0（titleNumber 0 と同じ約束）。
     public let vtsNumber: Int
     /// 連結順（VTS_nn_1, VTS_nn_2, ...）。
     public let partURLs: [URL]
     /// VTS_nn_0.IFO か VTS_nn_1.IFO が見つかっているか（v1 は「存在」のみを見る）。
     public let hasIfo: Bool
+    /// VMGM メニュー（VIDEO_TS.VOB）のチェーン。
+    public let isMenu: Bool
 
-    public init(vtsNumber: Int, partURLs: [URL], hasIfo: Bool) {
+    public init(vtsNumber: Int, partURLs: [URL], hasIfo: Bool, isMenu: Bool = false) {
         self.vtsNumber = vtsNumber
         self.partURLs = partURLs
         self.hasIfo = hasIfo
+        self.isMenu = isMenu
+    }
+
+    /// warning 文面などに使う表示名（実体名で出す — 「VTS_00」のような機械名にしない）。
+    public var label: String {
+        isMenu ? "VMGM menu (VIDEO_TS.VOB)" : "VTS_\(String(format: "%02d", vtsNumber))"
     }
 }
 
 public enum VideoTsNavigator {
     /// root（DVD-Video のルート、または VIDEO_TS を直接指す URL）からタイトル列を作る。
     /// VIDEO_TS ディレクトロが見つからなければ nil（呼び出し側は「DVD-Video ではない」と扱う）。
-    /// 戻り値の chains は vtsNumber の昇順、partURLs は part 番号の昇順（決定的順序）。
+    /// 戻り値の chains は menu（VMGM・VIDEO_TS.VOB）があれば先頭に 1 本、以下 vtsNumber の
+    /// 昇順。partURLs は part 番号の昇順（決定的順序）。
     public static func chains(in root: URL) -> (chains: [VideoTsChain], warnings: [StructureWarning])? {
         let fm = FileManager.default
         let videoTS = findVideoTSDirectory(in: root)
@@ -52,15 +63,29 @@ public enum VideoTsNavigator {
         var grouped: [Int: [Entry]] = [:]
         var ignored: [String] = []
         var warnings: [StructureWarning] = []
+        // VMGM メニュー（VIDEO_TS.VOB。03 §5 のメニュー増分）。多重 part の VMGM は
+        // 観測例の無い形なので単一 VIDEO_TS.VOB のみ（未来の OQ — 他 VIDEO_T* 名は
+        // 下の「形式外 name」warning に残る）。
+        var menuVOBs: [URL] = []
+        var menuHasIfo = false
 
         for url in entries.sorted(by: { $0.path < $1.path }) {
             let name = url.lastPathComponent
             guard isRegularFile(url) else { continue }
+            let baseName = (name as NSString).deletingPathExtension.uppercased()
+            let nameExt = (name as NSString).pathExtension.uppercased()
+            if baseName == "VIDEO_TS" {
+                // 大文字小文字は無視（macOS へのコピーで case が揺れる実運用対策）。
+                switch nameExt {
+                case "VOB": menuVOBs.append(url)
+                case "IFO", "BUP": menuHasIfo = menuHasIfo || nameExt == "IFO"
+                default: break
+                }
+                continue
+            }
             guard let parsed = Self.parseTitleFileName(name) else {
-                // VIDEO_TS.IFO/BUP はディスク情報のため対象外（正常。warning は出さない）。
                 // VTS_VO.* はオーサリングツールが置くことがある（title0 menu。v1 は対象外）。
-                let base = (name as NSString).deletingPathExtension.uppercased()
-                if base != "VIDEO_TS" && base != "VTS_VO" {
+                if baseName != "VTS_VO" {
                     ignored.append(name)
                 }
                 continue
@@ -71,6 +96,8 @@ public enum VideoTsNavigator {
 
         var chains: [VideoTsChain] = []
         for vts in grouped.keys.sorted() {
+            // VTS_00_* は VMGM が書く実例が無い（0 は menu 側で使う数字）。列挙しない。
+            if vts == 0 { continue }
             let items = grouped[vts]!
             // VTS_nn_0.VOB はメニュー用（title 0）でタイトル本体ではない（実 DVD 配置）。
             // 列からは除外し、part 0 のみの VTS は menu-only として静かに skip する（正常形）。
@@ -107,6 +134,14 @@ public enum VideoTsNavigator {
                                                     + "（v1 はファイル名のみで列挙。IFO の実パースは増分）"))
             }
             chains.append(VideoTsChain(vtsNumber: vts, partURLs: contiguous.map(\.url), hasIfo: hasIfo))
+        }
+
+        // VMGM menu chain（VIDEO_TS.VOB）は常に先頭（titleNumber 0 / ItemID(0) の約束。
+        // 実盤の first-play 入口は menu — 再生開始の政策自体は PlayerViewModel が持つ）。
+        if !menuVOBs.isEmpty {
+            chains.insert(VideoTsChain(vtsNumber: 0, partURLs: menuVOBs.sorted { $0.path < $1.path },
+                                       hasIfo: menuHasIfo, isMenu: true),
+                          at: 0)
         }
 
         // 0 バイトの IFO（fixture・破損ディスク）は「読めない」の実例として残す。

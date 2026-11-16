@@ -40,11 +40,16 @@ public final class FakePlayerEngine: PlayerEngine, VideoSurfaceBinding {
 
     // MARK: PlayerEngine
 
-    public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws -> MediaStructure {
+    public func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws -> MediaStructure {
         calls.append("load")
         let structure = presetStructure ?? MediaStructure(itemKind: .singleItem,
-                                                         items: [MediaItem(id: selection.item,
+                                                         items: [MediaItem(id: selection?.item ?? ItemID(1),
                                                                           duration: CMTime(seconds: 60, preferredTimescale: 1))])
+        // 実 engine（EngineCore.load）と同じ意味論: selection nil は open 後、構造の先頭
+        // item で解決される（メニュー増分。UI は selectionChanged からのみ派生状態を得る）。
+        let selection = selection
+            ?? structure.items.first.map { PlaybackSelection(item: $0.id) }
+            ?? PlaybackSelection(item: ItemID(1))
         let isReload = nilWasSet
         nilWasSet = true
         structureRef = structure

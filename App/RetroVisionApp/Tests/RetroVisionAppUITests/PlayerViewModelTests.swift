@@ -104,6 +104,74 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertEqual(vm.selected?.item, ItemID(2), "selectionChanged で選択表示が更新される")
     }
 
+    // MARK: first-play 政策（menu 増分。03 §5 の DVD 実機の挙動: 挿入 = 再生開始）
+    //
+    // menu（titleNumber 0 / ItemID(0)）が構造の先頭に在るとき:
+    //   * open は selection nil（構造駆動）→ engine が先頭 = menu で解決する（selectionChanged で届く）。
+    //   * menu は自动再生される（実機の first-play）。menu の無い盘では user gate のまま（#17）。
+    //   * menu が ended になったら最初の本体タイトルへ auto-select + play で自動進行する。
+    private func menuPreset() -> MediaStructure {
+        MediaStructure(itemKind: .dvdTitles, items: [
+            MediaItem(id: ItemID(0), titleNumber: 0, duration: CMTime(value: 4, timescale: 1)),
+            MediaItem(id: ItemID(1), titleNumber: 1, duration: CMTime(value: 60, timescale: 1)),
+            MediaItem(id: ItemID(2), titleNumber: 2, duration: CMTime(value: 30, timescale: 1)),
+        ])
+    }
+
+    func testFirstPlayWithMenuAutoSelectsAndPlaysIt() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+        XCTAssertEqual(vm.selected?.item, ItemID(0),
+                       "menu が構造駆動の既定選択になっていない（first-play 実挙動）")
+        XCTAssertTrue(fake.calls.contains("play"), "menu が自动再生されない（03 §5 の実挙動合わせ）")
+    }
+
+    func testMenuEndedAutoAdvancesToFirstTitle() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+
+        fake.emit(.phaseChanged(.ended))   // menu 再生終了
+        for _ in 0..<200 where !fake.calls.contains("select:item") {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let selects = fake.calls.filter { $0 == "select:item" }
+        XCTAssertEqual(selects.count, 1,
+                       "menu ended で最初の本体タイトルへの select が 1 回発火しない（自動進行）")
+        XCTAssertTrue(fake.calls.contains("play"), "自動進行で再生を続けない（first-play 実挙動）")
+
+        // 実 engine は select(item:) で selectionChanged を送る。それが届いた後の
+        // 本体タイトル の ended では自動進行を重ねない（menu 限定の政策）。
+        fake.emit(.selectionChanged(PlaybackSelection(item: ItemID(1))))
+        for _ in 0..<200 where vm.selected?.item != ItemID(1) {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        fake.emit(.phaseChanged(.ended))
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let selects2 = fake.calls.filter { $0 == "select:item" }.count
+        XCTAssertEqual(selects2, 1, "本体タイトルの ended で自動進行が再発火した（menu 限定のはず）")
+    }
+
+    func testDVDWithoutMenuDoesNotAutoplay() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = MediaStructure(itemKind: .dvdTitles, items: [
+            MediaItem(id: ItemID(1), titleNumber: 1, duration: CMTime(value: 60, timescale: 1)),
+            MediaItem(id: ItemID(2), titleNumber: 2, duration: CMTime(value: 30, timescale: 1)),
+        ])
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .ready)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(vm.selected?.item, ItemID(1), "menu の無い盘は先頭タイトルが既定選択（従来形）")
+        XCTAssertFalse(fake.calls.contains("play"),
+                       "menu の無い素材で自动再生する（#17 の user gate は menu 以外従来まま）")
+    }
+
     func testSingleItemSourceHidesTitleMenu() async {
         let fake = FakePlayerEngine()
         let vm = PlayerViewModel(engine: fake)

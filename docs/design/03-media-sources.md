@@ -146,9 +146,11 @@ public protocol DVDCssBackend: Sendable {
 ```swift
 // RVMediaSources（純 Foundation。RVDecode を import しない境界は維持）
 public struct VideoTsChain: Sendable, Hashable {
-    public let vtsNumber: Int
+    public let vtsNumber: Int      // menu（VMGM）は 0（titleNumber 0 と同じ約束）
     public let partURLs: [URL]      // 連結順（VTS_nn_1, _2, ...）
     public let hasIfo: Bool
+    public let isMenu: Bool        // VMGM（VIDEO_TS.VOB）。列の先頭に置く（§9.7）
+    public var label: String       // warning 等の表示名（実体名。VTS_00 にしない）
 }
 public enum VideoTsNavigator {
     /// nil = DVD-Video 構造でない（呼び出し側は .unsupportedStructure を構成できる）。
@@ -161,37 +163,102 @@ public enum VideoTsNavigator {
   warning を列挙する（#3 受入基準「IFO と VOB の長さが食い違う等を列挙する」の最初の項）。
 - part 番号の飛びは `missingVOB` を残し、繋がった範囲だけを使う。先頭 part (_1) の
   無い VTS はタイトルにしない。`VTS_nn_0.VOB`（メニュー用）は列から除く（実 DVD 配置の実測）。
-- 決定的順序: vtsNumber 昇順・part 番号昇順。`VideoTsPlaybackTests` が fixture 配置で
-  タイトル 2 本の列挙と warning 発生を検査する。
+- 決定的順序: menu（VMGM。下記）が先頭、以下 vtsNumber 昇順・part 番号昇順。
+  `VideoTsPlaybackTests` が fixture 配置での列挙と warning 発生を検査する。
+- **menu（VMGM）列（2026-11-17 追加、§9.7）**: `VideoTsChain` に `isMenu` を持つ。
+  `VIDEO_TS.VOB` が見つかれば `vtsNumber 0`・`isMenu true` のチェーンを列の**先頭**に置く
+  （item は `ItemID(0)` / `titleNumber 0`。§9.7 の first-play 政策の材料）。`VIDEO_TS.IFO` の
+  存在は menu chain の `hasIfo` として立てる。多重 part の VMGM は観測例の無い形なので単一
+  VIDEO_TS.VOB のみ（他 VIDEO_T\* 名は「形式外 name」warning に残る）。VTS_nn_0.VOB の
+  まま（VTS メニュー）は対象外を継続。
 
-### 9.2 多重 VOB 連結（実測で決まった実装形）
+### 9.2 多重 VOB の segment demux + 時刻縫合（実測による設計差し替え。2026-11-17）
 
-AVFoundation の MPEG-PS 処理には 2 つの実測事実がある（2026-11-16、scratch probe +
-`ConcatPSDemuxerTests` が兼実測）:
+AVFoundation の MPEG-PS 処理には 2 つの実測事実がある（2026-11-16、scratch probe。
+concat 期の検査は退場し、以下は `SegmentPSDemuxerTests` と issue #3 が兼実測で確定）:
 
 1. **ファイル単位で 0 起点に正規化する**（生素材の先頭 PTS 2.535 s → track timeRange.start=0）。
    よって「素の PTS の縫合」では繋がらない。
-2. **AVMutableComposition は PS の sample 時刻を書き換えない**（track timeRange は
-   合成オフセットで伸びるが、AVAssetReader は part2 の sample をファイル単位の素の
-   時戳のまま返す。境界直後に 0.53 s 台の sample が現れる実測で確定）。
+2. **AVMutableComposition は PS の sample 時刻を書き換えない**（track timeRange は合成
+   オフセットで伸びるが、AVAssetReader は part2 の sample をファイル単位の素の時戳のまま
+   返す。境界直後に 0.53 s 台の sample が現れる実測で確定。composition 案も退場）。
 
-一方、DVD 仕様は「タイトルの VOB 連結は 1 本の連続した MPEG プログラムストリーム」を
-保証する（VOB 分割は容器のスライス）。合成 fixture で `cat VTS_01_1 VTS_01_2` が
-母素材とバイト一致であることも実測。よって連結 demux は:
+当初実装の ConcatPSDemuxer（バイト連結 → 単一 AVURLAsset）は合成 fixture では成立した
+（demux 180 = 母素材と一致）が、**実写の長いマルチパート VTS で壊れる**ことが実測で確定した
+（issue #3、PICHI 実 ISO）:
+
+- **崩壊形の実測**: 4 パート連結の duration が 76.064 s に崩壊。part 4 単体でも
+  92,865 s と誤読され reader が 3.2 s / 92 sample で停止した。
+- **根本原因は part 4 内部のプログラム再開始**（連結という器ではない）: parts 1〜4 の
+  PES PTS は raw で 0.189→2935.455 s と連続だが、バイト 338,876,430 で 0.189→75.965 s へ
+  戻る（≈ −2,935 s 逆行）。**この点を跨いでも pack SCR は連続**（実測: 338.6〜339.0 MB 窓に
+  負の SCR ジャンプ無し）= 単一 VOB に続けて記録された別プログラム。
+- **PES 5-byte タイムスタンプフィールドだけを正しく寄せる修復で全文字通り読む**:
+  正しい layout の PES のみ修復写し（break 338,876,430・patches 2,501 個。temp の
+  repaired4b.mpg で兼実測）→ duration 357.184 s、reader 完走 10,699 sample
+  （0.221→357.163）。対照: 未修復 part 4 単体は 92 sample。SCR は読まない・触らない
+  （FFmpeg の PS demuxer も pack header を完全に読み飛ばす — libavformat/mpeg.c 実測。
+  走査の pack 前進式は GStreamer と同じ 14 + stuff。PICHI 実測で一致）。
+
+本増分は **無連結・part 単位 demux + demux 内侧の時刻縫合**へ差し替える:
 
 ```swift
-// RVDecode。単一 part はコピーを作らず AVFoundationDemuxer(url:) へ直行。
-public actor ConcatPSDemuxer: Demuxer, PCMSampleSource {
-    public init(partURLs: [URL])   // 1MB chunk の逐次写しで一時ファイルを作る
+// RVDecode。全チェーン（単一 part 含む）がこの経路 — 単一 part は素のファイル経路と
+// 逐語一致（SegmentPSDemuxerTests §5 実測）。単一 part 内部の程序再開始も修復できる。
+public actor SegmentPSDemuxer: Demuxer, PCMSampleSource {
+    public init(partURLs: [URL])   // part 単位の AVFoundationDemuxer。修復写しは deinit で掃除
+}
+// RVDecode。PS start code 走査 + PTS 再開始の修復計画/適用（RV_DEBUG_PSREPAIR=1 で opt-in 診断）。
+public enum ProgramStreamRepair {
+    public static func repairedCopyIfNeeded(of url: URL) async -> (repairedURL: URL, finding: Finding)?
+    static func scanFields(in buf: UnsafeRawBufferPointer, visitor: (_ at: Int, _ hasDTS: Bool) -> Void)
+    static func plan(in buf: UnsafeRawBufferPointer) -> (patches: [Patch], breaks: [Int64])
 }
 ```
 
-- **バイト連結 + 実証済み単一ファイル経路**を採る。sample 時刻の surgery
-  （`CMSampleBufferCreateCopyWithNewTiming`）も、composition のタイムライン合成も不要。
-- 契約は「連結後の列は母素材を単一ファイルとして読んだ列と一致」（テストで逐語一致）。
-  engine 経由の実測でも demux 180 / 提示 180 が母素材と同じ値で完走（VideoTsPlaybackTests）。
-- 代償: open 時にタイトル 1 本ぶんの一時コピー（実 DVD で 1〜8GB）。無連結の
-  ブロック供給経路は §9.4 のハング実測を受けて OQ のまま（次項）。
+- **時間基盤**: 各 part の duration 累積をオフセットにする（上記実測事実 1 に依存）。
+  part 2 以降の sample には `CMSampleBufferCreateCopyWithNewTiming` で時戳を寄せて運ぶ
+  （03 旧 §9.2 で「避ける」とした sample 時戳 surgery — 連結が壊れる以上 surgery を避ける
+  経路が存在しない。demux の内側に閉じ込め、engine・session は従来どおり単一 sample 列を
+  見る（04 §2 の契約不変）。
+- **修復の発火はスキャン検出のみ**（PES PTS 逆行 ≥ 2.0 s = `programBreakSeconds`）。
+  ファイル名・サイズ等の heuristics は無い。clean な part は写しを作らない（PICHI
+  parts 1〜3 で plan ゼロ・写し無し実測。fixture clean 連鎖でも検査で固定）。検出時は
+  warning code `.ptsRestartRepaired`（逆行バイト位置・寄せたフィールド数）を structure に載せる。
+- **PES ヘッダは 2 形を実観測（両方読む。FFmpeg `mpegps_read_pes_header` と同じ判別
+  `(c & 0xE0) == 0x20`）**:
+  * '10xx' marker 形（PES-2。PICHI 実写: video PES flags 0x81/0xC1。PTS/DTS flags）
+  * length 直後の '001x' 形（PES-1 旧形。ffmpeg 生成 fixture: '0011' PTS、lead '0001'
+    継続で DTS。ffprobe pts=48003 / dts=45000 と実バイト一致で確定）
+- **5-byte タイムスタンプの canonical layout（実バイトの round-trip で証明）**:
+  `lead(4) P[32:30](3) '1' P[29:15](15) '1' P[14:0](15) '1'`（P[29:15] は bit31..17、
+  marker bit16）。PICHI VTS_01_1 の実フィールド 0x31000184eb = 0.18903 s を delta 0 で
+  再符号化すると恒等（SegmentPSDemuxerTests §7）。*以前使った 2 実装（Python 実証と
+  Swift 初期版）は bit16/15 を取り違えていた。当時の実測値（319.266 s 等）は誤り二つが
+  打ち消しあった値で、本 layout の round-trip 検証に差し替え置き換えられた。
+- **既知のトレードオフ（受容。cell 時刻縫合は別増分）**:
+  * オフセット = duration 総和の規則は、境界で両 part が自分の窓に含む frame のぶん
+    母素材の単一ファイルタイムラインより大きい（fixture 実測 +0.123 s = 6.107 vs 5.984。
+    実写 PICHI の part 間は 0.5 s 級 gap があり overcount は有界）。
+  * 境界の frame 喪失: この合成 mpeg2 fixture は open GOP で、I 境界で切っても part1 末尾の
+    forward reference frame が part 単体では復号できない（実測 86+90=176/180 = 4 帧喪失。
+    gen-dvd-fixture.sh は ffprobe 実測の keyframe PES 位置で分割する — 中央の任意 pack
+    境界スライスだと part2 先頭 15 帧が落ちる実測）。実 DVD authoring は closed-GOP の
+    cell で切るためこの喪失は 0（PICHI 実盤で part 全体が通る実測）。
+  * 再開始の結合点は設計上 0 间隔（lastSeen アンカー。以降は同一 delta の平行移動で
+    順序・間隔は保存される）。IFO PGCI による章境界の切り分けは別増分。
+- **契約（`SegmentPSDemuxerTests` が兼実測）**: (a) part1 相当領域は単一ファイル読みと
+  逐語一致、(b) frame 集合の喪失 ≤ 4（この fixture の forward reference 上限）で幽霊
+  frame 無し、(c) 縫合後の位置 drift < 0.25 s・提示順に並べて単調・プログラム単位
+  （≥ 2 s）の逆行無し・音声 PCM は単調 PTS で 2 本ぶん届く。単一 part は素の経路と
+  逐語一致。再開始の無い連鎖は写しを作らない。修復算術は合成バイト列で厳密
+  （1.5 s の小刻み逆行は触らず ≥ 2.0 s のみ lastSeen 直後へ続ける。実ファイル実バイトの
+  canonical round-trip）。実写に観測例の無い「SCR・PES とも再開始する 2 連結」形は
+  reader が continuation の明示時刻しか通さない（境界は IFO cell で扱うまで完全な
+  通读を期待しない — 限界メモとして検査で固定）。
+- engine 経由の実測（VideoTsPlaybackTests、2026-11-17）: VTS_01（keyframe 整合 2 分割）の
+  demux/提示 = 176（母素材 180 − 境界 4 帧。§上の喪失説明と一致）。合成 ISO 経由も同じ。
+  旧 concat 期の 180 完走記録は §9.6 の fixture 変更メモ（2026-11-17）まで有効だった。
 
 ### 9.3 ISO（ディスクイメージ）= マウント経路
 
@@ -210,7 +277,7 @@ public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
   "at least one volume could not be unmounted" で失敗 → **demuxer cache を降ろしてから
   eject、失敗時は force**（force は常に出る。UI の eject 同意は optical 実装まで棚上げ）。
 - 開いた後は内部の `VideoTsMediaSource`（マウント点の VIDEO_TS）へ委派。e2e は
-  装置ゲート付き（attach 失敗環境では数値を主張しない。実機では合成 ISO で 180 完走実測）。
+  装置ゲート付き（attach 失敗環境では数値を主張しない。実機では合成 ISO で完走実測 — 現行の完走実数は §9.2 末尾、旧 concat 期は 180）。
 
 ### 9.4 無マウント（ブロック供給 → AVFoundation）の実測結果
 
@@ -261,8 +328,45 @@ public enum MediaSourceRouting {
   複製に変更。単一 MPEG の機械スライスだとタイトル 1 に近く、e2e が数値で区別できなかった。
   実測: タイトル 2 の raw probe = total 122 / valid 120 / lastPTS 3.971 s、
   engine 経由 = demux 120 / 提示 120（0 長 marker 2 件は demux 縁の間引き。OQ-23 の意味論と一致）。
-  タイトル 1 の 180 と明確に区別される。`VideoTsPlaybackTests.testTitleSwitchPlaysSecondTitle`
-  が 120/120 で兼実測固定。
+  タイトル 1（当時は concat 経由 180。2026-11-17 の segment 差し替えで 176 — §9.2）と
+  明確に区別される。`VideoTsPlaybackTests.testTitleSwitchPlaysSecondTitle`
+  が 120/120 で兼実測固定（title 2 は単一 part のため影響なし）。
+
+### 9.7 menu（VMGM）と first-play（2026-11-17 実装済み。ユーザー実測要望）
+
+実盤（PICHI）を開いたとき「最初のメニュー画面（11 s 級の VMGM video）が出て、それが
+終わると本編へ進む」のが DVD プレーヤ実機の挙動。v1 は ITEM 列に VMGM を載せず、
+PlayerViewModel が `PlaybackSelection(item: ItemID(1))` をハードコードしていたため
+ menu 画面が一切出なかった。
+
+- **列の約束**: `VideoTsNavigator` が `VIDEO_TS.VOB` を menu chain（`vtsNumber 0`・
+  `isMenu true`）として検出し、chains の**先頭**に置く（§9.1）。`VideoTsMediaSource` は
+  同じループで `MediaItem(id: ItemID(0), titleNumber: 0)` を作る（model 変更なし —
+  titleNumber は Option で、0 は「menu」の予約値として UI 側で「メニュー」表示にする）。
+  menu は単なる VOB チェーンとして SegmentPSDemuxer を通る（実測: PICHI VIDEO_TS.VOB は
+  単体 probe 11.0 s で問題無し。VTS_01_0.VOB は duration が nan で読めない — 除外のまま。
+  menu 素材が開けない盘は structure warning を残して menu 無しで開く）。
+- **選択の構造駆動化（API 変更）**: `PlayerEngine.load(_:selection:)` の selection が
+  `PlaybackSelection?` へ変わる。nil = 「open 後、構造の先頭 item で解決する」
+  （EngineCore は open 後 `structure.items.first` で解決し selectionChanged を同じ
+  単一経路で流す。tracksChanged より先に解決 — tracksChanged が selectedItem() を読む
+  ため）。VIDEO_TS では menu が先頭 = menu 優先、menu の無い盘は従来どおり先頭タイトル。
+  明示指定の呼び出し（タイトル切り替え・テスト）は無変更で通る。
+- **first-play 政策（PlayerViewModel。UI 側政策として engine に意味を渡さない）**:
+  構造に `titleNumber == 0` の item が在るときだけ自动再生する（盤挿入=再生開始の実機
+  挙動）。menu の無い素材（ファイル・menu 無し盘）は #17 の user gate のまま。
+  menu の再生が `.ended` になったら最初の本体タイトル（titleNumber 最小）を
+  `engine.select(item:)` + `play()` で自動進行する（単一経路原則のため政策の発火は
+  phaseChanged(.ended) からのみ。`menuAdvancePending` ガードで同一 .ended の多重発火を
+  防ぎ、selectionChanged の観測で解除。本体タイトル側では再発火しない）。
+- **検査**: `VideoTsNavigatorTests`（menu 先頭列・menu 無しで項を作らない・VTS_nn_0 は
+  対象外のまま）、`VideoTsPlaybackTests`（structure items [0,1,2] と menu duration、
+  menu の engine 完走 120/ended）、`PlayerViewModelTests`（menu 構造の open で
+  ItemID(0) 既定選択 + 自动再生、.ended → select+play 自動進行 1 回だけ、menu 無し盘は
+  自动再生しない — user gate 不変）。
+- **限界（次の増分）**: VMGM のInteractive menu（PU/PGC 命令・ボタン）は未実装 —
+  メニューは「video として线性に再生」するだけ（IFO VMGM PGCI パースとセットの増分）。
+  複数 part の VMGM（VIDEO_T0.VOB 等）は観測例が無いため未対応（形式外 name warning に残る）。
 
 ## 10. v1 増分以降も未実装のまま残す項目（#3 の続き）
 
