@@ -14,6 +14,8 @@ KEYS = (
     "mode", "playStatus", "loadError", "targetFrameRate", "targetFrameIntervalMS",
     "presented", "late", "firstPresentDelayMS", "totalWallMS", "mediaDurationMS",
     "realTimeFactor", "presentIntervalMS", "decodeStageMS", "errors",
+    "audioStatus", "audioOutputFormat", "clockDriftMS",
+    "audioUnderrunEpisodes", "audioUnderrunTotalMS",
 )
 
 def main() -> None:

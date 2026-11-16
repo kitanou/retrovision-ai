@@ -148,6 +148,74 @@ public actor AVFoundationDemuxer: Demuxer {
         }
     }
 
+    /// PCM 変換読み出し（04 §4・EXP-002 A1）。`AVAssetReaderTrackOutput` の
+    /// outputSettings に線形 PCM を要求すると、システムが AC-3 等を復号・変換して渡す
+    /// （依存ゼロで成立する実測確認済み）。変換 chunk は ~8192 帧に結合されて届く（A2）。
+    /// 映像と違い PCM は reader 内部の buffer を再利用しうるのでコピーを保たせる
+    /// （alwaysCopiesSampleData を既定のままにする）。
+    public func pcmSamples(for track: TrackID, target: PCMTargetSettings)
+        async -> AsyncThrowingStream<AudioPCM, any Error>
+    {
+        let url = self.url
+        let start = readingFrom
+        let end = readRangeEnd
+        let key = trackKeys[track]
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached(priority: .userInitiated) {
+                // dict は non-Sendable なので sending 境界をまたがない（tasks の内側で組む）。
+                let outputSettings: [String: Any] = [
+                    AVFormatIDKey: Int(kAudioFormatLinearPCM),
+                    AVSampleRateKey: target.sampleRate,
+                    AVNumberOfChannelsKey: target.channelCount,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false,
+                ]
+                do {
+                    guard let key, key.mediaType == .audio else {
+                        throw PlaybackError.source(.notFound, message: "音声トラックが見つかりません",
+                                                  recovery: .needsUserAction(.selectDifferentItem))
+                    }
+                    let asset = AVURLAsset(url: url)
+                    let candidates = asset.tracks(withMediaType: .audio)
+                    guard candidates.count > key.index else {
+                        throw PlaybackError.source(.notFound, message: "音声トラックが見つかりません",
+                                                  recovery: .needsUserAction(.selectDifferentItem))
+                    }
+                    let reader = try AVAssetReader(asset: asset)
+                    let output = AVAssetReaderTrackOutput(track: candidates[key.index], outputSettings: outputSettings)
+                    reader.timeRange = CMTimeRange(start: start, end: end ?? .invalid)
+                    guard reader.canAdd(output) else {
+                        throw PlaybackError.decode(.formatRejected, message: "PCM 変換を受け付けられません",
+                                                  recovery: .giveUp(reason: "audio"),
+                                                  cause: reader.error.map { String(describing: $0) } ?? "canAdd=false")
+                    }
+                    reader.add(output)
+                    guard reader.startReading() else {
+                        throw PlaybackError.decode(.corruptStream, message: "音声の読み始めに失敗しました",
+                                                  recovery: .giveUp(reason: "read"),
+                                                  cause: reader.error.map { String(describing: $0) })
+                    }
+                    while !Task.isCancelled {
+                        guard let raw = output.copyNextSampleBuffer() else { break }
+                        if CMSampleBufferGetNumSamples(raw) <= 0 { continue }
+                        continuation.yield(AudioPCM(track: track, buffer: raw))
+                    }
+                    if let error = reader.error {
+                        throw PlaybackError.decode(.corruptStream, message: "音声の読み取りに失敗しました",
+                                                  recovery: .giveUp(reason: "read"),
+                                                  cause: String(describing: error))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// probe 段で読んだ生の format description（04 §2 の `FormatDescriptionHolder` へ渡す）。
     /// sample に format description が添えられない容器で、復号器を作るために使う（実測: EXP-001）。
     public func seedFormatDescription(for track: TrackID) async throws -> CMFormatDescription? {

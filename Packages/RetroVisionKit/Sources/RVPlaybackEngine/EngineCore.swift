@@ -42,9 +42,10 @@ public actor EngineCore {
     private var continuation: AsyncStream<PlayerEvent>.Continuation?
     private var stream: AsyncStream<PlayerEvent>?
 
-    // 再生線（#11）。pipeline は「その source を実際に走らせるための配線」で、
+    // 再生線（#11/#10）。pipeline は「その source を実際に走らせるための配線」で、
     // ファイル source 以外は Phase 2 で同じスロットに収める（FileMediaSource の注記参照）。
-    private var pipeline: (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription)?
+    private var pipeline: (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription,
+                           audioTrack: TrackID?, audioFormat: AudioFormatDescription?)?
     private var session: PlaybackSession?
     private var sessionTask: Task<Void, Never>?
     private var lastOutcome: PlaybackOutcome?
@@ -111,6 +112,7 @@ public actor EngineCore {
 
     public func close() async {
         sessionTask?.cancel()
+        if let session { await session.shutdown() }
         sessionTask = nil
         session = nil
         pipeline = nil
@@ -138,17 +140,39 @@ public actor EngineCore {
             return
         }
         if let pipeline, activePlan ?? pendingPlan != nil {
+            var config = PlaybackSession.Config(videoTrack: pipeline.track, videoFormat: pipeline.format)
+            config.audioTrack = pipeline.audioTrack
+            config.audioFormat = pipeline.audioFormat
+            let audioLine = await makeAudioLine(for: pipeline)
             let session = PlaybackSession(
                 demuxer: pipeline.demuxer,
                 decoder: VideoToolboxDecoder(),
-                config: PlaybackSession.Config(videoTrack: pipeline.track, videoFormat: pipeline.format),
+                config: config,
                 time: deps.time,
+                audio: audioLine,
                 report: { [weak self] event in
                     Task { await self?.handleSessionEvent(event) }
                 })
             self.session = session
             sessionTask = Task { await session.run() }
         }
+    }
+
+    /// 音声線の組立て（#10）。demuxer が PCMSampleSource（AVFoundation の PCM 変換読み出し、
+    /// EXP-002 A1）のときだけ作る。sink.start() は出力装置の無い環境（CI など）で失敗するが、
+    /// それはセッション側で「暫定 pacing へ縮退」として扱う（start はここで呼ばない）。
+    private func makeAudioLine(for pipeline: (demuxer: any Demuxer, track: TrackID,
+                                             format: VideoFormatDescription,
+                                             audioTrack: TrackID?, audioFormat: AudioFormatDescription?)?)
+        async -> AudioLine? {
+        guard let pipeline, pipeline.audioTrack != nil,
+              let audioFormat = pipeline.audioFormat,
+              let pcmSource = pipeline.demuxer as? any PCMSampleSource else { return nil }
+        let decoder = AVFoundationAudioDecoder(source: pcmSource)
+        // sink は「decoder が返すことになっている仕様」で組む（規則の二重化なし）。
+        let target = AVFoundationAudioDecoder.pcmFormat(for: audioFormat)
+        guard let sink = try? AVFoundationAudioSink(pcmFormat: target) else { return nil }
+        return AudioLine(decoder: decoder, sink: sink)
     }
 
     public func pause() async {
@@ -164,7 +188,7 @@ public actor EngineCore {
         // 実際のシーク手順（音声 0.2 s 前から・映像は keyframe から）は #13 で実装する。
         // 再生線がある場合、一時停止して配線を作り直す（#13 まで这是ら暫定）。
         if let session {
-            await session.pause()
+            await session.shutdown()
             self.session = nil
             sessionTask?.cancel()
             sessionTask = nil
@@ -244,18 +268,32 @@ public actor EngineCore {
               let item = structure.items.first,
               let videoFormat = item.videoFormat,
               let track = item.trackTable.first(where: { $0.kind == .video }) else { return }
-        pipeline = (await fileSource.makeDemuxer(), track.id, videoFormat)
+        // 音声トラック（#10）。AVFoundation が列挙できるもののみ（DTS はトラックとして現れない
+        // ＝ EXP-002 A6。Phase 4 の shim ゲートまで音声なしで再生する）。
+        var audioTrack: TrackID?
+        var audioFormat: AudioFormatDescription?
+        if let audio = item.trackTable.first(where: { $0.kind == .audio }),
+           case .audio(let format) = audio.format {
+            audioTrack = audio.id
+            audioFormat = format
+        }
+        pipeline = (await fileSource.makeDemuxer(), track.id, videoFormat, audioTrack, audioFormat)
     }
 
-    private func handleSessionEvent(_ event: PlaybackSession.Event) {
+    private func handleSessionEvent(_ event: PlaybackSession.Event) async {
         switch event {
         case .position(let pts):
             position = pts
             // イベント洪水を防ぐ（UI 向け 0.25 s 間隔。診断は outcome を見る）。
             if lastPositionEmitSeconds == nil || pts.seconds - (lastPositionEmitSeconds ?? -1) >= 0.25 {
                 lastPositionEmitSeconds = pts.seconds
+                // drift は音声 clock が生きているあいだだけ実値（04 §5 の符号系）。
+                var driftMS = 0.0
+                if let session, let last = await session.outcomeSnapshot().clockDriftMS.last {
+                    driftMS = last
+                }
                 continuation?.yield(.positionUpdated(position: pts, duration: structure?.items.first?.duration,
-                                                     clockDriftMS: 0))
+                                                     clockDriftMS: driftMS))
             }
         case .finished(let outcome):
             lastOutcome = outcome

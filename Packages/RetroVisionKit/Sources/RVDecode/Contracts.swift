@@ -174,23 +174,55 @@ public protocol VideoDecoder: Sendable {
     func reset(at pts: MediaTime) async
 }
 
-/// 音声復号（04 §4）。PCM は CoreAudio 側ではなくここで PCM 化して渡す。
-public protocol AudioDecoderProtocol: Sendable {
-    var pathInfo: DecodePathInfo { get async }
-    func configure(_ format: AudioFormatDescription, policy: DecodePolicy) async throws
-    func decode(_ sample: CompressedSample) async throws -> AudioPCM?
-    func flush() async -> [AudioPCM]
-    func reset(at pts: MediaTime) async
+/// 変換目标仕様の指定（Sendable 化のため値型。dict への展開は actor の内側で行う）。
+public struct PCMTargetSettings: Sendable, Hashable {
+    public var sampleRate: Double
+    public var channelCount: Int
+    public init(sampleRate: Double, channelCount: Int) {
+        self.sampleRate = sampleRate
+        self.channelCount = channelCount
+    }
 }
 
-/// 音声出力（04 §4）。realtime thread では確保しない。
+/// 変換済み PCM の供給口。AVFoundation 経路では demuxer が PCM 変換 outputSettings で
+/// 読む（EXP-002 A1 の決定。依存ゼロ）。変換出力は ~8192 帧に結合されて届く（A2）。
+public protocol PCMSampleSource: Sendable {
+    func pcmSamples(for track: TrackID, target: PCMTargetSettings)
+        async -> AsyncThrowingStream<AudioPCM, any Error>
+}
+
+/// 音声復号（04 §4）。実測で確定した形に同期した: 入力は ES サンプル供給ではなく
+/// PCM 変換済み chunk の供給で、復号器側の仕事は (a) 出力仕様の確定、(b) 480 帧
+/// quantum への分割（A2）、(c) 診断（pathInfo・実出力仕様）である。
+/// ES をさばく復号器（FFmpeg shim 経由の DTS 等＝OQ-02 ゲート）が現れたときは、
+/// 同じ出力側（AudioPCM の quantum 列 + outputFormat）を維持して入口だけを差し替える。
+public protocol AudioDecoderProtocol: Sendable {
+    var pathInfo: DecodePathInfo { get async }
+    /// 変換後の実 PCM 仕様（最初の chunk から確定。AudioSink の接続と clock の原料）。
+    /// 確定前は nil。
+    var outputFormat: AudioFormatDescription? { get async }
+    func configure(_ format: AudioFormatDescription, policy: DecodePolicy) async throws
+    /// 480 帧 quantum（10 ms @48 kHz）に分割された PCM 列（04 §4 の量子方針）。
+    func pcm(for track: TrackID) async -> AsyncThrowingStream<AudioPCM, any Error>
+}
+
+/// 音声出力（04 §4）。render thread では確保しない。
 public protocol AudioSink: Sendable {
     func start() throws
     func stop()
+    func pause()
+    func resume()
     func flush()
-    /// 再生されたフレーム位置（クロックの原料）。
+    /// 先に積む。内部で (framePosition, startPTS) の対応表を持つ（04 §5 の clock 原料）。
+    func schedule(_ pcm: AudioPCM) throws
+    /// 積んでいる残余（ms）。underrun 検出と prefill 制御の材料（04 §9 の「音声の underrun」）。
+    func scheduledAheadMS() -> Double
+    /// 再生された frame 位置（クロックの原料）。
     func renderedFramePosition() -> Int64
+    /// 再生位置に対応する PTS（対応表から解決）。未再生なら nil。
+    func renderedPTS() -> MediaTime?
     var outputLatencyMS: Double { get }
+    var outputFormat: AudioFormatDescription? { get }
 }
 
 /// audio master clock（04 §5）。音声側を権威とする。

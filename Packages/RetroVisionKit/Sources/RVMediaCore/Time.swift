@@ -118,6 +118,16 @@ public struct HostTime: Sendable, Hashable, Comparable {
 
     public static func < (lhs: HostTime, rhs: HostTime) -> Bool { lhs.machTime < rhs.machTime }
 
+    /// 壁時計の進みを機械的に加算する（clock の対応付け、再生基点の再アンカー用）。
+    /// 差分は符号つきでよい（clock の逆変換 hostTime(for:) では負にもなる）。
+    public func advancing(ms: Double) -> HostTime {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        let nanos = ms * 1_000_000
+        let delta = Int64((nanos * Double(info.denom) / Double(info.numer)).rounded(.toNearestOrEven))
+        return HostTime(machTime: UInt64(bitPattern: Int64(bitPattern: machTime) &+ delta))
+    }
+
     public func ms(since other: HostTime) -> Double {
         HostTime.ms(from: other.machTime, to: machTime)
     }

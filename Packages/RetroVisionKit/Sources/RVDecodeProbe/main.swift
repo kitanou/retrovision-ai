@@ -511,6 +511,13 @@ final class ProbeReport: @unchecked Sendable {
             entry["realTimeFactor"] = outcome.totalWallMS > 0 ? outcome.mediaDurationMS / outcome.totalWallMS : 0
             entry["presentIntervalMS"] = statistics(outcome.presentIntervalMS)
             entry["decodeStageMS"] = statistics(outcome.decodeStageMS)
+            // 音声線（#10・04 §9）: clock drift と underrun。CI のランナーに出力装置が
+            // 無い場合は audioStatus に failed が残り、clockDriftMS は空になる（映像のみ計測）。
+            entry["audioStatus"] = outcome.audioStatus
+            if let format = outcome.audioOutputFormat { entry["audioOutputFormat"] = format }
+            if !outcome.clockDriftMS.isEmpty { entry["clockDriftMS"] = statistics(outcome.clockDriftMS) }
+            entry["audioUnderrunEpisodes"] = outcome.audioUnderrunEpisodes
+            if outcome.audioUnderrunTotalMS > 0 { entry["audioUnderrunTotalMS"] = outcome.audioUnderrunTotalMS }
             if !outcome.errors.isEmpty { entry["errors"] = outcome.errors }
         }
         entries.append(entry)
