@@ -67,6 +67,9 @@ struct PlayerScreenView: View {
     @AppStorage("ui.showQualityPill") private var showQualityPill = true
     @State private var controlsVisible = true
     @State private var hideTask: Task<Void, Never>?
+    /// 再生画面の表示中だけ有効な入力源（#22。onContinuousHover が NSView 映像面の
+    /// 上で効かないため、AppKit local monitor を併存させる — ControlsActivity.swift）。
+    @State private var activityMonitor: ControlsActivityMonitor?
 
     var body: some View {
         ZStack {
@@ -81,6 +84,16 @@ struct PlayerScreenView: View {
             }
         }
         .onContinuousHover { _ in showControls() }
+        .onAppear {
+            let monitor = ControlsActivityMonitor { showControls() }
+            monitor.start()
+            activityMonitor = monitor
+        }
+        .onDisappear {
+            activityMonitor?.stop()
+            activityMonitor = nil
+            hideTask?.cancel()
+        }
     }
 
     // MARK: 映像（#17 §2 の letterbox/pillarbox。枠の比率は AspectResolution の targetDAR に合わせる）
