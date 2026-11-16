@@ -37,6 +37,10 @@ public struct PlaybackOutcome: Sendable {
     /// 音声 underrun の発生回数と合計長さ（04 §9 の音声測定項目）。
     public var audioUnderrunEpisodes: Int = 0
     public var audioUnderrunTotalMS: Double = 0
+    /// 起動準備（prepare）にかけた wall time。0 = 未実行（#12・OQ-18 の測定項目）。
+    public var warmupMS: Double = 0
+    /// warmup で復号した sample の wall time（decodeStageMS を warmup で汚さないための分離箱）。
+    public var warmupStageMS: [Double] = []
     public var errors: [String] = []
 
     public init() {}
@@ -65,6 +69,9 @@ public actor PlaybackSession {
         public var lateThresholdMS: Double = 2.0
         /// 復号済みキューの上限。
         public var maxQueuedFrames: Int = 4
+        /// 起動準備（prepare）で先に復号する帧数（#12・OQ-18。0 にすると warmup なし＝
+        /// #11 の動作。初回復号スパイク 44〜70 ms を .ready 側に移す目的）。
+        public var warmupFrames: Int = 3
         /// 再生開始前に sink へ積む量（ms）。04 §9 の underrun -free 開始のための値。
         public var audioPrefillMS: Double = 120
         /// 稼働中に維持する積量（ms）。供給はこの下限割れで追う。
@@ -144,6 +151,23 @@ public actor PlaybackSession {
 
     public func isFinished() -> Bool { finished }
     public func outcomeSnapshot() -> PlaybackOutcome { outcome }
+
+    /// 起動準備（#12・OQ-18）。load 完了後に呼ぶ: 復号器を configure し、先頭ぶん（既定 3 帧）を
+    /// 復号してキューに置く — **捨てない**（初帧提示にそのまま使う。VT の初回スパイク 44〜70 ms を
+    /// .ready の待ち時間に吸収するのが目的で、reset は呼ばない = VT session を壊さない）。
+    /// 音声は prefill まで積んで start しない（再生開始の瞬間にずらし、initial の無音すき間を
+    /// 作らない）。run()/step() と並行に呼んでよい（`producing` で復号供給の重複を防ぐ）。
+    public func prepare() async {
+        guard !finished, !prepared else { return }
+        prepared = true
+        let began = time.now()
+        await topUpDecode(limitOverride: config.warmupFrames)
+        await prefillAudio()
+        outcome.warmupMS = time.now().ms(since: began)
+    }
+    private var prepared = false
+    /// 復号・音声供給が進行中か（prepare と run の並行で iterator を二重に進めないための闸门）。
+    private var producing = false
 
     /// 1 呼吸: 音声供給と復号を少し進め、時刻が来ていれば 1 帧消費する。
     /// 呼び手（driver）が時間を進めてから呼ぶ。テストはこれで決定的に進められる。
@@ -230,40 +254,49 @@ public actor PlaybackSession {
 
     // MARK: 音声供給とクロック（04 §4・§5）
 
-    /// prefill → start → 稼働中の補給。供給は 480 帧 quantum（10 ms）単位。
+    /// prefill のみ（start しない）。prepare() が .ready のあいだに、topUpAudio は play 後の
+    /// 初回 tick で呼ぶ（どちらも冪等）。
+    private func prefillAudio() async {
+        guard let audio, !audioFailed, !audioPrefilled, let audioTrack = config.audioTrack else { return }
+        audioPrefilled = true   // 失敗しても再実行しない（縮退が正）
+        if !audioConfigured {
+            audioConfigured = true
+            do {
+                try await audio.decoder.configure(config.audioFormat ?? AudioFormatDescription(
+                    codec: .unknown, sampleRate: 48_000, channelCount: 2), policy: DecodePolicy())
+            } catch {
+                failAudio("configure", error)
+                return
+            }
+        }
+        audioClock = AudioClock(sink: audio.sink, time: time)
+        audioCursor = AudioCursor((await audio.decoder.pcm(for: audioTrack)).makeAsyncIterator())
+        // prefill: start 前に audioPrefillMS 分積む。素材が短い場合は最後まで読む。
+        var safety = 0
+        while audio.sink.scheduledAheadMS() < config.audioPrefillMS, safety < 2_000 {
+            do {
+                guard let quantum = try await audioCursor?.next() else {
+                    audioStreamDone = true
+                    break
+                }
+                try audio.sink.schedule(quantum)
+            } catch {
+                failAudio("prefill", error)
+                return
+            }
+            safety += 1
+        }
+    }
+    private var audioPrefilled = false
+
+    /// 稼働中の補給（play 後の初回 tick で start も行う）。供給は 480 帧 quantum（10 ms）単位。
     /// AVFoundation の PCM 変換は realtimeFactor ≈1100（EXP-002）なので、ここで同期に
-    /// 引く時間は再生時間に対して無視できる（起動時の prefill だけ wall に見える）。
+    /// 引く時間は再生時間に対して無視できる。
     private func topUpAudio() async {
-        guard let audio, !audioFailed, let audioTrack = config.audioTrack else { return }
-        if audioCursor == nil {
-            if !audioConfigured {
-                audioConfigured = true
-                do {
-                    try await audio.decoder.configure(config.audioFormat ?? AudioFormatDescription(
-                        codec: .unknown, sampleRate: 48_000, channelCount: 2), policy: DecodePolicy())
-                } catch {
-                    failAudio("configure", error)
-                    return
-                }
-            }
-            let clock = AudioClock(sink: audio.sink, time: time)
-            audioClock = clock
-            audioCursor = AudioCursor((await audio.decoder.pcm(for: audioTrack)).makeAsyncIterator())
-            // prefill: start 前に audioPrefillMS 分積む。素材が短い場合は最後まで読む。
-            var safety = 0
-            while audio.sink.scheduledAheadMS() < config.audioPrefillMS, safety < 2_000 {
-                do {
-                    guard let quantum = try await audioCursor?.next() else {
-                        audioStreamDone = true
-                        break
-                    }
-                    try audio.sink.schedule(quantum)
-                } catch {
-                    failAudio("prefill", error)
-                    return
-                }
-                safety += 1
-            }
+        guard let audio, !audioFailed, config.audioTrack != nil else { return }
+        if !audioRunning {
+            await prefillAudio()
+            if audioFailed { return }
             do {
                 try audio.sink.start()      // 出力装置の無い環境（CI 等）では throw → 映像のみへ縮退
             } catch {
@@ -330,7 +363,14 @@ public actor PlaybackSession {
 
     // MARK: 映像供給
 
-    private func topUpDecode() async {
+    /// 映像の復号供給。`producing` 闸门で prepare と run の並行実行でも iterator を
+    /// 二重に進めない（actor の一時停止中に別の呼が入るため、flag で守る）。
+    /// `limitOverride` は warmup 用の上限（統計は warmupStageMS に分けて、decodeStageMS の
+    /// 常時再生値を汚さない — #12 の「probe 統計から warmup 分を除外する規則」の実装）。
+    private func topUpDecode(limitOverride: Int? = nil) async {
+        guard !producing else { return }
+        producing = true
+        defer { producing = false }
         if cursor == nil {
             if !configured {
                 configured = true
@@ -346,8 +386,10 @@ public actor PlaybackSession {
             cursor = SampleCursor((await demuxer.samples(for: config.videoTrack)).makeAsyncIterator())
         }
         guard !streamDone else { return }
+        let warmup = limitOverride != nil
+        let roundLimit = limitOverride ?? config.maxQueuedFrames
         var decodedThisRound = 0
-        while queue.count < config.maxQueuedFrames, decodedThisRound < config.maxQueuedFrames {
+        while queue.count < config.maxQueuedFrames, decodedThisRound < roundLimit {
             do {
                 guard let sample = try await cursor?.next() else {
                     streamDone = true
@@ -364,7 +406,12 @@ public actor PlaybackSession {
                 } catch {
                     outcome.errors.append("decode: \(String(describing: error))")
                 }
-                outcome.decodeStageMS.append(time.now().ms(since: began))
+                let tookMS = time.now().ms(since: began)
+                if warmup {
+                    outcome.warmupStageMS.append(tookMS)
+                } else {
+                    outcome.decodeStageMS.append(tookMS)
+                }
                 decodedThisRound += 1
             } catch {
                 streamDone = true

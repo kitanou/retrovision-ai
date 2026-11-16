@@ -163,7 +163,99 @@ final class FilePlaybackTests: XCTestCase {
         XCTAssertLessThan(afterResume.stats.late, 2, "停止区間が late に積算されていない")
     }
 
-    // MARK: - 2. EngineCore 経由の実時間再生（G1 前半資料の回路そのもの）
+    // MARK: - 3. 起動準備（prepare / warmup。#12・OQ-18）
+
+    /// prepare() で先頭ぶんを復号済み（保持）にした状態で駆動しても、提示の完全性
+    /// （全帧 1 回・PTS 順）は壊れないこと。warmup の復号は warmupStageMS に分離され、
+    /// 常時統計（decodeStageMS）に混ざらないこと（#12 の「統計から warmup 分を除外する規則」）。
+    func testWarmupPrepareKeepsFullPlaybackAndSeparatesStageStats() async throws {
+        let url = try fixtureURL("truncated-01-cut.mpg")
+        let demuxer = AVFoundationDemuxer(url: url)
+        let stream = try await demuxer.probe()
+        let (track, format) = try videoTrack(of: stream)
+
+        let time = DeterministicTimeSource(startMS: 10_000)
+        let box = EventBox()
+        var config = PlaybackSession.Config(videoTrack: track.id, videoFormat: format)
+        config.warmupFrames = 3
+        let session = PlaybackSession(
+            demuxer: demuxer,
+            decoder: VideoToolboxDecoder(),
+            config: config,
+            time: time,
+            report: { box.append($0) })
+
+        // load 相当: 時間を進めずに準備だけ行う（EngineCore の .preparing と同じ形）。
+        await session.prepare()
+        let afterPrepare = await session.outcomeSnapshot()
+        XCTAssertEqual(afterPrepare.warmupStageMS.count, 3,
+                       "warmupFrames ぶんの復号が warmupStageMS に記録されていない")
+        XCTAssertEqual(afterPrepare.decodeStageMS.count, 0,
+                       "warmup の復号が decodeStageMS（常時統計）に混ざった")
+        XCTAssertTrue(box.positions.isEmpty, "prepare 中に提示があってはならない")
+
+        // 通常駆動で最後まで（prepare 済みの 3 帧も同じ 1 回だけ提示される）。
+        var iterations = 0
+        while !(await session.isFinished()) && iterations < 5_000 {
+            await session.step()
+            time.advance(ms: 1)
+            iterations += 1
+        }
+        let outcome = await session.outcomeSnapshot()
+        let didFinish = await session.isFinished()
+        XCTAssertTrue(didFinish, "有限時間で終了しない")
+        XCTAssertEqual(outcome.demuxedSampleCount, 12)
+        XCTAssertEqual(outcome.stats.presented, 12,
+                       "warmup で先読みした帧が脱落・重複していない")
+        XCTAssertEqual(outcome.stats.late, 0)
+        XCTAssertEqual(outcome.errors, [])
+        XCTAssertEqual(box.positions.count, 12)
+        strictlyIncreasing(box.positions)
+
+        // 統計の分離は最後まで保たれる（warmup 3 + 常時 9 = 全 sample）。
+        let final = await session.outcomeSnapshot()
+        XCTAssertEqual(final.warmupStageMS.count, 3)
+        XCTAssertEqual(final.decodeStageMS.count, 12 - 3,
+                       "常時統計に warmup 分が混入・または供給が不足")
+    }
+
+    /// warmupFrames = 0（warmup なし）では #11 と同じ形になること: 復号統計は全 sample が
+    /// decodeStageMS に乗り、分離箱は空。上のテストとの差分で「除外規則」の両辺を固定する。
+    func testWithoutWarmupAllDecodesStayInSteadyStats() async throws {
+        let url = try fixtureURL("truncated-01-cut.mpg")
+        let demuxer = AVFoundationDemuxer(url: url)
+        let stream = try await demuxer.probe()
+        let (track, format) = try videoTrack(of: stream)
+
+        let time = DeterministicTimeSource(startMS: 10_000)
+        var config = PlaybackSession.Config(videoTrack: track.id, videoFormat: format)
+        config.warmupFrames = 0
+        let session = PlaybackSession(
+            demuxer: demuxer,
+            decoder: VideoToolboxDecoder(),
+            config: config,
+            time: time)
+
+        await session.prepare()               // warmupFrames=0: 復号しない（音声 prefill のみ）
+        let afterPrepare = await session.outcomeSnapshot()
+        XCTAssertTrue(afterPrepare.warmupStageMS.isEmpty)
+
+        var iterations = 0
+        while !(await session.isFinished()) && iterations < 5_000 {
+            await session.step()
+            time.advance(ms: 1)
+            iterations += 1
+        }
+        let outcome = await session.outcomeSnapshot()
+        let didFinish = await session.isFinished()
+        XCTAssertTrue(didFinish)
+        XCTAssertEqual(outcome.stats.presented, 12)
+        XCTAssertTrue(outcome.warmupStageMS.isEmpty)
+        XCTAssertEqual(outcome.decodeStageMS.count, 12,
+                       "warmup なしの形では全 sample が常時統計に乗る（#11 の形）")
+    }
+
+    // MARK: - 3. EngineCore 経由の実時間再生（G1 前半資料の回路そのもの）
 
     /// truncated-01-cut を EngineCore で最初まで再生し、phase .ended と全帧提示を検査する。
     func testEnginePlaysTruncatedFixtureToEnd() async throws {

@@ -168,12 +168,19 @@ final class ProbeReport: @unchecked Sendable {
             var decodedFrames: [DecodedVideoFrame] = []
             var decodeError: String?
             let decodeStart = Date()
+            // #12 の除外規則: 初回復号（warmup スパイク 44〜70 ms）は firstDecodeMS に単独で
+            // 残し、decodePerFrameMS（常時再生の分布）から除外する。両方 JSON に載るので
+            // 比較可能性は保たれる（規則は 04 §9 / 10-open-questions OQ-18 に記録）。
+            var firstDecodeMS: Double?
             do {
                 for try await sample in await demuxer.samples(for: videoTrack.id) {
                     let began = Date()
                     if let frame = try await decoder.decode(sample) {
                         decodedFrames.append(frame)
-                        decodeTimes.append(milliseconds(from: began))
+                        let took = milliseconds(from: began)
+                        // decoder は先頭 sample を遅延させて nil を返す（F13）。最初の
+                        // **フレームを返した**復号がスパイク地点なので、そこで一度だけ分離する。
+                        if firstDecodeMS == nil { firstDecodeMS = took } else { decodeTimes.append(took) }
                     }
                     if frameLimit > 0, decodedFrames.count >= frameLimit { break }
                 }
@@ -192,6 +199,7 @@ final class ProbeReport: @unchecked Sendable {
             entry["decodedFrameCount"] = decodedFrames.count
             entry["decodeTotalMS"] = totalDecodeMS
             entry["decodePerFrameMS"] = statistics(decodeTimes)
+            if let firstDecodeMS { entry["firstDecodeMS"] = firstDecodeMS }   // warmup 分（#12 の除外規則）
             entry["decodeThroughputFPS"] = decodedFrames.isEmpty ? 0
                 : Double(decodedFrames.count) * 1_000 / max(totalDecodeMS, 0.001)
             if let first = decodedFrames.first {
@@ -468,8 +476,10 @@ final class ProbeReport: @unchecked Sendable {
                 }
             }
         } catch {}
+        let loadBegan = Date()
         do {
             try await engine.load(FileMediaSource(url: url), selection: PlaybackSelection(item: ItemID(1)))
+            entry["loadMS"] = Date().timeIntervalSince(loadBegan) * 1_000   // open + warmup 込み（#12）
         } catch {
             entry["playStatus"] = "load-failed"
             entry["loadError"] = String(describing: error)
@@ -486,9 +496,13 @@ final class ProbeReport: @unchecked Sendable {
         }
         let began = Date()
         await engine.play()
+        var firstPositionMS: Double? = nil
         var endState: String?
         let deadline = began.addingTimeInterval(300)   // 10 秒素材に対する安全側上限
         for await event in events {
+            if case .positionUpdated = event, firstPositionMS == nil {
+                firstPositionMS = Date().timeIntervalSince(began) * 1_000
+            }
             if case .phaseChanged(let phase) = event {
                 switch phase {
                 case .ended: endState = "ended"
@@ -500,6 +514,8 @@ final class ProbeReport: @unchecked Sendable {
         }
         entry["playStatus"] = endState ?? "timeout"
         entry["wallMS"] = Date().timeIntervalSince(began) * 1_000
+        // play → 最初の位置イベント（初帧提示の実時間遅延。warmup 済みの分がここに出る、#12）。
+        if let firstPositionMS { entry["playToFirstPresentMS"] = firstPositionMS }
         if let outcome = await engine.playbackOutcome() {
             let stats = outcome.stats
             entry["presented"] = stats.presented
@@ -511,6 +527,11 @@ final class ProbeReport: @unchecked Sendable {
             entry["realTimeFactor"] = outcome.totalWallMS > 0 ? outcome.mediaDurationMS / outcome.totalWallMS : 0
             entry["presentIntervalMS"] = statistics(outcome.presentIntervalMS)
             entry["decodeStageMS"] = statistics(outcome.decodeStageMS)
+            // warmup（#12）: load の .preparing で消化した分。常時統計（decodeStageMS）と分離。
+            if outcome.warmupMS > 0 {
+                entry["warmupMS"] = outcome.warmupMS
+                entry["warmupStageMS"] = outcome.warmupStageMS
+            }
             // 音声線（#10・04 §9）: clock drift と underrun。CI のランナーに出力装置が
             // 無い場合は audioStatus に failed が残り、clockDriftMS は空になる（映像のみ計測）。
             entry["audioStatus"] = outcome.audioStatus

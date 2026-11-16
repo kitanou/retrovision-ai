@@ -44,8 +44,7 @@ public actor EngineCore {
 
     // 再生線（#11/#10）。pipeline は「その source を実際に走らせるための配線」で、
     // ファイル source 以外は Phase 2 で同じスロットに収める（FileMediaSource の注記参照）。
-    private var pipeline: (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription,
-                           audioTrack: TrackID?, audioFormat: AudioFormatDescription?)?
+    private var pipeline: Pipeline?
     private var session: PlaybackSession?
     private var sessionTask: Task<Void, Never>?
     private var lastOutcome: PlaybackOutcome?
@@ -96,6 +95,7 @@ public actor EngineCore {
             continuation?.yield(.structureChanged(opened.structure))
             continuation?.yield(.tracksChanged(opened.structure.items.first?.trackTable ?? []))
             try rebuildPlan()
+            await preparePlaybackLine()
             transition(to: .ready)
         } catch let error as PlaybackError {
             transition(to: .failed(error))
@@ -115,6 +115,7 @@ public actor EngineCore {
         if let session { await session.shutdown() }
         sessionTask = nil
         session = nil
+        sessionRunning = false
         pipeline = nil
         lastOutcome = nil
         position = .zero
@@ -135,36 +136,54 @@ public actor EngineCore {
         promotePendingPlan()
         transition(to: .playing)
         // 再生線がある場合は実際にフレームを回す。ない場合（DVD 等・Phase 2）は状態機械のみ。
-        if let session {
+        // load で作って warmup 済みのセッション（#12）は run 開始だけ。実行中のものは resume。
+        if session == nil, let pipeline, activePlan ?? pendingPlan != nil {
+            await makeSession(for: pipeline)
+        }
+        guard let session else { return }
+        if sessionRunning {
             await session.resume()
             return
         }
-        if let pipeline, activePlan ?? pendingPlan != nil {
-            var config = PlaybackSession.Config(videoTrack: pipeline.track, videoFormat: pipeline.format)
-            config.audioTrack = pipeline.audioTrack
-            config.audioFormat = pipeline.audioFormat
-            let audioLine = await makeAudioLine(for: pipeline)
-            let session = PlaybackSession(
-                demuxer: pipeline.demuxer,
-                decoder: VideoToolboxDecoder(),
-                config: config,
-                time: deps.time,
-                audio: audioLine,
-                report: { [weak self] event in
-                    Task { await self?.handleSessionEvent(event) }
-                })
-            self.session = session
-            sessionTask = Task { await session.run() }
-        }
+        sessionRunning = true
+        sessionTask = Task { await session.run() }
+    }
+
+    /// セッション生成（load の warmup 経路と、seek 後の再生再開从这里通る）。
+    private func makeSession(for pipeline: Pipeline) async {
+        var config = PlaybackSession.Config(videoTrack: pipeline.track, videoFormat: pipeline.format)
+        config.audioTrack = pipeline.audioTrack
+        config.audioFormat = pipeline.audioFormat
+        let audioLine = await makeAudioLine(for: pipeline)
+        let session = PlaybackSession(
+            demuxer: pipeline.demuxer,
+            decoder: VideoToolboxDecoder(),
+            config: config,
+            time: deps.time,
+            audio: audioLine,
+            report: { [weak self] event in
+                Task { await self?.handleSessionEvent(event) }
+            })
+        self.session = session
+        self.sessionRunning = false
+    }
+    private typealias Pipeline = (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription,
+                                  audioTrack: TrackID?, audioFormat: AudioFormatDescription?)
+    private var sessionRunning = false
+
+    /// 起動準備（#12・OQ-18）。open の完了（.preparing のあいだ）にセッションを作り、
+    /// 復号の初回スパイク（44〜70 ms）と音声 prefill を here 消化する。失敗しても
+    /// open を失敗させない（outcome.errors に残り、再生時に縮退として表面化する）。
+    private func preparePlaybackLine() async {
+        guard let pipeline else { return }
+        await makeSession(for: pipeline)
+        await session?.prepare()
     }
 
     /// 音声線の組立て（#10）。demuxer が PCMSampleSource（AVFoundation の PCM 変換読み出し、
     /// EXP-002 A1）のときだけ作る。sink.start() は出力装置の無い環境（CI など）で失敗するが、
     /// それはセッション側で「暫定 pacing へ縮退」として扱う（start はここで呼ばない）。
-    private func makeAudioLine(for pipeline: (demuxer: any Demuxer, track: TrackID,
-                                             format: VideoFormatDescription,
-                                             audioTrack: TrackID?, audioFormat: AudioFormatDescription?)?)
-        async -> AudioLine? {
+    private func makeAudioLine(for pipeline: Pipeline?) async -> AudioLine? {
         guard let pipeline, pipeline.audioTrack != nil,
               let audioFormat = pipeline.audioFormat,
               let pcmSource = pipeline.demuxer as? any PCMSampleSource else { return nil }
@@ -190,6 +209,7 @@ public actor EngineCore {
         if let session {
             await session.shutdown()
             self.session = nil
+            sessionRunning = false
             sessionTask?.cancel()
             sessionTask = nil
         }
@@ -297,6 +317,7 @@ public actor EngineCore {
             }
         case .finished(let outcome):
             lastOutcome = outcome
+            sessionRunning = false
             continuation?.yield(.statisticsUpdated(DiagnosticsSummary(frames: outcome.stats)))
             if phase == .playing { transition(to: .ended) }
         }
