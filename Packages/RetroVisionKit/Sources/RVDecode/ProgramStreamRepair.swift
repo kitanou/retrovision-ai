@@ -213,7 +213,12 @@ public enum ProgramStreamRepair {
     static func timestampValue(_ buf: UnsafeRawBufferPointer, at: Int) -> Int64 {
         let v: UInt64 = (UInt64(buf[at]) << 32) | (UInt64(buf[at + 1]) << 24)
             | (UInt64(buf[at + 2]) << 16) | (UInt64(buf[at + 3]) << 8) | UInt64(buf[at + 4])
-        return Int64((((v >> 33) & 7) << 30) | (((v >> 17) & 0x7FFF) << 15) | ((v >> 1) & 0x7FFF))
+        // 明示分解（CI の swift build で単一式の型検査が指数爆発した実測: 2026-11-17）。
+        let p3032: UInt64 = (v >> 33) & 7
+        let p1529: UInt64 = (v >> 17) & 0x7FFF
+        let p014: UInt64 = (v >> 1) & 0x7FFF
+        let pts: UInt64 = (p3032 << 30) | (p1529 << 15) | p014
+        return Int64(pts)
     }
 
     /// window 内のフィールドを delta だけシフトして書き戻す。33-bit の範囲を跨ぐ場合は
@@ -224,7 +229,10 @@ public enum ProgramStreamRepair {
         let v: UInt64 = (UInt64(bytes[local]) << 32) | (UInt64(bytes[local + 1]) << 24)
             | (UInt64(bytes[local + 2]) << 16) | (UInt64(bytes[local + 3]) << 8) | UInt64(bytes[local + 4])
         let lead = (v >> 36) & 0xF
-        let pts: UInt64 = (((v >> 33) & 7) << 30) | (((v >> 17) & 0x7FFF) << 15) | ((v >> 1) & 0x7FFF)
+        let p3032r: UInt64 = (v >> 33) & 7
+        let p1529r: UInt64 = (v >> 17) & 0x7FFF
+        let p014r: UInt64 = (v >> 1) & 0x7FFF
+        let pts: UInt64 = (p3032r << 30) | (p1529r << 15) | p014r
         let shifted: UInt64 = UInt64((Int64(bitPattern: pts) &+ delta) &+ 0x2_0000_0000) & 0x1_FFFF_FFFF
         // 5-byte 符号法: lead(4) P[32:30](3) '1' P[29:15](15) '1' P[14:0](15) '1'
         let p3032: UInt64 = ((shifted >> 30) & 0x7) << 33
