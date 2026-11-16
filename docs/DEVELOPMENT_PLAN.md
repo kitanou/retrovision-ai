@@ -1,6 +1,6 @@
 # RetroVision AI 開発計画
 
-最終更新: 2026-11-15
+最終更新: 2026-11-17
 
 本書は [Epic #1](https://github.com/kitanou/retrovision-ai/issues/1) とその実装 Issue #2〜#9 を、実装順序・依存関係・決定ゲート・完了条件に落とし込んだ実行計画です。仕様の本体は Epic と各 Issue が正であり、本書が矛盾する場合は Epic / Issue に従います。
 
@@ -112,6 +112,54 @@ Epic の Milestone 7 に対応します。Phase 3 以降は調査のみ並行し
 1. 非暗号化 / ユーザーオーサリング BD（フォーマットとライブラリのライセンス確認）
 2. 商用 AACS 保護 BD（要件に適合したライセンス済み再生実装と、必要な契約・認証がある場合のみ）
 3. **保護済みの復号フレームを自作の Metal / Core ML 経路に通せるか**をライセンサーまたは SDK ベンダーに確認する。再生ライセンスが任意のフレーム処理や出力経路を許すと仮定しない。
+
+### 残作業の実行計画（2026-11-17 時点の棚卸し）
+
+Phase 2 以降の未実装を、**Metal 主線（トラック A）**と **Metal を待たない作業（トラック B）**の 2 本に分けて並べ直したものです。フェーズとゲートは上記のとおりで、ここでは着手順と前提だけを補います。コード上の現状はコミット 2170e3a 時点の読みに基づきます（「未検証」と書いた項目は裏取り未了）。
+
+#### 判断待ち（決まるまで後続が止まる）
+
+| 項目 | 決めること | 止まる作業 |
+|---|---|---|
+| #15 / OQ-16 実素材 | 所有盤からの自己抽出（非同梱）で pending 7 本を揃える | G1 の条件解除、G2 判定、menu 検証、OQ-17 / OQ-22 |
+| OQ-01 / OQ-03 | DVD 制御に libdvdnav（GPL-2.0-or-later）を使うか、IFO・VM を自前で読むか | インタラクティブ menu、光学ドライブ |
+| OQ-12 | 製品の最小 macOS（コード上は 15 が暫定。G1 前の期限を超過） | 配布、新 API の採否 |
+| OQ-07 / OQ-11 | モデル変換経路・同梱方法・重みのライセンス（Real-ESRGAN の重みは未確認） | #6、#7 |
+| OQ-14 | 2x SR が予算に収まらない場合の扱い | Phase 4 の範囲 |
+
+CSS 回避を実装しない方針（README）のままでは、光学ドライブ対応後も市販 DVD の大半は再生できません（`.protectedNeedsLicense` で止まる）。
+
+#### トラック A — Metal 主線（Phase 2 → 5）
+
+- **A1. Metal 経路のアプリ接続（#5、G2）**
+  - 現状: EngineCore は `RenderPlan` を組むが、提示は OQ-26 の暫定経路（`VideoPresentSink` → `AVSampleBufferDisplayLayer`、`App/.../VideoSurface.swift`）。`MetalRenderGraph` / `MetalPresenter` は RVVideoPipeline の外から参照されていない。
+  - 手順: ① sink 契約を Metal 提示へ差し替え、`VideoSurface` を Metal 描画面に ② detector（FieldMatch / CadenceAnalyzer）と motionAdaptive・inverseTelecine（現状は edgeDirected で代用）③ `ScaleFilter.highQuality` の kernel（定義のみ）④ 表示同期方式の確定（OQ-10）
+  - 完了: G2。combing 判定に実素材（#15）が必要。
+- **A2. Core ML 実行基盤（#6、G3）**: 現状は `ModelManifest` と `ModelRuntimeProtocol` のみ。load/unload、tensor ↔ texture 橋渡し、breaker（5 中 3 失敗で 10 分 open）、tiny model による CI ハーネスを実装する。
+- **A3. 2x 超解像（#7）とノイズ除去・復元（#8）**: `bench/model-comparison/` の比較表を先に作ってから統合する。非 AI の Metal フィルタ（guided filter・unsharp）は A1 の後すぐ前倒しできる。
+- **A4. 適応制御とベンチマーク（#9）**: `AdaptivePolicyEngine` は存在。ControlAction が engine に実適用されているかは未検証。残りは thermal / memory pressure の取得、present jitter の実計測、品質インジケータ UI、ベンチクリップと `bench/reports/`。
+
+#### トラック B — Metal を待たない作業
+
+- **B0. menu 終端の扱い（#3）**: menu の `.ended` で本体タイトルへ自動進行する現行政策（`PlayerViewModel.scheduleMenuAutoAdvance`）を、menu を繰り返す（極端に短い menu は最終フレームで停止）に改める。実盤の menu は静止画（PGC still time）で尺がほぼ 0 のことが多く、停止側が通常経路になり得るため、実盤で先に確認する。
+- **B1. OQ-17 CVFieldDetail（#14）**: 値を解読し PCE と突き合わせて決定ログへ。素材は生成済みの `ntsc480i-22-01-in-mp4` で足りる。
+- **B2. インタラクティブ menu（#3）** — 依存順:
+  1. IFO 実パース（VMGM / VTS の PGCI・PTT・cell 順・音声 / 字幕ストリーム表）。現状は IFO の存在確認のみ。
+  2. NAV パック（private_stream_2: PCI のボタン情報 / DSI）と SPU（private_stream_1）の取り出し。AVFoundation demux はこれらを出さない見込みで、`SubtitleCue` の生成箇所が無い（`ProgramStreamRepair` は private PES を保持するだけ）。自前の PS パケット読みが要る。
+  3. VM 命令（PRE / POST / CELL・ボタン命令）の解釈。OQ-01 の結論で実装形が変わる。
+  4. SPU の RLE 復号・パレット・ハイライトと overlay 合成。合成段は **A1 の Metal 経路が前提**（05 の subtitle composite 段）。
+  5. 操作 UI（矢印・決定・クリック）と VTS menu（`VTS_nn_0.VOB`）。
+- **B3. 光学ドライブ**: DiskArbitration による挿入 / 取出し検出、mediaRemoved の実運用、ISO の UDF 対応範囲（OQ-04）。
+- **B4. 署名（#16）**: `Makefile`（rvprobe）と `Scripts/make-app.sh`（.app）は ad-hoc 署名済み。残りは CI への組み込みと、配布要件（hardened runtime・entitlements、G4）。
+- **B5. DTS**: 現状は警告なしでトラックが消える。先に「再生できない音声」の UI 警告を出し、復号自体は OQ-02 の FFmpeg 判断まで保留。
+
+#### 推奨の着手順
+
+1. すぐ: B0、B1、B4 の CI 部分、B5 の警告。並行して #15 の実素材を揃える。
+2. 主線: A1。並行して B2 の 1〜2。
+3. G2 通過後: A2、B2 の 3〜5。
+4. G3 通過後: A3、A4。
+5. Phase 6 はライセンス問い合わせのみ並行（OQ-03 / OQ-15）。
 
 ## 4. 依存関係
 
