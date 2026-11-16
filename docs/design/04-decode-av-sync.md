@@ -162,7 +162,25 @@ public enum SeekTolerance: Sendable { case exact, previousKeyframe, near(MediaTi
 
 `step(_:)`（1 フレーム送り）は seek を使わず、デコードを 1 フレーム進めて present する専用経路にする。seek を使うと音声の扱いが不定になるため、paused 時のみ許可し音声はミュートしたまま。
 
-## 7. 字幕
+### 実装と実測（#13・2026-11-16）
+
+手順は設計どおり `PlaybackSession.seek(to:tolerance:)` に実装した。実装上の決定（いずれもテストで固定済み）:
+
+- **セッションと VT decoder は生きたまま**（seek で作り直さない・warmup し直さない）。#12 の脈絡そのもので、seek 後の初回复号にもスパイクは出ない（実測: seek 後の復号は定常値 0.7〜2.6 ms）。decoder の `flush()`（session は維持）で F13 の遅延保持帧を流し切る — これにより seek ごとに最低 1 帧の破棄が必ず起き、`DropReason.seekDiscarded` に計上される。
+- **順序**: ①clock stop + `sink.flush()` ②音声 demuxer を `target − 0.2 s` に seek し **先に prefill を作る**（音声 iterator は生成時に reader 位置を capture する。`AVFoundationDemuxer` の reader 位置は 1 本（`readingFrom`）なので、音声の iterator を映像 seek より先に作らないと音が 0.2 s 前から始まらない）③映像 seek → queue / anchors クリア、`discardBefore = target` ④paused でない限り sink を start ⑤`topUpDecode(kind: .seekPreroll)` で target までの復号を進める（回合上限 600）。
+- **generation ガード**: seek 開始で同期インクリメントし、全ての供給ループが await ごとに照合して古い reader は自分から終る（seek による供給中断は degrade でも error でもない）。`seeking` フラグは seek 中の `step()` を止める。
+- **sink の flush/restart**: flush は `player.stop()+reset()`（engine は running のまま — 出力装置の再確保を避け preroll の積み直しだけをやり直す）。`start()` は `engine.isRunning` を見て player だけ再開する。
+- **EngineCore.seek**: phase を `.seeking(target:)` に移し target の position イベントを先に出す（UI は target を表示。§6 の設計どおり）→ session.seek → 元の phase（playing/paused）へ戻す。`PlaybackOutcome.seekMS` に 1 回ごとの wall time を残す。
+
+実測（ntsc480i 系・6 s fixture・target 3.0 s）:
+
+- **着地**: 要求 3.0 s → 最初の sample PTS **2.502 s**。bitstream の key frame（2.535 s）の **1 帧手前**に寄る（AVFoundation の key frame index は実 bitstream と 1 帧ぶんずれることがある。`SeekEffect.landedAt` は要求位置を返し、実際の着地は sample の PTS で確認する契約）。GOP は 0.5 s / 15 帧なので、破棄されるのは target 前 0.5 s ぶんまで。
+- **着地直後の sample 欠番**: frame 76〜88 の 9 sample（I 1・P 4・B 4）を reader 自体が届けない（間引きではなく reader 側の出力。届くのは B 帧だけという交互パターン）。**すべて target 前**なので提示完全性には影響なし。契約は「target 以上の sample はすべて届く」側に置き、テストで固定した（seek(3.0s) → frame 90..179 の 90 帧完全着達）。
+- **OQ-23（0 長 buffer）**: cold read でも seek 再開直後でも 0 長 sample（2 件）が現れる。**demux 縁の間引きは両経路で必須**（risk ではなく実測事実として確定。`gatedEmptySampleCount` で診断を残す）。
+- **決定的回帰**（`FilePlaybackTests.testSeekMidStreamPresentsTargetOnwardExactlyOnce`）: 30 帧再生 → seek(3.0) → 完走で提示 **120 = 30 + 90 ちょうど**（重複なし・PTS 逆行なし）、`seekDiscarded=7`（reader が届けた target 前 6 帧 + 復号保持 1 帧）、seek 後の提示間隔も pts 間隔 ±2 ms。
+- **実時間回帰**（AC-3・`AudioPlaybackTests`）: 再生 1.5 s 地点から seek(3.0) の wall time **91.8 ms**（`seekMS` に記録）。drift 采样は seek 後も継続（clock 再 anchor の証拠）で underrun 0。設計の「0.2〜1.5 s」は実盤前提の UI ガイド値で、合成 6 s 素材ではその 1/2 以下。
+
+
 
 Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字幕（SubRip / WebVTT / ASS）**を別の通路にする。
 
@@ -194,6 +212,8 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 | dropped frames | present されなかった frame を理由付きで計上（late / skippedByPolicy / leaseViolation） | 08 §3 |
 | A/V drift | 0.1 s 間隔で drift を記録、p50/p95/max を集計 | 08 §4 |
 | 音声の underrun | schedule 済み buffer の残数 | 08 §3 |
+| seek 1 回の wall time（preroll 込み） | `PlaybackSession.seek` の前後。1 回ぶんずつ配列に積む | `PlaybackOutcome.seekMS`（04 §6 実測） |
+| seek での破棄（keyframe→target の復号分・decoder の遅延保持分） | `acceptFrame()` の target 前破棄と `decoder.flush()` を reason 付きで計上 | `stats.dropReasons[.seekDiscarded]`（04 §6） |
 
 **確立済みの計測ツール（Phase 1）**:
 1. `make probe`（`rvprobe --json`）: fixture ごとに open→全サンプル復号。`probe-*.json`（decode 時間分布、PTS ゲイン、フレームレート解決の根拠、decode 順と提示順、bitstream / PCE 声明、PAR、音声実験）。

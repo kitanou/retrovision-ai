@@ -33,7 +33,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 | OQ-20 | SW 復号フォールバック（`SoftwareDecoder`）の実現方式（VideoToolbox が弾く pixfmt・codec — WMV1 等） | libavcodec shim。ただし**実際に対象素材が現れるまで作らない**（無依存方針を壊さない） | WMV1 fixture が AVFoundation で開けるかの測定（未実施） | Phase 4 | 対象が判明した時点 |
 | OQ-21 | 合成 fixture の再生成一致性（ffmpeg の版で bit が変わりうる。sha を検証にするか記録にするか） | **決定済み（下記決定ログ）**: `status: generated` で Git 同梱。sha は記録（検査しない） | CI の ffmpeg バージョン漂移の実測 | — | 決定 |
 | OQ-22 | 60i 素材のキャデンス（film-origin pull-down）対応の範囲と ground truth | 未対応（現セットに flag 付き pull-down 素材がない） | 市販 DVD 映画素材の flags と検出器の突合 | G2 | Phase 2 |
-| OQ-23 | seek 再開直後にも zero-sample buffer（`hasSampleData == false`）が現れるか（F5 の再発条件） | demux 縁で一律スキップ（実装済み。PTS 補完に使わない） | seek 直後のサンプル列の測定 | G1 | Phase 1 残作業（低リスク） |
+| OQ-23 | seek 再開直後にも zero-sample buffer（`hasSampleData == false`）が現れるか（F5 の再発条件） | **決定済み（下記決定ログ・#13）**: 出る。cold read でも seek 再開直後でも 0 長 sample が現れることを実測で確認（各 2 件）。demux 縁の間引きは両経路で必須。`gatedEmptySampleCount` で診断を残す | 実測（04 §6・§9）: cold 180 sample 中 2 件 / seek(3.0s) 後 96 sample 中 2 件。decode 段に届いた件数は 0（-12902 ゼロ） | G1 | 完了 |
 | OQ-24 | ビルド成果物の署名方針（unsigned の SPM debug binary が一部環境で SIGKILL=exit 137。CI と配布の関係） | ビルド後 ad-hoc 署名（`codesign --force --sign -`）。Makefile/CI で実施 | 配布形態の要件（hardened runtime・entitlements） | G4 | Phase 4 |
 | OQ-25 | H.264 interlaced 素材の field 順序の情報源（F11 で全て消える）— detector の検証素材をどう用意するか | H.264 は detector 経路で受け入れる。順序の ground truth は生成時情報で持つ | h264 fixture での検出精度比較（生成時に正解既知） | G2 | Phase 2 |
 
@@ -91,6 +91,16 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **数値の再解釈（重要）**: EXP-001 の「初帧 44〜70 ms」は**旧コードの decode-all 経路の max** だった。現在のコード（#4/#11 以降）の decode-all は max 1.45 ms でスパイクが無く、**スパイクは再生線（AVFoundationDemuxer の reader + 同一 session の継続）に現れる**（no-warmup 再生の実測 firstDecode 52〜65 ms、全 11 素材で再現）。G1 の「初回复号は別枠」の前提は生き但つが、内訳が変わった: demux+decode 常時コストは従来どおり軽く、起動コストは warmup で .ready 側に移った。
 - **設計値（起動遅延）**: play→初帧提示 **≤ 50 ms**（実測 p95 17 ms に対し安全側の設計値。UI が open 完了を待って play する流れで成立）。load→初帧提示 **≤ 300 ms**（実測 max 188 ms。warmup は load 側に 57〜106 ms を移すだけで open→初帧の合計は変えない — 利得は「play を open から独立にできる」「初帧測定が clean」「stage 統計が常時値で安定」にある）。この 2 つを 04 §9・DEVELOPMENT_PLAN に設計値として記録。
 - AC-3 の play→初帧 16.5 ms（映像のみ 1〜4 ms に対し）は sink start + clock 初回 anchor の経直。破綻ではないが startup UX の実装（#2）で詰める（04 §9 に注記）。
+
+### 2026-11-16 — seek（#13・OQ-23）の実装決定（実測は 04 §6・§9 に記録）
+
+- **OQ-23 決定**: seek 再開直後にも 0 長 sample buffer は**出る**（cold read で 180 sample 中 2 件、seek 再開で 96 sample 中 2 件を実測。F5 は seek 経路でも再現する）。demux 縁の間引き（`hasSampleData == false` を PTS 補完に使わず捨てる）は**両経路で必須**。件数は `gatedEmptySampleCount` として demuxer に診断を残す（テストが cold / post-seek の両方を検査）。
+- **セッションは生きたまま組み替える**（seek で session・VT decoder を作り直さない）。#12 の warmup 資産を守るためで、実測どおり seek 後の復号は定常値（0.7〜2.6 ms）のまま。decoder の `flush()`（session 維持・`reset()` ではない）で F13 の遅延保持帧を流し切り、`DropReason.seekDiscarded`（新 case）に計上 — seek ごとに 1 帧以上の破棄が必ず出る構造をテストで固定。
+- **reader 位置は 1 本という制約**（`AVFoundationDemuxer` は単一の `readingFrom`）: 音声 iterator は生成時に reader 位置を capture するため、**音声の seek（target−0.2 s）と prefill を映像 seek より先に作る**順序が契約になる。逆順にすると音が target から始まる（prefill の 0.2 s が消える）。将来 reader をトラック別に分離するならこの順序制約は外せるが、現状は順序で固定する。
+- **供給の中断は正常系**: seek で generation を同期インクリメントし、供給ループは await ごとに照合して旧 reader は黙って終る（degrade・error 扱いしない）。seek 中の `step()` は `seeking` フラグで不許可。
+- **sink の flush/restart セマンティクス**: flush は `player.stop()+reset()` で buffer と対応表だけ捨て、**engine は running のまま**（`start()` は `engine.isRunning` を見て player を再開、出力装置の再確保をしない）。#10 の device-missing 縮退とは独立。
+- **AVFoundation の seek 着地は実 bitstream より 1 帧手前**（実測: target 3.0 s → 最初の sample PTS 2.502 s、keyframe は 2.535 s）。`SeekEffect.landedAt` は要求位置を返し、実際の着地は sample の PTS で確認する契約のまま（着地位置を設計値にしない）。加えて着地 GOP の 9 sample（I・P・B 混在、すべて target 前）を reader 自体が届けない。**契約は「target 以上の sample はすべて届く」側に置く**（テストで frame 90..179 の完全着達を固定。着地直後の欠番は破棄側の問題として 04 §6 に記録）。
+- **実測**: 決定的回帰 = 提示 120 ちょうど（30 + target 以上 90）・seekDiscarded 7（reader が届けた target 前 6 + decoder 保持 1）・seek 後の提示間隔 pts ±2 ms。実時間回帰（AC-3）= seek wall time **91.8 ms**（`PlaybackOutcome.seekMS` に記録）・clock 再 anchor 確認（drift 采样継続）・underrun 0。設計の 0.2〜1.5 s は UI ガイド値のまま（合成 6 s 素材ではその 1/2 以下。実盤長い素材での再測は OQ-16 の実素材で）。
 
 ### 2026-11-15〜16 — 運用面の実施決定（実験ゲート外の自己決定）
 

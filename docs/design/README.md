@@ -78,7 +78,8 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | **再生線（EngineCore ↔ demux/decode、#11 前半）** | 実装済み（`PlaybackSession` + `FileMediaSource`。映像のみ: play/pause/resume・PTS 順の提示・位置イベント・`PlaybackOutcome` 計測）。実測: 180 素材で 180/180 提示、realTimeFactor 0.9998、late 0、提示間隔 p50 33.25 ms（目標 33.37）。統合テスト 4 本で回帰固定 |
 | **音声線（#10）** | 実装済み（AC-3→PCM 復号は AVFoundation の変換出力 + `AVFoundationAudioDecoder`（480 帧 quantum・実仕様確定）。`AVFoundationAudioSink` は (framePosition, PTS) 対応表と出力遅延補正。`AudioClock` が提示締切の権威）。実測（AC-3 素材）: **drift p50 +6.9 / p95 +10.6 ms（04 §5 のデッドバンド/補正段階の帯域内）、underrun 0**。出力装置の無い環境は暫定 pacing へ縮退（設計どおり。テストで両経路を検査） |
 | **起動 warmup（#12・OQ-18）** | 実装済み（`PlaybackSession.prepare()` を load の .preparing が呼ぶ: 先頭 3 帧を復号して保持＋音声 prefill（start は play まで遅らせる）。warmup 段の統計は `warmupStageMS` / `firstDecodeMS` に分離）。実測: play→初帧提示 59〜69 ms → **1〜4 ms**（AC-3 16.5 ms）、初回复号スパイク 50〜69 ms は再生線固有と判明（設計値・除外規則は 04 §9。テスト 2 本で固定） |
-| `EngineCore`（02） | 状態機械・設定適用・plan 生成＋上記の再生線（映像・音声）の接続と load 中の warmup 準備まで実装（seek は場当たり的な再構築のみ＝#13） |
+| **seek（#13・OQ-23）** | 実装済み（実行中のセッションと VT session を生きたまま組み替え。target−0.2 s から音声 preroll → 映像は keyframe から target まで復号して捨てる。generation ガード・`DropReason.seekDiscarded`・`seekMS`）。実測: 決定的回帰で**提示 120 ちょうど**（30 + target 以上 90。重複・逆行なし）／`seekDiscarded` 7、実時間（AC-3）で **seek wall time 91.8 ms**・clock 再 anchor・underrun 0。AVFoundation の着地は実 bitstream の key frame より 1 帧手前、着地 GOP の 9 sample が届かない（すべて target 前）と実測。OQ-23: 0 長 buffer は seek 経路でも出る（cold 2 件 / seek 後 2 件）→ demux 縁の間引きを両経路で固定。テスト 3 本（04 §6） |
+| `EngineCore`（02） | 状態機械・設定適用・plan 生成＋上記の再生線（映像・音声）の接続と load 中の warmup 準備、seek（#13）まで実装 |
 | 未実装（03、05、06、07） | 契約と plan のみ（SW 復号は OQ-20 のゲート待ち。DTS 音声は Phase 4 の shim ゲート＝OQ-02。AVFoundation がトラックを列挙しないのは実測済みで、AudioPathTests に回帰固定） |
 | 素材 | `fixtures/manifest.json` 18 登録（**11 を generated として Git 同梱**、実素材 7 は `pending`＝OQ-16）。`make gen-fixtures` で再生成 |
 | ライセンス | `licenses/inventory.json`（Homebrew 版の実測 license・未リンクを区別。`make check-licenses` で検査） |

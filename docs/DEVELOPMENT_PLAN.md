@@ -52,14 +52,14 @@
 1. #2: アプリシェル、比率維持のビデオ表示、Open File、再生操作、音量、全画面、設定 UI（状態はプレースホルダ）
 2. #4: ~~FFmpeg による demux~~ → **AVFoundation demux（ES パススルー）/ VideoToolbox ハードウェアデコード**（EXP-001 で FFmpeg なしで成立と決定済み。ソフトウェアフォールバックは OQ-20 ゲート）、CVPixelBuffer への正規化、タイムスタンプ・フレーム長・色メタデータ・DAR の保持、AVFoundation / CoreAudio クロック、seek / pause / トラック選択
 
-**進捗（2026-11-16）**: #4 の映像経路 ＋ **EngineCore との実接続（#11・映像再生線）** ＋ **音声線（#10: AC-3→PCM 復号・AudioSink・audio master clock）** ＋ **起動 warmup（#12・OQ-18 完了）**が完了・実測済み。11 素材すべて最後まで完走、NTSC/PAL/24p の提示間隔が目標に一致、realTimeFactor ≥0.997。AC-3 素材で drift p50 +6.9 / p95 +10.6 ms（04 §5 の帯域内）・underrun 0。warmup で play→初帧提示 1〜4 ms（旧 59〜69 ms。設計値 ≤50 ms。04 §9）。**ゲート G1 は条件付きで判定可**（下の G1 節に実測で判定を記録）。残りは seek（#13）、#2 の UI。
+**進捗（2026-11-16）**: #4 の映像経路 ＋ **EngineCore との実接続（#11・映像再生線）** ＋ **音声線（#10: AC-3→PCM 復号・AudioSink・audio master clock）** ＋ **起動 warmup（#12・OQ-18 完了）** ＋ **seek（#13・OQ-23 完了。実行中のセッションを組み替えて target 以上を完全提示。実時間 seek 91.8 ms）**が完了・実測済み。11 素材すべて最後まで完走、NTSC/PAL/24p の提示間隔が目標に一致、realTimeFactor ≥0.997。AC-3 素材で drift p50 +6.9 / p95 +10.6 ms（04 §5 の帯域内）・underrun 0。warmup で play→初帧提示 1〜4 ms（旧 59〜69 ms。設計値 ≤50 ms。04 §9）。**ゲート G1 は条件付きで判定可**（下の G1 節に実測で判定を記録）。残る実測系は実素材（OQ-16）と長時運転で、フェーズ作業としては #2 の UI と Metal（#5）へ。
 
 ゲート G1（このフェーズ末で判定）: **AI なしの素の再生パスで、目標マシン（M5 Max 64GB）にて 29.97 / 25 fps が破綻せず、ステージ別の測定値から後段（Metal・Core ML）に使える残り予算が確定する。**
 
 **G1 判定（2026-11-16・条件付き PASS。根拠は 04 §9 の in-loop 実測表）**:
 - 破綻なし: 合成 11 素材がすべて最後まで完走。提示 realTimeFactor ≥0.997、NTSC 33.36 / PAL 40.00 / 24p 41.66 ms が目標に一致。音声 clock 権威の AC-3 素材でも提示間隔 p50 は破綻せず、drift は p95 +10.6 ms（04 §5 の補正段階の帯域内）・underrun 0。起動は warmup 込みで play→初帧 1〜4 ms（AC-3 で 16.5 ms。設計値 ≤50 ms。04 §9）。
 - 残り予算（仮配分の実測への置換）: demux+HW decode 段 p50 — MPEG-2 2.6 ms / H.264 progressive 1.6〜1.9 ms / **H.264 interlaced 5.7 ms**。33.37 ms に対する後段（Metal・Core ML）の目安は **27〜30 ms**（H.264 interlaced を DVD 相当で扱う場合は 27 ms 側。04 §9）。
-- 条件（残る検証）: ①**実素材 7 本での再実行**（合成素材のみで判定。OQ-16 / #15）。②drift の長時間・実盤分布（R8 の懸念。合成 6 s では 0 累積を確認したにとどまる）。
+- 条件（残る検証）: ①**実素材 7 本での再実行**（合成素材のみで判定。OQ-16 / #15）。②drift の長時間・実盤分布（R8 の懸念。合成 6 s では 0 累積を確認したにとどまる）。実盤の seek もここに含む（合成素材では 91.8 ms だが、実盤は key frame 間隔・GOP 構造が違い、target 前の破棄数と preroll 量がうる）（#13）。
 - 数値の注意（2026-11-16 更新）: `make probe` の decode-all は現行コードでは復号 max 1.45 ms（初帧スパイクなし）。**初回复号スパイク（50〜69 ms）は再生線に現れる**が、warmup（#12/OQ-18 完了）で load の .preparing 側に移済み。常時再生の stage 値は in-loop 表を使う（04 §9 に warmup 実測と設計値〈play→初帧 ≤50 ms、load→初帧 ≤300 ms〉を記録）。
 
 - 判定資料: 代表クリップでのフレーム間隔ヒストグラム、ドロップ数、A/V ドリフト
@@ -212,9 +212,10 @@ Phase 1〜5 がゲートを通過した時点で、MVP としての判断材料�
 | 10 | MPEG-2 bitstream 解析（frame rate / field 順序の一次情報） | **完了**（ffprobe と byte-for-byte 突合。PCE 解析。回帰テスト 14 本） |
 | 11 | 合成 fixture 生成・登録・検査（gen-fixtures / check-fixtures） | **完了**（10 本 Git 同梱。実素材は OQ-16） |
 | 12 | probe 計測基盤（`make probe` / `make probe-play` + nightly 収集） | **完了**（映像 + 音声 in-loop + 起動（loadMS/playToFirstPresentMS/warmup）の計測。clock drift・underrun も実測済み → 04 §9。残るは実素材での再測＝OQ-16） |
-| 13 | EngineCore ↔ demux/decode の実接続（#11・映像再生線） | **完了**（PlaybackSession + FileMediaSource。11 素材完走・realTimeFactor ≥0.997・提示間隔は目標に一致（04 §9）。統合テスト 4 本）。seek（#13）は別作業 |
+| 13 | EngineCore ↔ demux/decode の実接続（#11・映像再生線） | **完了**（PlaybackSession + FileMediaSource。11 素材完走・realTimeFactor ≥0.997・提示間隔は目標に一致（04 §9）。統合テスト 4 本） |
 | 14 | 音声線（#10: `AVFoundationAudioDecoder` / `AVFoundationAudioSink` / `AudioClock`） | **完了**（AC-3→PCM 変換 + 480 帧 quantum、framePosition↔PTS 対応表、audio master clock が提示締切の権威。AC-3 素材で drift p50 +6.9 / p95 +10.6 ms・underrun 0。単体 4 本 + e2e 3 本）。DTS は A6 のため Phase 4 shim ゲートまで非対応（回帰テストで固定）。drift の補正行動（SyncController）は Phase 2 |
 | 15 | 起動 warmup（#12・OQ-18） | **完了**（`PlaybackSession.prepare()` が load の .preparing で先頭 3 帧を復号・保持＋音声 prefill。play→初帧 59〜69 ms → 1〜4 ms（AC-3 16.5 ms）、設計値 ≤50 ms / load→初帧 ≤300 ms を 04 §9 に記録。統計の除外規則は warmupStageMS / firstDecodeMS 分離でテスト 2 本＋probe で固定。初回复号スパイクは再生線固有と判明——EXP-001 の decode-all 44〜70 ms は旧コードの実測） |
+| 16 | seek（#13）＋ zero-length sample の間引き（OQ-23） | **完了**（実行中のセッションと VT session を生きたまま組み替える。target−0.2 s から音声 preroll → 映像は keyframe から target まで復号して捨てる。実測: 決定的回帰で提示 120 ちょうど（重複・逆行なし）／seekDiscarded 7、実時間（AC-3）で seek wall time **91.8 ms**・clock 再 anchor・underrun 0。OQ-23 は seek 経路でも 0 長 buffer が出ると確認済み（cold 2 件 / seek 後 2 件）→ demux 縁の間引きを両経路で固定。AVFoundation の seek 着地が実 bitstream の key frame より 1 帧手前になることも実測（04 §6）。テスト 3 本） |
 
 ## 10. 関連
 
