@@ -2,6 +2,7 @@ import Foundation
 import RVMediaCore
 import RVMediaSources
 import RVDecode
+import UniformTypeIdentifiers
 
 // MARK: - ファイル source の MediaSource（03 §6 のファイル系、#11 の接続点）
 //
@@ -25,6 +26,18 @@ public actor FileMediaSource: MediaSource {
     }
 
     public func open() async throws -> OpenedSource {
+        // ディスクイメージ系（ISO 等）は現ファイル経路では開けない。AVFoundation の probe が
+        // -11828（フォーマット非対応）を返すだけ（2026-11-16 実測。合成 DVD ISO で作成→開く試行）。
+        //DVD 読み（ISO/VIDEO_TS の BLOCK 経路）は #3 の増分。そこでは 03 §6 の
+        // 「DVD を検出できません」を作るまでの暫定として、実測で成立している回避策を案内する
+        // （ISO をマウントして中の .VOB を直接開く = MPEG-PS として再生できた）。
+        if Self.isDiskImageLike(url) {
+            throw PlaybackError(kind: .source(.unsupportedStructure),
+                                causeDescription: "AVFoundation はディスクイメージ（ISO9660/UDF）を demux できない（AVError -11828 実測）",
+                                recovery: .needsUserAction(.insertDisc),
+                                userMessage: "ISO（ディスクイメージ）は直接開けません。DVD タイトルの読み込みは #3 で対応中です。"
+                                    + "今は ISO をマウントして中の .VOB ファイルを直接開くと再生できます（実測）。")
+        }
         let demuxer = AVFoundationDemuxer(url: url)
         self.cachedDemuxer = demuxer
         let stream = try await demuxer.probe()
@@ -51,6 +64,14 @@ public actor FileMediaSource: MediaSource {
         let demuxer = AVFoundationDemuxer(url: url)
         cachedDemuxer = demuxer
         return demuxer
+    }
+
+    /// ディスクイメージ系の UTI か（.iso/.dmg/.cdr 等。拡張子から決定的に判定する —
+    /// #3 の ISOBlockReader 経路が繋がるまでの事前ゲート。03 §6）。
+    static func isDiskImageLike(_ url: URL) -> Bool {
+        guard let ext = url.pathExtension.lowercased() as String?, !ext.isEmpty else { return false }
+        guard let type = UTType(filenameExtension: ext) else { return false }
+        return type.conforms(to: .diskImage)
     }
 
     /// パスから決定的な SourceID（FNV-1a。プロセス間・実行間で安定にしておく）。

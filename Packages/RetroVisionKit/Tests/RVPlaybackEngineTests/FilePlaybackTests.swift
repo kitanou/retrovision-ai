@@ -451,4 +451,23 @@ final class FilePlaybackTests: XCTestCase {
                        "close 後の seek 復帰が phase を復活させた（line generation ガードの後退）")
         await engine.close()
     }
+
+    /// ISO（ディスクイメージ）を開いたとき、汎用エラーではなく構造化された
+    /// `.unsupportedStructure` になること（03 §6。AVFoundation の -11828 をそのまま見せない —
+    /// 2026-11-16 のユーザー報告「ISOを読み込んだらエラーとなりました」への修正）。
+    func testDiskImageURLGetsStructuredUnsupportedError() async throws {
+        let url = URL(fileURLWithPath: "/nonexistent/disk-image-test.iso")
+        let source = FileMediaSource(url: url)
+        do {
+            _ = try await source.open()
+            XCTFail("ISO が開けてしまった（事前ゲート而后退）")
+        } catch let error as PlaybackError {
+            XCTAssertEqual(error.kind, .source(.unsupportedStructure))
+        }
+        // 誤発火の検査: 実ファイルは content で決める（拡張子ゲートに映像を通さない）。
+        XCTAssertFalse(FileMediaSource.isDiskImageLike(URL(fileURLWithPath: "/tmp/a.mpg")))
+        XCTAssertFalse(FileMediaSource.isDiskImageLike(URL(fileURLWithPath: "/tmp/a.vob")))
+        XCTAssertTrue(FileMediaSource.isDiskImageLike(URL(fileURLWithPath: "/tmp/a.iso")))
+        XCTAssertTrue(FileMediaSource.isDiskImageLike(URL(fileURLWithPath: "/tmp/a.dmg")))
+    }
 }
