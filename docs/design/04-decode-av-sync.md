@@ -214,6 +214,7 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 | 音声の underrun | schedule 済み buffer の残数 | 08 §3 |
 | seek 1 回の wall time（preroll 込み） | `PlaybackSession.seek` の前後。1 回ぶんずつ配列に積む | `PlaybackOutcome.seekMS`（04 §6 実測） |
 | seek での破棄（keyframe→target の復号分・decoder の遅延保持分） | `acceptFrame()` の target 前破棄と `decoder.flush()` を reason 付きで計上 | `stats.dropReasons[.seekDiscarded]`（04 §6） |
+| 提示サーフェスへの受け渡し（暫定経路・OQ-26） | delivered / displayMissed の保存則（presented = delivered + displayMissed） | `PlaybackOutcome.displayMissed`（05 §7・PresentHandoffTests） |
 
 **確立済みの計測ツール（Phase 1）**:
 1. `make probe`（`rvprobe --json`）: fixture ごとに open→全サンプル復号。`probe-*.json`（decode 時間分布、PTS ゲイン、フレームレート解決の根拠、decode 順と提示順、bitstream / PCE 声明、PAR、音声実験）。

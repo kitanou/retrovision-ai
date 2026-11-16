@@ -26,6 +26,7 @@ public protocol PlayerEngine: AnyObject {
     func seek(to time: MediaTime, tolerance: SeekTolerance) async
     func step(_ direction: StepDirection) async      // 1 フレーム送り（deint 検証用）
     func setRate(_ rate: Double) async               // 1.0 のみ対応。0.5 は Phase 5 以降で判断（OQ-09）
+    func setVolume(_ gain: Double) async             // 0.0〜1.0 線形。#17 の音量スライダー（決定ログ #14 で追加。phase を変えない）
 
     // 選択
     func select(_ track: TrackID, for kind: TrackKind) async
@@ -49,6 +50,12 @@ public final class DefaultPlayerEngine: PlayerEngine, @unchecked Sendable {
     // @MainActor 公開 API → EngineCore へ非同期で転送
 }
 ```
+
+**実装状況（#2・2026-11-16）**: 上記の形のまま実装済み（`DefaultPlayerEngine` は @MainActor、
+events の fan-out と snapshot ミラーをここに置く = §4 の「複数契約者が必要なら engine 側」の
+実装点）。UI 側のテストスタブ `FakePlayerEngine` はアプリ target 側にある（#17 §6 対応）。
+再入安全: close/load で **line generation** を進め、線の外側になった seek 復帰と旧 session の
+イベントは黙る（#13 のセッション内ガードの engine 側対応。決定ログ #14）。
 
 ## 3. 状態機械
 

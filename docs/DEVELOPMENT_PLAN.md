@@ -52,7 +52,7 @@
 1. #2: アプリシェル、比率維持のビデオ表示、Open File、再生操作、音量、全画面、設定 UI（状態はプレースホルダ）
 2. #4: ~~FFmpeg による demux~~ → **AVFoundation demux（ES パススルー）/ VideoToolbox ハードウェアデコード**（EXP-001 で FFmpeg なしで成立と決定済み。ソフトウェアフォールバックは OQ-20 ゲート）、CVPixelBuffer への正規化、タイムスタンプ・フレーム長・色メタデータ・DAR の保持、AVFoundation / CoreAudio クロック、seek / pause / トラック選択
 
-**進捗（2026-11-16）**: #4 の映像経路 ＋ **EngineCore との実接続（#11・映像再生線）** ＋ **音声線（#10: AC-3→PCM 復号・AudioSink・audio master clock）** ＋ **起動 warmup（#12・OQ-18 完了）** ＋ **seek（#13・OQ-23 完了。実行中のセッションを組み替えて target 以上を完全提示。実時間 seek 91.8 ms）**が完了・実測済み。11 素材すべて最後まで完走、NTSC/PAL/24p の提示間隔が目標に一致、realTimeFactor ≥0.997。AC-3 素材で drift p50 +6.9 / p95 +10.6 ms（04 §5 の帯域内）・underrun 0。warmup で play→初帧提示 1〜4 ms（旧 59〜69 ms。設計値 ≤50 ms。04 §9）。**ゲート G1 は条件付きで判定可**（下の G1 節に実測で判定を記録）。残る実測系は実素材（OQ-16）と長時運転で、フェーズ作業としては #2 の UI と Metal（#5）へ。
+**進捗（2026-11-16）**: #4 の映像経路 ＋ **EngineCore との実接続（#11・映像再生線）** ＋ **音声線（#10: AC-3→PCM 復号・AudioSink・audio master clock）** ＋ **起動 warmup（#12・OQ-18 完了）** ＋ **seek（#13・OQ-23 完了。実行中のセッションを組み替えて target 以上を完全提示。実時間 seek 91.8 ms）**が完了・実測済み。11 素材すべて最後まで完走、NTSC/PAL/24p の提示間隔が目標に一致、realTimeFactor ≥0.997。AC-3 素材で drift p50 +6.9 / p95 +10.6 ms（04 §5 の帯域内）・underrun 0。warmup で play→初帧提示 1〜4 ms（旧 59〜69 ms。設計値 ≤50 ms。04 §9）。**ゲート G1 は条件付きで判定可**（下の G1 節に実測で判定を記録）。**#2 の Phase 1 シェル完了**（`App/RetroVisionApp`: 空状態・再生・操作・比率・設定・エラー表示。実 engine e2e で open→再生→seek→close まで回帰固定。`DefaultPlayerEngine` で UI はプロトコル境界だけを通る）。残る実測系は実素材（OQ-16）と長時運転で、フェーズ作業としては Metal（#5）と DVD source（#3）へ。
 
 ゲート G1（このフェーズ末で判定）: **AI なしの素の再生パスで、目標マシン（M5 Max 64GB）にて 29.97 / 25 fps が破綻せず、ステージ別の測定値から後段（Metal・Core ML）に使える残り予算が確定する。**
 
@@ -206,7 +206,7 @@ Phase 1〜5 がゲートを通過した時点で、MVP としての判断材料�
 | 4 | 依存の導入方針（FFmpeg / libdvdnav のビルド・配布形） | **縮小**（2026-11-16、EXP-001）: ファイル再生に依存なし。残りは DVD 制御（Phase 2 の block-reader 実験）と WMV1（Phase 4 ゲート、OQ-20）。OQ-01 / OQ-02 の決定ログ参照 |
 | 5 | テスト素材セットの取得元と sha256（#7 / #8 の共通基盤） | 合成 11 本を Git 同梱・manifest 登録（`kind: generatedFile` + 実測 sha、sha は記録扱い）。実素材 7 は pending（OQ-16） |
 | 6 | 保護ディスク（CSS）と Blu-ray のライセンス問い合わせ | 未着手。OQ-03 / OQ-15（リードタイムがあるため早期に問い合わせる） |
-| 7 | player-engine プロトコルの実装（#2 の本体 UI は未着手） | プロトコル・状態機械・plan 生成まで実装。UI とデコード接続は Phase 1 |
+| 7 | player-engine プロトコルの実装（#2 の本体 UI） | **完了**（`DefaultPlayerEngine` 適合 + `App/RetroVisionApp` シェル: 空状態・再生画面・コントロールバー・比率 4:3 解決・全画面・メニュー/ショートカット・設定・エラー表示・有効無効表のテスト。音量経路（PlayerEngine.setVolume）と line generation ガードもここで実測修正。残作業は Phase 2 以降の機能（DVD サイドバー・字幕メニュー・A/B・診断 inspector）と #16 のバンドル化） |
 | 8 | Python / coremltools 環境（モデル変換） | 未着手。OQ-07 |
 | 9 | 映像 demux + VideoToolbox 復号（#4 の映像本体） | **完了**（AVFoundation ES パススルー + VT 直行。全 10 fixture 通過、提示順の順序保証を統合テストで固定） |
 | 10 | MPEG-2 bitstream 解析（frame rate / field 順序の一次情報） | **完了**（ffprobe と byte-for-byte 突合。PCE 解析。回帰テスト 14 本） |

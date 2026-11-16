@@ -20,7 +20,7 @@
 | OQ-14 | 2x SR が実時間に収まらない場合の製品方針（#7 を非リアルタイム機能に縮小するか、非 AI 品質を標準とするか） | 非 AI 経路を標準品質にし、#7 は非リアルタイムの復元機能へ縮小 | G3 の実測値と、意図した画質が得られるかの主観評価 | G3 | Phase 3 末 |
 | OQ-15 | Blu-ray の対応範囲（非暗号化 BD のみ / 商用 AACS） | 対象外（Phase 6 の別ゲート） | 想定利用フォーマットの実態、SDK の見積り | BD ゲート | Phase 3 以降に調査 |
 
-## OQ-16〜OQ-25（Phase 1/2 の実測から抽出した新しい未決、2026-11-16）
+## OQ-16〜OQ-26（Phase 1/2 の実測から抽出した新しい未決、2026-11-16）
 
 Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-videotoolbox.md)）によって、設計当時は想定しなかった穴が観測された。実在する穴だけを登録する。
 
@@ -36,6 +36,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 | OQ-23 | seek 再開直後にも zero-sample buffer（`hasSampleData == false`）が現れるか（F5 の再発条件） | **決定済み（下記決定ログ・#13）**: 出る。cold read でも seek 再開直後でも 0 長 sample が現れることを実測で確認（各 2 件）。demux 縁の間引きは両経路で必須。`gatedEmptySampleCount` で診断を残す | 実測（04 §6・§9）: cold 180 sample 中 2 件 / seek(3.0s) 後 96 sample 中 2 件。decode 段に届いた件数は 0（-12902 ゼロ） | G1 | 完了 |
 | OQ-24 | ビルド成果物の署名方針（unsigned の SPM debug binary が一部環境で SIGKILL=exit 137。CI と配布の関係） | ビルド後 ad-hoc 署名（`codesign --force --sign -`）。Makefile/CI で実施 | 配布形態の要件（hardened runtime・entitlements） | G4 | Phase 4 |
 | OQ-25 | H.264 interlaced 素材の field 順序の情報源（F11 で全て消える）— detector の検証素材をどう用意するか | H.264 は detector 経路で受け入れる。順序の ground truth は生成時情報で持つ | h264 fixture での検出精度比較（生成時に正解既知） | G2 | Phase 2 |
+| OQ-26 | #5（Metal 提示）が載るまでの映像提示の形（#2 が先、#5 が後の順序に対する間つなぎ） | **暫定既定で実装済み（下記決定ログ #14）**: engine は present 済み帧を `VideoPresentSink` で UI に渡す（in-flight 3、超過は `displayMissed` に計上）。UI 側は AVSampleBufferDisplayLayer に enqueue のみ。比率は帧の format から AspectResolver で解決 | 実装・回帰固定（PresentHandoffTests の保存則 / SurfaceAspectTests の 4:3 / アプリ e2e）。#5 の Metal 提示で置換されるまで暫定 | G2 | 完了（#5 で置換前提） |
 
 ## 決定ログ
 
@@ -107,6 +108,16 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **OQ-21**: 合成 fixture は自己生成物（第三者の権利を含まない）として Git に同梱し、`fixtures/manifest.json` に `status: generated` / `kind: generatedFile` + 実測 sha256 + 生成パラメータで登録した。版差で bit 一致は保証しないため **sha は記録であって検査ではない**（`check-fixtures.py` は存在・フィールド構造を検査。再生成は `make gen-fixtures`、既存ファイルはスキップ）。実素材の `pending` 7 件は OQ-16 に紐づいて保留。
 - **H.264 fixture の仕様**: yuv420p / High 4:2:0 に変更。High 4:2:2（yuv422p）ではこの機械の VideoToolbox が handler status -8969 で弾いた（開かない素材を待たせるより、通る仕様で固定）。
 - **ライセンス棚卸は実測値へ**: libdvdnav 7.0.0・libdvdread 7.1.1・libdvdcss 1.6.0 はいずれも **GPL-2.0-or-later**（過去の MIT 記録は誤り）。Homebrew ffmpeg 9.0.2 は GPL-3.0-or-later。すべて `planned`（未リンク）のまま。CSS/AACS の照会（OQ-03）は未着手。
+
+### 2026-11-16 — プレイヤーシェル（#2）の実装決定（UI 設計そのものは #17 に固定済み）
+
+- **OQ-26 決定（暫定既定・#5 で置換前提）**: Metal 提示（#5）より先に UI シェルが動くため、提示は「engine が present 済み帧を `VideoPresentSink`（async receive）で渡す」契約の間つなぎ。UI 側は AVSampleBufferDisplayLayer に enqueue のみ（スケーリング・deint なし。`enqueue(_:)` は macOS 15 非推奨 — 置換までの許容）。in-flight 上限は 00 §5 と同じ 3。渡せなかった帧は `PlaybackOutcome.displayMissed` に数える（保存則 presented = delivered + displayMissed をテストで固定）。再生は止めない（INV-1）。`AVFoundationAudioSink` の前例どおり MainActor クラスの async メソッドで非 isolated async 要件を満たせる（SDK 実測）。
+- **PlayerEngine に setVolume を追加**（#17 に音量スライダーがあるのに 02 §2 のプロトコルに音量が無かった取りこぼし）。値は線形 0.0〜1.0、engine は AudioSink 契約に追加した setVolume で player node のゲインだけ触る（対応表・クロック不変。音声線が無い素材では no-op で UI の状態だけ保つ）。セッション再生成でも値は引き継ぐ。
+- **line generation ガード（実測した reentrancy 不具合の修正）**: EngineCore は actor なので seek の await 中に close が割り込める。実測順序: seeking → （close で）empty → seek 復帰で playing → ended と、phase が復活した（アプリ e2e の print デバッグで確定）。close/load で generation を進め、seek は復帰後に線が変わっていれば phase を触らず終る。旧 session の report クロージャも生成時 generation を持つ（#13 のガードの engine 側姉妹）。回帰: `testCloseDuringInFlightSeekLeavesPhaseEmpty`。
+- **#17 の有効・無効表からの逸脱（preparing のみ）**: 実測で preparing は load の中に一瞬通り、UI が購読する前に .ready へ進みうる（#12 の warmup を load 内に収める設計のため）。「操作不可」にすると開いている間の transport が死に、着弾後に再度押すはめになる。表を緩め、preparing は play/pause だけ許し seek・step・トラック選択（構造確定が要る操作）は不許可にした。実装は `PlayerViewModel` の computed property で、全 phase の表は `PlayerViewModelTests` に固定。
+- **境界検査**: アプリ source は RVMediaCore / RVMediaSources / RVPlaybackEngine のみを import する（INV-8）。`ImportBoundaryAppTests` が機械検査。アプリは単独 SPM パッケージ（App/RetroVisionApp）で、make と CI に build/test を追加（00 §2 の構造どおり。Xcode ワークスペース化と App Sandbox・署名は #16）。
+- **比率の暫定実装**: 表示比率は最初の提示帧の `format`（codedSize + aspectSignals）から AspectResolver で解決し、枠の aspectRatio に反映。NTSC 720x480（PAR 10:11）が 4:3 になる回帰を 2 本（単位 + e2e）で固定。信号が無い素材は 1:1 画素比で仮表示し、メニューで明示選択を促す（推測で 4:3 に倒さない = 01 §2 の方針継続）。
+
 
 ## 意思決定の運用
 

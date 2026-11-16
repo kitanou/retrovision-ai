@@ -139,6 +139,14 @@ drawable.addPresentedHandler { drew in
 - `presentsWithTransaction = false`（UI との同期を待たない）。
 - in-flight は最大 3（00 §5）。`MTLDrawable` の保留数が上限に達している場合、新規エンコードを待たずに**その frame を drop** して present 側を進める（INV-1 の一環: 音声は待たない）。
 
+**暫定提示経路（OQ-26・#2 で実装済み、#5 で置換）**。Metal 提示が載るまでは、engine は
+present を済らせた帧を `VideoPresentSink`（async receive）で UI 側の実装に渡す。UI 側は
+AVSampleBufferDisplayLayer に enqueue するだけ（スケーリング・deint は通さない — 画質でなく
+UI の回路と比率の正しさを見る経路）。in-flight 上限 3 は同じ値で、渡せなかった帧は
+`PlaybackOutcome.displayMissed` に計上される（保存則: presented = delivered + displayMissed。
+PresentHandoffTests で固定）。表示比率は UI 側が帧の `format` から AspectResolver で解決する
+（NTSC 720x480 → 4:3。SurfaceAspectTests とアプリ e2e で回帰固定）。
+
 ## 8. GPU 計測（#5 の受入基準「GPU timings and end-to-end frame latency are instrumented」）
 
 | 手段 | 用途 | 備考 |
