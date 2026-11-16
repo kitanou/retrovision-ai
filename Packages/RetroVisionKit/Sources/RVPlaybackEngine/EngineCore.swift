@@ -37,7 +37,6 @@ public actor EngineCore {
     private var activePlan: RenderPlan?
     private var pendingPlan: RenderPlan?
     private var planCounter: UInt64 = 0
-    private var preSeekPhase: EnginePhase?
     private var controller = AdaptivePolicyEngine()
     private var continuation: AsyncStream<PlayerEvent>.Continuation?
     private var stream: AsyncStream<PlayerEvent>?
@@ -200,20 +199,29 @@ public actor EngineCore {
         transition(to: .paused)
     }
 
+    /// seek（04 §6、#13）。セッションを生かしたまま復号配線を組み替える — VT session を
+    /// 壊さない（初回复号スパイクを再払しない。#12 と同じ設計）。SeekController の手順:
+    /// 音声は target-0.2 s 前から実音 preroll、映像は直前 keyframe から捨てながら進む
+    /// （PlaybackSession.seek がやる）。UI には target 位置を示し、preroll 完了後
+    /// （この呼び出しの復帰時）に seek 前の phase へ戻す（04 §6「完了まで待つ」）。
     public func seek(to time: MediaTime, tolerance: SeekTolerance = .default) async {
         guard phase == .playing || phase == .paused else { return }
-        preSeekPhase = phase
+        let resumeTo = phase
         transition(to: .seeking(target: time))
-        // 実際のシーク手順（音声 0.2 s 前から・映像は keyframe から）は #13 で実装する。
-        // 再生線がある場合、一時停止して配線を作り直す（#13 まで这是ら暫定）。
+        position = time   // プログレスは目標位置を表示（04 §6）
+        lastPositionEmitSeconds = nil   // 後方 seek でも位置イベントが再開される
+        continuation?.yield(.positionUpdated(position: time, duration: structure?.items.first?.duration,
+                                             clockDriftMS: 0))
         if let session {
-            await session.shutdown()
-            self.session = nil
-            sessionRunning = false
-            sessionTask?.cancel()
-            sessionTask = nil
+            await session.seek(to: time, tolerance: tolerance)
+        } else if pipeline != nil, activePlan ?? pendingPlan != nil {
+            // 実行中のセッションが無い（open 直後等）: seek 位置の状態で作り、warmup まで行う。
+            if let pipeline {
+                await makeSession(for: pipeline)
+                await session?.prepare()
+            }
         }
-        transition(to: preSeekPhase ?? .paused)
+        transition(to: resumeTo)
     }
 
     public func step(_ direction: StepDirection) async {

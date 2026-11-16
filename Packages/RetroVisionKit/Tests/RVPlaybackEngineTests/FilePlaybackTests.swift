@@ -163,7 +163,7 @@ final class FilePlaybackTests: XCTestCase {
         XCTAssertLessThan(afterResume.stats.late, 2, "停止区間が late に積算されていない")
     }
 
-    // MARK: - 3. 起動準備（prepare / warmup。#12・OQ-18）
+    // MARK: - 2. 起動準備（prepare / warmup。#12・OQ-18）
 
     /// prepare() で先頭ぶんを復号済み（保持）にした状態で駆動しても、提示の完全性
     /// （全帧 1 回・PTS 順）は壊れないこと。warmup の復号は warmupStageMS に分離され、
@@ -348,5 +348,84 @@ final class FilePlaybackTests: XCTestCase {
         XCTAssertFalse(observed.isEmpty, "position が一度も進行しなかった")
         XCTAssertGreaterThan(observed.max() ?? 0, 0.2,
                              "0.4 s 素材の最後まで位置が進まない")
+    }
+
+    // MARK: - 4. seek（#13・OQ-23。決定的駆動）
+
+    /// 実行中のセッションのまま中間 seek: 提示は重複も逆行もなく、target 以上の帧だけが続く。
+    /// target 前の帧は復号して捨てる（04 §6 手順 4。dropped(.seekDiscarded) に計上）。
+    /// 決定的時間源では 120 帧 = seek 前 30 + target 以降の全 90 帧がちょうど提示される。
+    func testSeekMidStreamPresentsTargetOnwardExactlyOnce() async throws {
+        let url = try fixtureURL("ntsc480i-22-01.mpg")
+        let demuxer = AVFoundationDemuxer(url: url)
+        let stream = try await demuxer.probe()
+        let (track, format) = try videoTrack(of: stream)
+
+        let time = DeterministicTimeSource(startMS: 10_000)
+        let box = EventBox()
+        let session = PlaybackSession(
+            demuxer: demuxer,
+            decoder: VideoToolboxDecoder(),
+            config: .init(videoTrack: track.id, videoFormat: format),
+            time: time,
+            report: { box.append($0) })
+
+        // 前半: 30 帧提示まで進める（frames 0..29、pts ≤ 0.97 s）。
+        var iterations = 0
+        var early = false
+        while !early && iterations < 5_000 {
+            await session.step()
+            time.advance(ms: 1)
+            iterations += 1
+            early = box.positions.count >= 30
+        }
+        XCTAssertEqual(box.positions.count, 30, "前半が 30 帧まで進まない")
+
+        // seek: target 3.0 s。GOP は 0.5 s（keyframe 2.535 s 側へ着地）。実測では着地直後の
+        // 9 sample（frame 76〜88 の一部）を reader 側が届けないため、target 前の破棄は
+        // 復号保持ぶん 1 + reader が届けた target 前 6 帧 = 7 になる（実測値は print で残す）。
+        let target = CMTime(seconds: 3.0, preferredTimescale: 1_000_000)
+        await session.seek(to: target, tolerance: .previousKeyframe)
+
+        // 最後まで続ける（残り 90 帧 ≈ 3.0 s + 安全側）。
+        while !(await session.isFinished()) && iterations < 15_000 {
+            await session.step()
+            time.advance(ms: 1)
+            iterations += 1
+        }
+        let outcome = await session.outcomeSnapshot()
+        let didFinish = await session.isFinished()
+        XCTAssertTrue(didFinish, "seek 後に有限時間終了しない")
+        XCTAssertEqual(outcome.errors, [],
+                       "seek 直後に復号・供給の失敗（0 長 buffer は -12902 になる。#13 の間引き）: \(outcome.errors)")
+
+        // 提示の完全性: seek 前 30 + target 以上の fixture 全 90 帧（frame 90 pts = 3.003 s〜）。
+        XCTAssertEqual(outcome.stats.presented, 120,
+                       "target 以上の帧がすべて 1 回だけ提示され、target 前が再提示されない")
+        XCTAssertEqual(box.positions.count, 120)
+        strictlyIncreasing(box.positions)   // seek 前後の境界でも PTS は逆行しない
+        let afterSeek = box.positions.filter { $0.seconds >= 3.0 }
+        XCTAssertEqual(afterSeek.count, 90, "target 以上の 90 帧がすべて提示されていない")
+        XCTAssertEqual(Set(box.positions.map { $0.seconds }).count, 120, "重複提示がある")
+
+        // 破棄の計上: 復号の遅延保持ぶん（F13、≥1）は必ず捨てる。加えて reader が届けた
+        // target 前 6 帧（frame 75, 78, 81, 84, 87, 89）が seekDiscarded に載る。
+        // 着地直後の 9 帧（frame 76〜88）は reader 自体が届けないので計上されない。
+        let seekDiscarded = outcome.stats.dropReasons[.seekDiscarded, default: 0]
+        XCTAssertGreaterThanOrEqual(seekDiscarded, 1, "復号保持帧が seek で流し切られていない")
+        print("04 §6 実測（決定的）: seekDiscarded=\(seekDiscarded)"
+            + "（内訳: reader が届けた target 前 6 帧 + 復号の遅延保持ぶん）")
+
+        // 提示間隔は seek 後も pts 間隔に追随（#11 と同じ ±2 ms 契約）。
+        // seek 境界の 1 本はインデックスに現れない（初回提示は lastPresentHost を立てるだけで
+        // 間隔を append しない。04 §9 と同じ理由で境界は検査しない）。
+        XCTAssertEqual(outcome.presentIntervalMS.count, 29 + (120 - 31),
+                       "seek 境界の間引き込み（間隔の append 構造）が壊れている")
+        for j in 31..<box.positions.count {
+            let expectedMS = (box.positions[j].seconds - box.positions[j - 1].seconds) * 1_000
+            let interval = outcome.presentIntervalMS[j - 2]   // 境界ぶん -1 のインデックス
+            XCTAssertGreaterThanOrEqual(interval, expectedMS - 2, "seek 後の提示が詰めすぎ")
+            XCTAssertLessThanOrEqual(interval, expectedMS + 2, "seek 後の提示が遅れすぎ")
+        }
     }
 }

@@ -60,8 +60,12 @@ public final class AVFoundationAudioSink: AudioSink, @unchecked Sendable {
         lock.lock()
         guard !running else { lock.unlock(); return }
         lock.unlock()
-        engine.prepare()
-        try engine.start()        // 出力装置が無い環境では throw。縮退は呼び出し側で扱う。
+        // engine は start のまま maintain（flush 後の再開を許す。running のままの
+        // AVAudioEngine を再 start できないため、running で分岐して player だけ再開する）。
+        if !engine.isRunning {
+            engine.prepare()
+            try engine.start()        // 出力装置が無い環境では throw。縮退は呼び出し側で扱う。
+        }
         player.play()
         lock.lock(); running = true; lock.unlock()
     }
@@ -84,8 +88,12 @@ public final class AVFoundationAudioSink: AudioSink, @unchecked Sendable {
         player.play()
     }
 
+    /// seek での組み替え（#13）。再生を止めて積まれた buffer と対応表を捨てる。
+    /// engine は動かしたまま（次の start() で player だけを再開し、出力装置の再確保を避ける）。
     public func flush() {
+        player.stop()
         player.reset()
+        lock.lock(); running = false; lock.unlock()
         resetTable()
     }
 

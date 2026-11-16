@@ -30,6 +30,22 @@ public actor AVFoundationDemuxer: Demuxer {
     private var readRangeEnd: MediaTime?
     /// TrackID → (media type, 同種トラック中の並び順)。sample 列を作る Task で再現できるキー。
     private var trackKeys: [TrackID: (mediaType: AVMediaType, index: Int)] = [:]
+    /// F5 ゲート（0-length sample の間引き）が間引いた数。OQ-23 の実測点（#13）:
+    /// seek 再開直後にも同じ buffer 混入が起きるはずだが未測定だった。読み取り Task から
+    /// 数えるため、actor をまたがない共有 box で持つ。
+    private let emptySampleGate = SampleGateCounter()
+
+    /// 間引かれた 0-length sample の数（実測値。AVFoundationDemuxer の診断であって、
+    /// Demuxer 契約には含まない — UI ではなく検査・測定専用）。
+    public var gatedEmptySampleCount: Int { emptySampleGate.value }
+
+    /// 0-length sample を数えるだけの箱（detached Task から触る。ロックで守る）。
+    fileprivate final class SampleGateCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func bump() { lock.lock(); count += 1; lock.unlock() }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    }
 
     public init(url: URL) {
         self.url = url
@@ -91,6 +107,7 @@ public actor AVFoundationDemuxer: Demuxer {
         let start = readingFrom
         let end = readRangeEnd
         let key = trackKeys[track]
+        let gate = emptySampleGate
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
                 do {
@@ -131,7 +148,8 @@ public actor AVFoundationDemuxer: Demuxer {
                         // 実測: 先頭にデータを持たない buffer が混ざる（VideoToolbox は -12902 で弾く）。
                         // sample 数を数えないことで、decode 段の「受け取った sample 数」と
                         // 「実際に復号要求した sample 数」を一致させる（04 §9 の dropped 計上を正確にする）。
-                        if !sample.hasSampleData { continue }
+                        // 間引いた数は OQ-23 の実測点として数える（seek 再開直後も同じ条件になるはず、#13）。
+                        if !sample.hasSampleData { gate.bump(); continue }
                         continuation.yield(sample)
                     }
                     if let error = reader.error {

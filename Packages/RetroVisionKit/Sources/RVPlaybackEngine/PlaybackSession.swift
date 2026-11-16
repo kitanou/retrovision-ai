@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import RVMediaCore
 import RVDecode
@@ -41,6 +42,8 @@ public struct PlaybackOutcome: Sendable {
     public var warmupMS: Double = 0
     /// warmup で復号した sample の wall time（decodeStageMS を warmup で汚さないための分離箱）。
     public var warmupStageMS: [Double] = []
+    /// seek 1 回の wall time（preroll 込み。04 §6 の 0.2〜1.5 s 設計に対する実測点、#13）。
+    public var seekMS: [Double] = []
     public var errors: [String] = []
 
     public init() {}
@@ -161,19 +164,22 @@ public actor PlaybackSession {
         guard !finished, !prepared else { return }
         prepared = true
         let began = time.now()
-        await topUpDecode(limitOverride: config.warmupFrames)
+        await topUpDecode(kind: .warmup)
         await prefillAudio()
         outcome.warmupMS = time.now().ms(since: began)
     }
     private var prepared = false
     /// 復号・音声供給が進行中か（prepare と run の並行で iterator を二重に進めないための闸门）。
     private var producing = false
+    /// 供給世代のカウント。seek は配線を組み替える際これを増やし、進行中の供給ループを
+    /// ガードで自分終りにする（古い reader のキャンセル・错误を縮退として扱わないため）。
+    private var generation = 0
 
     /// 1 呼吸: 音声供給と復号を少し進め、時刻が来ていれば 1 帧消費する。
     /// 呼び手（driver）が時間を進めてから呼ぶ。テストはこれで決定的に進められる。
     /// 停止中は復も消費も行わない（停止区間の先読みでメモリを増やさない）。
     public func step() async {
-        guard !finished, pauseHost == nil else { return }
+        guard !finished, !seeking, pauseHost == nil else { return }
         await topUpAudio()
         audioTick()
         await topUpDecode()
@@ -245,6 +251,74 @@ public actor PlaybackSession {
 
     public func isPaused() -> Bool { pauseHost != nil }
 
+    /// seek（04 §6、#13）。セッションが生きたまま復号配線を組み替える —
+    /// VT session は生かす（初回复号スパイクを再払しない。#12 と同じ設計思想）。
+    /// 手順: ① clock を止め sink を flush → ② 音声を target-0.2 s 前に寄せて prefill
+    /// （実音 preroll。対応表で PTS が解決されるので clock はそこから再アンカーされる）→
+    /// ③ 映像を target に寄せる（実際の着地は直前 keyframe。AVFoundation が編集表で寄せる）→
+    /// ④ target までの帧は復号して捨てる（acceptFrame の闸门。復号負荷は計上）→
+    /// ⑤ clock の再開は最初の提示完了ではなく最初の採样（rendered PTS が取れた時点。
+    /// AudioClock の初回 sample が anchor になる — #10 と同じ機構）。
+    /// seek 中（`seeking`）は step() が何もしない（run() ループの途中差し込みで二重進行しない）。
+    public func seek(to target: MediaTime, tolerance: SeekTolerance) async {
+        guard !finished, !seeking else { return }
+        seeking = true
+        let began = time.now()
+        defer {
+            outcome.seekMS.append(time.now().ms(since: began))
+            seeking = false
+        }
+        // 進行中の供給（step 経由の topUp*）があれば、その回合を終えさせてから組み替える
+        // （generation ガードで古い reader は自分から終る。待ちすぎても壊れないが、
+        // 組み替え後の topUpDecode が producing で空振りしない利点だけ待つ）。
+        generation &+= 1
+        for _ in 0..<200 where producing { try? await Task.sleep(nanoseconds: 1_000_000) }
+        // ① 音声クロックと出力を止める（rendered の追補をやめる — 04 §6 手順 1）。
+        audioClock?.stop()
+        audio?.sink.flush()
+        audioRunning = false
+        audioPrefilled = false
+        audioStreamDone = false
+        underrunSince = nil
+        videoDrainedHost = nil
+        // 復号の遅延保持（F13 の組み替えが保持する直前帧）を流し切って捨てる。
+        // flush は保持分の消化で、VT session は壊さない（reset と違い再 warmup が起きない）。
+        for frame in await decoder.flush() {
+            outcome.stats.dropped += 1
+            outcome.stats.dropReasons[.seekDiscarded, default: 0] += 1
+        }
+        // ② 音声: target より 0.2 s 前から（04 §6 手順 2・3。PREROLL_MS 相当）。
+        //    iterator は生成時に reader 位置を capture するので、音声の prefill を先に作る。
+        let audioAnchor = CMTimeCompare(target, CMTime(seconds: 0.2, preferredTimescale: 1_000_000)) > 0
+            ? CMTimeSubtract(target, CMTime(seconds: 0.2, preferredTimescale: 1_000_000))
+            : .zero
+        if config.audioTrack != nil {
+            do { _ = try await demuxer.seek(to: audioAnchor, tolerance: .previousKeyframe) }
+            catch { outcome.errors.append("seek-audio: \(String(describing: error))") }
+            await prefillAudio()
+        }
+        // ③ 映像: target そのものへ（着地は keyframe 側）。再生アンカーとキューを初期化し、
+        //    target までの帧は捨てて進む（④ は topUpDecode の seekPreroll 内）。
+        do { _ = try await demuxer.seek(to: target, tolerance: tolerance) }
+        catch { outcome.errors.append("seek: \(String(describing: error))") }
+        queue.removeAll()
+        cursor = nil
+        streamDone = false
+        flushDone = false
+        discardBefore = target
+        startHost = nil; firstPTS = nil; lastPresentHost = nil; lastPresentedPTS = nil
+        lastDriftSampleHost = nil
+        // ⑤ 音声開始（実音 preroll を鳴らしながら映像は target まで進む）。停止中は prefill のみ
+        // （再開時の topUpAudio が start する。停止中に preroll を鳴らさない）。
+        if pauseHost == nil {
+            startAudioSink()
+        } else if !audioFailed, config.audioTrack != nil {
+            outcome.audioStatus = "prefilling"
+        }
+        await topUpDecode(kind: .seekPreroll)
+    }
+    private var seeking = false
+
     /// セッションを閉じるときの後始末（音声装置を解放し、クロックを止める）。
     public func shutdown() {
         audio?.sink.stop()
@@ -272,15 +346,22 @@ public actor PlaybackSession {
         audioClock = AudioClock(sink: audio.sink, time: time)
         audioCursor = AudioCursor((await audio.decoder.pcm(for: audioTrack)).makeAsyncIterator())
         // prefill: start 前に audioPrefillMS 分積む。素材が短い場合は最後まで読む。
+        // generation ガード: 待ち中に別の seek が入ったら、この古い reader は静かに終る
+        // （次の prefill が新しい位置で作られた iterator を使う）。
+        let myGen = generation
         var safety = 0
         while audio.sink.scheduledAheadMS() < config.audioPrefillMS, safety < 2_000 {
+            guard generation == myGen else { return }
             do {
-                guard let quantum = try await audioCursor?.next() else {
+                let next = try await audioCursor?.next()
+                guard generation == myGen else { return }
+                guard let quantum = next else {
                     audioStreamDone = true
                     break
                 }
                 try audio.sink.schedule(quantum)
             } catch {
+                if generation != myGen { return }
                 failAudio("prefill", error)
                 return
             }
@@ -297,35 +378,47 @@ public actor PlaybackSession {
         if !audioRunning {
             await prefillAudio()
             if audioFailed { return }
-            do {
-                try audio.sink.start()      // 出力装置の無い環境（CI 等）では throw → 映像のみへ縮退
-            } catch {
-                failAudio("start(\(String(describing: error)))", nil)
-                return
-            }
-            if let format = audio.sink.outputFormat {
-                outcome.audioOutputFormat =
-                    "\(format.sampleRate)Hz/\(format.channelCount)ch/\(format.codec.rawValue)"
-            }
-            audioRunning = true
-            outcome.audioStatus = "running"
+            startAudioSink()
             return
         }
         guard !audioStreamDone else { return }
+        let myGen = generation
         var safety = 0
         while audio.sink.scheduledAheadMS() < config.audioRefillMS, safety < 60 {
+            guard generation == myGen else { return }
             do {
-                guard let quantum = try await audioCursor?.next() else {
+                let next = try await audioCursor?.next()
+                guard generation == myGen else { return }
+                guard let quantum = next else {
                     audioStreamDone = true
                     break
                 }
                 try audio.sink.schedule(quantum)
             } catch {
+                if generation != myGen { return }   // seek 中の reader キャンセルは想定どおり
                 failAudio("refill", error)
                 return
             }
             safety += 1
         }
+    }
+
+    /// 出力装置を start する（play 初回 tick と、seek の preroll から呼ぶ。どちらも冪等）。
+    /// 失敗は「音声なしの暫定 pacing へ縮退」（#10。出力装置の無い環境では throw）。
+    private func startAudioSink() {
+        guard let audio, !audioFailed, !audioRunning, config.audioTrack != nil else { return }
+        do {
+            try audio.sink.start()      // 出力装置の無い環境（CI 等）では throw → 映像のみへ縮退
+        } catch {
+            failAudio("start(\(String(describing: error)))", nil)
+            return
+        }
+        if let format = audio.sink.outputFormat {
+            outcome.audioOutputFormat =
+                "\(format.sampleRate)Hz/\(format.channelCount)ch/\(format.codec.rawValue)"
+        }
+        audioRunning = true
+        outcome.audioStatus = "running"
     }
 
     private func failAudio(_ stage: String, _ error: (any Error)?) {
@@ -363,11 +456,13 @@ public actor PlaybackSession {
 
     // MARK: 映像供給
 
+    /// 供給の目的。warmup は #12 の統計分離（warmupStageMS）、seekPreroll は 04 §6 の
+    /// 捨てながら進む（復号負荷は常時統計に計上する）。
+    private enum SupplyKind { case steady, warmup, seekPreroll }
+
     /// 映像の復号供給。`producing` 闸门で prepare と run の並行実行でも iterator を
     /// 二重に進めない（actor の一時停止中に別の呼が入るため、flag で守る）。
-    /// `limitOverride` は warmup 用の上限（統計は warmupStageMS に分けて、decodeStageMS の
-    /// 常時再生値を汚さない — #12 の「probe 統計から warmup 分を除外する規則」の実装）。
-    private func topUpDecode(limitOverride: Int? = nil) async {
+    private func topUpDecode(kind: SupplyKind = .steady) async {
         guard !producing else { return }
         producing = true
         defer { producing = false }
@@ -386,12 +481,22 @@ public actor PlaybackSession {
             cursor = SampleCursor((await demuxer.samples(for: config.videoTrack)).makeAsyncIterator())
         }
         guard !streamDone else { return }
-        let warmup = limitOverride != nil
-        let roundLimit = limitOverride ?? config.maxQueuedFrames
+        let myGen = generation
+        // warmup は既定帧数ぶんだけ復号する（prepare）。seekPreroll は目標位置まで
+        // 捨てながら進む（04 §6 手順 4。長い GOP のための上限で打ち切り、次 tick で続く）。
+        let roundLimit: Int
+        switch kind {
+        case .steady: roundLimit = config.maxQueuedFrames
+        case .warmup: roundLimit = config.warmupFrames
+        case .seekPreroll: roundLimit = 600
+        }
         var decodedThisRound = 0
         while queue.count < config.maxQueuedFrames, decodedThisRound < roundLimit {
+            guard generation == myGen else { return }   // seek が配線を引き継いだ（この世代は終り）
             do {
-                guard let sample = try await cursor?.next() else {
+                let next = try await cursor?.next()
+                guard generation == myGen else { return }  // 待ち中に seek: この sample は捨て、新しい位置から続く
+                guard let sample = next else {
                     streamDone = true
                     break
                 }
@@ -401,29 +506,45 @@ public actor PlaybackSession {
                 let began = time.now()
                 do {
                     if let frame = try await decoder.decode(sample) {
-                        queue.append(frame)
+                        acceptFrame(frame)
                     }
                 } catch {
                     outcome.errors.append("decode: \(String(describing: error))")
                 }
                 let tookMS = time.now().ms(since: began)
-                if warmup {
+                if kind == .warmup {
                     outcome.warmupStageMS.append(tookMS)
                 } else {
-                    outcome.decodeStageMS.append(tookMS)
+                    outcome.decodeStageMS.append(tookMS)   // seekPreroll も復号負荷として計上（04 §6）
                 }
                 decodedThisRound += 1
             } catch {
+                if generation != myGen { return }   // seek 中の reader キャンセルは想定どおり（错误にしない）
                 streamDone = true
                 outcome.errors.append("demux: \(String(describing: error))")
                 break
             }
         }
         if streamDone && !flushDone {
-            queue.append(contentsOf: await decoder.flush())
+            for frame in await decoder.flush() { acceptFrame(frame) }
             flushDone = true
         }
     }
+
+    /// 復号帧の受け口。seek の preroll 中（`discardBefore` が生きている間）は目標位置前の
+    /// 帧を**復号だけして提示しない**（04 §6 手順 4。dropped に数えるが presentation には出さない）。
+    /// decoder は提示順（PTS 順）に返す（F13）ので、最初の target 以上で闸门を解く。
+    private func acceptFrame(_ frame: DecodedVideoFrame) {
+        if let floor = discardBefore,
+           frame.pts.isValid, frame.pts.compared(to: floor) == .orderedAscending {
+            outcome.stats.dropped += 1
+            outcome.stats.dropReasons[.seekDiscarded, default: 0] += 1
+            return
+        }
+        discardBefore = nil
+        queue.append(frame)
+    }
+    private var discardBefore: MediaTime?
     private var lastSamplePTS: MediaTime?
 
     private func presentDue() {

@@ -78,6 +78,9 @@ public enum DropReason: String, Sendable, CaseIterable, Codable {
     case enhancementNotReady
     case leaseViolation
     case drawableLost
+    /// seek の preroll: 目標位置前の帧（keyframe から target まで）は復号するが提示しない
+    /// （04 §6 手順 4。復号負荷は計上する）。
+    case seekDiscarded
 }
 
 /// 1 窓分のフレーム統計（08 §3）。

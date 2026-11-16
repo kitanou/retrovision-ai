@@ -129,6 +129,77 @@ final class AudioPlaybackTests: XCTestCase {
                       "AVFoundation は DTS を列挙しない（A6）。実際: \(outcome.audioStatus)")
         XCTAssertEqual(outcome.stats.presented, 180)
     }
+
+    /// 再生中の seek（04 §6・#13）。セッションは生きたまま配線を組み替え、
+    /// 音声 preroll（target-0.2 s）から clock を起こし直す。
+    /// 構造的検査: 完走・错误なし・位置イベントの単調増加（seek の target イベントを含む）・
+    /// seek 後に drift 采样が続く（clock の再 anchor — 止まったままだと采样が増えない）。
+    func testSeekDuringPlaybackResumesWithAudioClockRunning() async throws {
+        let url = try fixtureURL("ntsc480i-ac3-01.mpg")
+        let engine = EngineCore()
+        let events = await engine.events()
+        try await engine.load(FileMediaSource(url: url),
+                              selection: PlaybackSelection(item: ItemID(1)))
+        let box = PlayerSnapshotBox()
+        let consumer = Task {
+            for await event in events {
+                box.handle(event)
+                if box.done { break }
+            }
+        }
+        await engine.play()
+        // 1.5 s 実時間で再生してから中間 seek（target 3.0 s、GOP 着地は 2.535 s 側）。
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        let target = CMTime(seconds: 3.0, preferredTimescale: 1_000_000)
+        let seekBegan = Date()
+        await engine.seek(to: target)
+        let seekWallMS = Date().timeIntervalSince(seekBegan) * 1_000
+
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline && !box.done {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        consumer.cancel()
+        let outcome = await engine.playbackOutcome() ?? PlaybackOutcome()
+        await engine.close()
+
+        XCTAssertNil(box.failedMessage, "seek 後に再生が失敗した: \(box.failedMessage ?? "")")
+        XCTAssertTrue(box.endedFlag, "seek 後に phase .ended に到達しない")
+        XCTAssertTrue(outcome.errors.isEmpty, "seek 直後の供给・復号の失敗: \(outcome.errors)")
+        XCTAssertEqual(outcome.seekMS.count, 1, "seek の wall time 記録が無い（04 §6 の実測点）")
+        print(String(format: "04 §6 実測（実時間）: seekWallMS=%.1f sessionSeekMS=%.1f "
+                     + "driftSamples=%d underruns=%d",
+                     seekWallMS, outcome.seekMS.first ?? 0,
+                     outcome.clockDriftMS.count, outcome.audioUnderrunEpisodes))
+
+        // 位置イベントは seek を挟んでも単調増加（再生側の提示順 + target イベント）。
+        let positions = box.collectedPositions
+        XCTAssertFalse(positions.isEmpty)
+        for i in 1..<positions.count {
+            XCTAssertEqual(positions[i - 1].compared(to: positions[i]), .orderedAscending,
+                           "position \(i) が PTS 順でない（seek 直後の逆行・重複は設計外）")
+        }
+        XCTAssertTrue(positions.contains { abs($0.seconds - 3.0) < 1e-6 },
+                      "seek の target 位置イベントが無い（UI は target を表示する設計、04 §6）")
+        let last = positions.last.map { $0.seconds } ?? 0
+        XCTAssertGreaterThan(last, 5.5, "seek 後に最後まで進んでいない")
+
+        switch outcome.audioStatus {
+        case "running":
+            break
+        case let status where status.hasPrefix("failed"):
+            return   // 出力装置の無い環境での縮退（#10 と同じ）。映像線の完走まで検査済み。
+        default:
+            XCTFail("audioStatus が予期しない値: \(outcome.audioStatus)")
+            return
+        }
+        // clock が seek 後に生きていれば drift 采样が増え続ける（停止だと増えない）。
+        // 全体 5.9 s ÷ 0.1 s 采样で 40 件超が期待値。seek 前だけで止まっていれば 15 件前後。
+        XCTAssertGreaterThan(outcome.clockDriftMS.count, 30,
+                             "seek 後に audio clock の采样が続いていない（再 anchor 失败？）")
+        XCTAssertLessThan(outcome.audioUnderrunEpisodes, 5,
+                          "seek 後の供給再開で underrun 多発: \(outcome.audioUnderrunEpisodes)")
+    }
 }
 
 /// e2e イベントの受け取り箱（FilePlaybackTests のものと同じ形）。
@@ -154,6 +225,7 @@ private final class PlayerSnapshotBox: @unchecked Sendable {
     var done: Bool { lock.lock(); defer { lock.unlock() }; return sawEnded || sawFailed != nil }
     var failedMessage: String? { lock.lock(); defer { lock.unlock() }; return sawFailed }
     var endedFlag: Bool { lock.lock(); defer { lock.unlock() }; return sawEnded }
+    var collectedPositions: [MediaTime] { lock.lock(); defer { lock.unlock() }; return positions }
 }
 
 // MARK: - 音声装置の実時間ペーシングprobe（環境の自己申告にしない）
