@@ -167,12 +167,54 @@ final class EngineCoreTests: XCTestCase {
         let snapshot = await engine.snapshot()
         if case .failed = snapshot.phase {} else { XCTFail("failed phase が無い") }
     }
+
+    /// タイトル切り替え（03 §5、#3 追加分）: select(item:) は「同じ source の再 load」で
+    /// 選択・duration・トラック表を一括更新し、position を 0 に戻す。実運用で「ISO を開くと
+    /// 最初のタイトルしか再生されない」境界が報告され（2026-11-17）、その固定として追加。
+    func testSelectItemSwitchesSelectionDurationAndTracks() async throws {
+        let engine = EngineCore()
+        let events = await engine.events()
+        try await engine.load(TestSource(itemCount: 2), selection: PlaybackSelection(item: ItemID(1)))
+        var snap = await engine.snapshot()
+        XCTAssertEqual(snap.duration?.seconds, 60, "初期選択は item 1（60 s 相当）でないと")
+
+        // 再生状態から切り替えても、線は止まり .ready で落ち着く（v1 の切り替え意味論）。
+        await engine.play()
+        await engine.select(item: ItemID(2))
+        snap = await engine.snapshot()
+        XCTAssertEqual(snap.phase, .ready, "切り替え後は ready で静止（再生は押し直し）")
+        XCTAssertEqual(snap.selected?.item, ItemID(2), "選択が切り替わらない")
+        XCTAssertEqual(snap.duration?.seconds, 30, "duration が古い item のまま（selectedItem 未反映）")
+        XCTAssertEqual(snap.position, .zero, "position が古い位置を表示したまま")
+        XCTAssertEqual(snap.available.first?.id, TrackID(21), "トラック表が古い item のまま")
+
+        // events 側にも同じ事実が届く（UI は events からのみ導出する原則 — #17）。
+        var sawSecondTable = false
+        var sawZeroPosition = false
+        collect: for await event in events {
+            switch event {
+            case .tracksChanged(let table) where table.first?.id == TrackID(21): sawSecondTable = true
+            case .positionUpdated(let position, _, _) where position == .zero: sawZeroPosition = true
+            default: break
+            }
+            if sawSecondTable && sawZeroPosition { break collect }
+        }
+        XCTAssertTrue(sawSecondTable, "tracksChanged が新しい item の表を運ばない")
+        XCTAssertTrue(sawZeroPosition, "positionUpdated(.zero) の初期化イベントが無い")
+        await engine.close()
+    }
 }
 
 /// テスト用のソース。VIDEO_TS 相当の構造をメモリ上に作る（09 §3）。
 struct TestSource: MediaSource {
     let hasAspectSignals: Bool
-    init(hasAspectSignals: Bool = true) { self.hasAspectSignals = hasAspectSignals }
+    /// 2 にすると dvdTitles 構造（item 数・duration が項目ごとに違う形）を作れる
+    /// （タイトル切り替えの state machine 検査用 — EngineCoreTests）。
+    let itemCount: Int
+    init(hasAspectSignals: Bool = true, itemCount: Int = 1) {
+        self.hasAspectSignals = hasAspectSignals
+        self.itemCount = itemCount
+    }
 
     var descriptor: SourceDescriptor {
         SourceDescriptor(id: SourceID(1), kind: .videoTsFolder, displayName: "test",
@@ -189,13 +231,18 @@ struct TestSource: MediaSource {
                                           frameRate: .ntsc,
                                           interlace: .ntscInterlaced,
                                           aspectSignals: signals)
-        let item = MediaItem(id: ItemID(1), titleNumber: 1,
-                             duration: CMTime(value: 60, timescale: 1),
-                             trackTable: [TrackInfo(id: TrackID(1), kind: .video, format: .video(video))],
-                             videoFormat: video,
-                             chapters: [ChapterMark(index: 0, start: .zero)],
-                             aspectFlag: hasAspectSignals ? .allowed4x3 : nil)
-        let structure = MediaStructure(itemKind: .dvdTitles, items: [item])
+        var items: [MediaItem] = []
+        for n in 1...itemCount {
+            let item = MediaItem(id: ItemID(UInt64(n)), titleNumber: n,
+                                 duration: CMTime(value: Int64(60 / n), timescale: 1),
+                                 trackTable: [TrackInfo(id: TrackID(UInt32(10 * n + 1)), kind: .video,
+                                                        format: .video(video))],
+                                 videoFormat: video,
+                                 chapters: [ChapterMark(index: 0, start: .zero)],
+                                 aspectFlag: hasAspectSignals ? .allowed4x3 : nil)
+            items.append(item)
+        }
+        let structure = MediaStructure(itemKind: .dvdTitles, items: items)
         return OpenedSource(reader: MemoryBlockReader(bytes: Data(count: 2_048 * 8)),
                             structure: structure,
                             formatHint: .mpegProgramStream)

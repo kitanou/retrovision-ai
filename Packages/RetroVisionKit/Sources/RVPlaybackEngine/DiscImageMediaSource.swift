@@ -33,6 +33,10 @@ public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
     }
 
     public func open() async throws -> OpenedSource {
+        // 冪等（タイトル切り替えの再 load で再 attach しない。実測: 既に attached の
+        // ISO を diskutil image attach すると「〜 1」付きの別マウントが増える）。
+        // 内部の VideoTsMediaSource 側の open cache が構造を返す。
+        if let internalSource { return try await internalSource.open() }
         let (device, mountPoint) = try await Self.attach(isoURL)
         self.mountedDevice = device
         let source = VideoTsMediaSource(rootURL: mountPoint)
@@ -41,8 +45,10 @@ public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
             return try await source.open()
         } catch {
             // 構造が無かった/開けなかった場合はマウントを残さない（取り残しの実測回避）。
+            // 内部 source も降ろす（残すと次の open が冪等経路で外れたボリュームを向く）。
             await Self.detach(device)
             self.mountedDevice = nil
+            self.internalSource = nil
             throw error
         }
     }

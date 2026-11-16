@@ -72,10 +72,22 @@ public actor EngineCore {
         quality.appliedStages = activePlan?.stages.map(\.stage) ?? []
         return PlayerStateSnapshot(phase: phase,
                                    position: position,
-                                   duration: structure?.items.first?.duration,
+                                   duration: selectedItem()?.duration,
                                    selected: selection,
-                                   available: structure?.items.first?.trackTable ?? [],
+                                   available: selectedItem()?.trackTable ?? [],
                                    quality: quality)
+    }
+
+    /// 選択中の item（structure 内で selection.item に一致。無ければ先頭 = v1 の既定）。
+    /// items.first 固定だとタイトル切り替えで duration・トラック表が古い item のままになる
+    /// （実測: ISO の 2 本目へ切り替えても UI の duration が 1 本目のままだった）。
+    private func selectedItem() -> MediaItem? {
+        guard let structure else { return nil }
+        if let item = selection?.item,
+           let chosen = structure.items.first(where: { $0.id == item }) {
+            return chosen
+        }
+        return structure.items.first
     }
 
     public func currentStructure() -> MediaStructure? { structure }
@@ -85,18 +97,44 @@ public actor EngineCore {
 
     public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws {
         lineGeneration &+= 1   // 古い線のイベント・in-flight 運送操作を黙らせる（下記ガード）
+        // 古い再生線を止める（タイトル切り替え = 同じ source への再 load 経路を含む。
+        // 以前は初回 load 前提で旧 session を止めておらず、2 回目の load で線が取り残された）。
+        sessionTask?.cancel()
+        if let session { await session.shutdown() }
+        sessionTask = nil
+        session = nil
+        sessionRunning = false
+        lastOutcome = nil
+        position = .zero
         transition(to: .preparing)
         self.selection = selection
+        // 再 load（タイトル切り替え）のときだけ、古い表示位置を 0 に戻す初期化イベントを
+        // 送る。初回 load では送らない — 初回線は最初の提示が position の先頭イベントであり、
+        // 先頭フレームの PTS が 0 の素材で 0 が二重に並ぶと「再生中の位置は strictly
+        // increasing」（02 §4・#14）の検査の意味と衝突する（FilePlaybackTests の実測で判明）。
+        let isReload = structure != nil
+        currentSource = source
+        // 選択自体も events で流す（UI は selectionChanged からのみ現在の選択を導出する —
+        // タイトルメニューの now 表示が古い選択のままにならないため、open でも送る）。
+        continuation?.yield(.selectionChanged(selection))
         do {
             let opened = try await source.open()
             self.openedSource = opened
             self.structure = opened.structure
             await wirePipeline(for: source, structure: opened.structure)
             continuation?.yield(.structureChanged(opened.structure))
-            continuation?.yield(.tracksChanged(opened.structure.items.first?.trackTable ?? []))
+            // 選ばれている item のトラック表を載せる（items.first 固定だとタイトル切り替えで
+            // UI のトラック選択が古い表のままになる — select(item:) の実装で顕在化）。
+            continuation?.yield(.tracksChanged(selectedItem()?.trackTable ?? []))
             try rebuildPlan()
             await preparePlaybackLine()
             transition(to: .ready)
+            if isReload {
+                // 位置・長さの初期化（title 切り替え後に UI が古い位置や古い item の長さを
+                // 表示し続けないための単一経路 — events からのみ導出する原則）。
+                continuation?.yield(.positionUpdated(position: .zero, duration: selectedItem()?.duration,
+                                                     clockDriftMS: 0))
+            }
         } catch let error as PlaybackError {
             transition(to: .failed(error))
             throw error
@@ -109,6 +147,8 @@ public actor EngineCore {
             throw wrapped
         }
     }
+    /// 今開いている source（タイトル切り替えの再 load で使う。MediaSource は Sendable）。
+    private var currentSource: (any MediaSource)?
 
     public func close() async {
         lineGeneration &+= 1   // seek 実行中に close されたら、seek 復帰後の phase 復帰を行わない
@@ -226,7 +266,7 @@ public actor EngineCore {
         transition(to: .seeking(target: time))
         position = time   // プログレスは目標位置を表示（04 §6）
         lastPositionEmitSeconds = nil   // 後方 seek でも位置イベントが再開される
-        continuation?.yield(.positionUpdated(position: time, duration: structure?.items.first?.duration,
+        continuation?.yield(.positionUpdated(position: time, duration: selectedItem()?.duration,
                                              clockDriftMS: 0))
         if let session {
             await session.seek(to: time, tolerance: tolerance)
@@ -285,9 +325,18 @@ public actor EngineCore {
         continuation?.yield(.selectionChanged(selection))
     }
 
+    /// タイトル切り替え（03 §5、#3 の残増分）。v1 の決定（2026-11-17）: 「線を止めて同じ
+    /// source を選び直す」reload として実装する — open 側は冪等（VideoTs / DiscImage は
+    /// 構造と demuxer を cache 済みで、再 open は再 probe・再連結しない）。phase は
+    /// preparing → ready に戻る（再生は押してから）。position は 0 に戻る（load が送る
+    /// positionUpdated(.zero) が単一の初期化経路）。実運用で確認された境界: ISO を開くと
+    /// 最初のタイトルしか再生されず、「おそらく最初のチャプターのみ」という報告になった。
     public func select(item: ItemID) async {
-        guard structure?.items.contains(where: { $0.id == item }) == true else { return }
-        selection?.item = item
+        guard let structure, structure.items.contains(where: { $0.id == item }) else { return }
+        guard phase != .preparing, let source = currentSource else { return }
+        var selection = self.selection ?? PlaybackSelection(item: item)
+        selection.item = item
+        try? await load(source, selection: selection)
     }
 
     /// 設定変更は phase を変えない（02 §3）。plan は pending に入り、frame 境界で昇格する（INV-3）。
@@ -375,7 +424,7 @@ public actor EngineCore {
                 if let session, let last = await session.outcomeSnapshot().clockDriftMS.last {
                     driftMS = last
                 }
-                continuation?.yield(.positionUpdated(position: pts, duration: structure?.items.first?.duration,
+                continuation?.yield(.positionUpdated(position: pts, duration: selectedItem()?.duration,
                                                      clockDriftMS: driftMS))
             }
         case .finished(let outcome):
@@ -393,7 +442,7 @@ public actor EngineCore {
 
     /// plan を作る。INV-2（AI なし経路が常に成立）と INV-6（計測点）をここで検査する。
     private func rebuildPlan() throws {
-        guard let item = structure?.items.first, let format = item.videoFormat else { return }
+        guard let item = selectedItem(), let format = item.videoFormat else { return }
         let aspect = AspectResolver.resolve(codedSize: format.codedSize,
                                            signals: format.aspectSignals,
                                            policy: settings.aspectPolicy)
