@@ -217,11 +217,40 @@ struct PlayerScreenView: View {
 
             audioTrackMenu
 
+            titleMenu
+
             Button { model.setFullscreen(NSApp.keyWindow) } label: {
                 Image(systemName: "arrow.up.left.and.arrow.down.right")
             }
             .accessibilityLabel("全画面")
             .help("全画面（⌃⌘F）")
+        }
+    }
+
+    /// DVD タイトルメニュー（#3 追加分。multi-item 構造のときだけ出る — ISO 実運用で
+    /// 「最初のタイトルしか再生されない」境界が報告されたことへの UI 応答。
+    /// 選択は events 経由でのみ反映される: engine.select(item:) → selectionChanged /
+    /// tracksChanged / positionUpdated(.zero)）。
+    @ViewBuilder
+    private var titleMenu: some View {
+        if model.hasTitleChoice {
+            Menu {
+                Picker("タイトル", selection: Binding(
+                    get: { model.selected?.item },
+                    set: { if let item = $0 { model.selectTitle(item) } }
+                )) {
+                    ForEach(model.availableTitles) { item in
+                        Text("タイトル \(item.titleNumber.map(String.init) ?? "\(item.id.rawValue)")")
+                            .tag(Optional(item.id))
+                    }
+                }
+            } label: {
+                Image(systemName: "film")
+            }
+            .menuStyle(.borderlessButton)
+            .frame(width: 34)
+            .disabled(!model.titleSelectionEnabled)
+            .help("DVD タイトル")
         }
     }
 

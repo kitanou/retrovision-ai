@@ -4,6 +4,7 @@ import CoreMedia
 import Foundation
 import Observation
 import RVMediaCore
+import RVMediaSources
 import RVPlaybackEngine
 // MARK: - PlayerViewModel（#17「UI 状態とエンジンの対応」の実装点）
 //
@@ -32,6 +33,9 @@ final class PlayerViewModel {
     private(set) var position: MediaTime = .zero
     private(set) var duration: MediaTime?
     private(set) var availableTracks: [TrackInfo] = []
+    /// dvdTitles 構造などの multi-item source のタイトル一覧（#3 追加分のタイトルメニュー用。
+    /// 単一項目 source では空 = メニューは出ない）。
+    private(set) var availableTitles: [MediaItem] = []
     private(set) var selected: PlaybackSelection?
     private(set) var quality = QualityPresentation()
     private(set) var lastError: PlaybackError?
@@ -91,9 +95,12 @@ final class PlayerViewModel {
             if let duration { self.duration = duration }
         case .structureChanged(let structure):
             // 構造から表示材料を採る（item 1 個のファイル素材では duration / trackTable がここに乗る。
-            // DVD の item 一覧は Phase 2 のサイドバー側で扱う）。
+            // 複数 item（DVD タイトル）はタイトルメニューの材料に載せる — 選択中の duration と
+            // トラック表は engine が selectionChanged / tracksChanged / positionUpdated(.zero) で
+            // 送るため、そちらが単一の更新経路）。
             if let duration = structure.items.first?.duration { self.duration = duration }
             availableTracks = structure.items.first?.trackTable ?? []
+            availableTitles = structure.items.count > 1 ? structure.items : []
         case .tracksChanged(let tracks):
             availableTracks = tracks
         case .selectionChanged(let selection):
@@ -144,6 +151,10 @@ final class PlayerViewModel {
         case .empty, .preparing, .seeking, .failed: return false
         }
     }
+    /// タイトル切り替えは trackSelectionEnabled と同じ phase で有効（切り替え自体が
+    /// preparing を経るので、seeking 中は受け付けない）。
+    var titleSelectionEnabled: Bool { trackSelectionEnabled }
+    var hasTitleChoice: Bool { availableTitles.count > 1 }
     var isPlaying: Bool {
         if case .playing = phase { return true }
         return false
@@ -206,6 +217,7 @@ final class PlayerViewModel {
         position = .zero
         duration = nil
         availableTracks = []
+        availableTitles = []
         displayAspectValue = nil
     }
 
@@ -236,6 +248,14 @@ final class PlayerViewModel {
     func selectAudio(_ track: TrackID?) {
         guard let track else { return }
         Task { await engine.select(track, for: .audio) }
+    }
+
+    /// タイトル切り替え（#3 追加分。03 §5 の select(item:) — engine 側は「同じ source の
+    /// 再 load」で線を組み替える。表示状態は selectionChanged / tracksChanged /
+    /// positionUpdated(.zero) からのみ更新される（単一経路の原則 — #17））。
+    func selectTitle(_ item: ItemID) {
+        guard availableTitles.contains(where: { $0.id == item }) else { return }
+        Task { await engine.select(item: item) }
     }
 
     func setFullscreen(_ window: NSWindow?) {

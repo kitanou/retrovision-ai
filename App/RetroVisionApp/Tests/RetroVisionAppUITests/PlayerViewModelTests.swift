@@ -3,6 +3,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import RVMediaCore
+import RVMediaSources
 import RVPlaybackEngine
 import XCTest
 @testable import RetroVisionAppUI
@@ -67,6 +68,49 @@ final class PlayerViewModelTests: XCTestCase {
         let duration = vm.durationSeconds
         XCTAssertEqual(duration, 60, accuracy: 0.001, "structure の duration が transport 表示に載る")
         XCTAssertTrue(fake.calls.contains("load"))
+    }
+
+    // MARK: タイトルメニュー（#3 追加分。multi-item 構造のときだけ列挙し、切り替えは engine に投げる）
+
+    func testMultiTitleOpenExposesTitlesAndSelectGoesToEngine() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = MediaStructure(itemKind: .dvdTitles, items: [
+            MediaItem(id: ItemID(1), titleNumber: 1, duration: CMTime(value: 60, timescale: 1)),
+            MediaItem(id: ItemID(2), titleNumber: 2, duration: CMTime(value: 30, timescale: 1)),
+        ])
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .ready)
+        for _ in 0..<200 where vm.availableTitles.count != 2 {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(vm.availableTitles.count, 2, "multi-item 構造がタイトルメニューに載らない")
+        XCTAssertTrue(vm.hasTitleChoice)
+        XCTAssertTrue(vm.titleSelectionEnabled)
+
+        vm.selectTitle(ItemID(2))
+        for _ in 0..<200 where !fake.calls.contains("select:item") {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertTrue(fake.calls.contains("select:item"), "select(item:) が発火しない")
+
+        // 選択表示の更新は events 経由（selectionChanged を流さない fake では古い選択のまま —
+        // 表示が engine 由来の外から勝手に進まないことの裏返し）。
+        XCTAssertNotEqual(vm.selected?.item, ItemID(2))
+        fake.emit(.selectionChanged(PlaybackSelection(item: ItemID(2))))
+        for _ in 0..<200 where vm.selected?.item != ItemID(2) {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(vm.selected?.item, ItemID(2), "selectionChanged で選択表示が更新される")
+    }
+
+    func testSingleItemSourceHidesTitleMenu() async {
+        let fake = FakePlayerEngine()
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.mpg"))
+        await waitPhase(vm, .ready)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertFalse(vm.hasTitleChoice, "単一項目 source でタイトルメニューが出る（03 §5）")
     }
 
     // MARK: スクラブ（ドラッグ中は engine を触らない。離した時に .exact を 1 回）
