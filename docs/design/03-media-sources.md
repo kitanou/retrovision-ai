@@ -363,14 +363,15 @@ PlayerViewModel が `PlaybackSelection(item: ItemID(1))` をハードコード�
 - **first-play 政策（PlayerViewModel。UI 側政策として engine に意味を渡さない）**:
   構造に `titleNumber == 0` の item が在るときだけ自动再生する（盤挿入=再生開始の実機
   挙動）。menu の無い素材（ファイル・menu 無し盘）は #17 の user gate のまま。
-  menu の再生が `.ended` になったら最初の本体タイトル（titleNumber 最小）を
-  `engine.select(item:)` + `play()` で自動進行する（単一経路原則のため政策の発火は
-  phaseChanged(.ended) からのみ。`menuAdvancePending` ガードで同一 .ended の多重発火を
-  防ぎ、selectionChanged の観測で解除。本体タイトル側では再発火しない）。
+  menu の再生が `.ended` になったら本体へ進まず `engine.play()` で先頭から再生し直して
+  繰り返す（2026-11-17 改訂。インタラクティブ menu が無い間、実機の「選択まで待つ」を
+  近似する）。本体タイトルへはタイトル一覧から選んで移る。本体タイトルの .ended では
+  何もしない。尺が不明・1 秒未満の menu（静止画 menu 等）は空転するので繰り返さず終端で
+  止める。`menuLoopPending` ガードで同一 .ended の多重発火を防ぎ、`.playing` への復帰で解除。
 - **検査**: `VideoTsNavigatorTests`（menu 先頭列・menu 無しで項を作らない・VTS_nn_0 は
   対象外のまま）、`VideoTsPlaybackTests`（structure items [0,1,2] と menu duration、
   menu の engine 完走 120/ended）、`PlayerViewModelTests`（menu 構造の open で
-  ItemID(0) 既定選択 + 自动再生、.ended → select+play 自動進行 1 回だけ、menu 無し盘は
+  ItemID(0) 既定選択 + 自动再生、.ended → menu を再生し直し（select しない・2 回目も繰り返す）、本体タイトルと極短 menu では再生し直さない、menu 無し盘は
   自动再生しない — user gate 不変）。
 - **限界（次の増分）**: VMGM のInteractive menu（PU/PGC 命令・ボタン）は未実装 —
   メニューは「video として线性に再生」するだけ（IFO VMGM PGCI パースとセットの増分）。

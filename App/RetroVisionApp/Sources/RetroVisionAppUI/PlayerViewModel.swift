@@ -65,9 +65,12 @@ final class PlayerViewModel {
     /// （画面ロック中の実盤検証など）でも運送の進みを数値で確認するための QA 入口。
     private let positionDebug = ProcessInfo.processInfo.environment["RV_DEBUG_POSITION"] != nil
     private var lastPositionLogSecond = -1
-    /// menu 再生終了の自動進行のガード（同一 .ended を複数回発火させない。
-    /// selectionChanged が観測されたら解除 — 単一更新経路の原則（#17）と同じ場所で行う）。
-    private var menuAdvancePending = false
+    /// menu 再生終了の繰り返しのガード（同一 .ended を複数回発火させない。
+    /// 再生が .playing に戻ったら解除 — 単一更新経路の原則（#17）と同じ場所で行う）。
+    private var menuLoopPending = false
+    /// menu を繰り返すと見なす最短の尺（秒）。これ未満・尺不明の menu（静止画 menu 等）は
+    /// 先頭へ戻すとすぐ .ended に戻り空転するので、最終フレームで止める。
+    private static let minLoopableMenuSeconds = 1.0
 
     init(engine: any PlayerEngine) {
         self.engine = engine
@@ -98,7 +101,8 @@ final class PlayerViewModel {
             logTransport("phase=\(phase)")
             if case .failed(let error) = phase { lastError = error }
             if case .empty = phase { lastError = nil }
-            if case .ended = phase { scheduleMenuAutoAdvance() }
+            if case .playing = phase { menuLoopPending = false }
+            if case .ended = phase { scheduleMenuLoop() }
         case .positionUpdated(let position, let duration, _):
             guard !timelineScrubbing else { return }   // ドラッグ中のつまみはユーザー操作に固定（#17）
             self.position = position
@@ -125,7 +129,6 @@ final class PlayerViewModel {
             availableTracks = tracks
         case .selectionChanged(let selection):
             selected = selection
-            menuAdvancePending = false   // 選択が動いた = 直前の menu 終端処理は完了
             logTransport("selection item=\(selection.item.rawValue)")
         case .qualityChanged(let presentation):
             quality = presentation
@@ -325,24 +328,22 @@ final class PlayerViewModel {
         Task { await engine.select(item: item) }
     }
 
-    /// DVD 実機の first-play 動作（03 §5 の実挙動合わせ、menu 増分）: menu item
-    /// （titleNumber 0 の約束 — VideoTsNavigator の VMGM 列）の再生が ended になったら、
-    /// 最初の本体タイトル（titleNumber 最小）を auto-select して再生を続ける。
-    /// 本体タイトルが無い盘（menu-only）では何もしない（盘の動作と同じくそこで終わり）。
-    private func scheduleMenuAutoAdvance() {
-        guard !menuAdvancePending,
+    /// DVD 実機の menu 動作（03 §5・§9.7）: インタラクティブ menu は未実装なので、menu
+    /// （titleNumber 0 の約束 — VideoTsNavigator の VMGM 列）は終端で本体へ進まず、
+    /// 先頭から再生し直して繰り返す（実機の menu は選択まで待つ）。本体タイトルへは
+    /// タイトル一覧（RootView）から選んで移る。本体タイトルの .ended では何もしない。
+    /// 尺が不明・極短の menu は繰り返さず終端で止める（空転防止）。
+    private func scheduleMenuLoop() {
+        guard !menuLoopPending,
               let selectedID = selected?.item,
               let playing = availableTitles.first(where: { $0.id == selectedID }),
-              playing.titleNumber == 0
+              playing.titleNumber == 0,
+              let seconds = playing.duration?.seconds, seconds.isFinite,
+              seconds >= Self.minLoopableMenuSeconds
         else { return }
-        // 本体タイトル（titleNumber 最小）へ自動進行する（menu-only 盘では行わない）。
-        let titles = availableTitles.filter { (($0.titleNumber ?? 1) >= 1) }
-        guard let firstTitle = titles.min(by: { ($0.titleNumber ?? 0) < ($1.titleNumber ?? 0) }) else { return }
-        menuAdvancePending = true
+        menuLoopPending = true
         Task { [weak self] in
-            guard let self else { return }
-            await self.engine.select(item: firstTitle.id)
-            await self.engine.play()
+            await self?.engine.play()   // .ended からの play は先頭から再生し直す（EngineCore）
         }
     }
 

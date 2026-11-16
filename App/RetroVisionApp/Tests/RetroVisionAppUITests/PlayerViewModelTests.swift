@@ -129,32 +129,69 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertTrue(fake.calls.contains("play"), "menu が自动再生されない（03 §5 の実挙動合わせ）")
     }
 
-    func testMenuEndedAutoAdvancesToFirstTitle() async {
+    func testMenuEndedLoopsMenuWithoutAdvancing() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+        let playsBefore = fake.calls.filter { $0 == "play" }.count
+
+        fake.emit(.phaseChanged(.ended))   // menu 再生終了 → 先頭から再生し直す
+        for _ in 0..<200 where fake.calls.filter({ $0 == "play" }).count == playsBefore {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, playsBefore + 1,
+                       "menu ended で menu を再生し直さない（繰り返し）")
+        XCTAssertFalse(fake.calls.contains("select:item"),
+                       "menu ended で本体タイトルへ自動進行した（menu で止まるはず）")
+
+        // 2 回目の終端でも繰り返す（ガードは .playing に戻ると解除）。
+        await waitPhase(vm, .playing)
+        fake.emit(.phaseChanged(.ended))
+        for _ in 0..<200 where fake.calls.filter({ $0 == "play" }).count < playsBefore + 2 {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, playsBefore + 2,
+                       "2 回目の menu 終端で繰り返さない")
+        XCTAssertFalse(fake.calls.contains("select:item"))
+    }
+
+    func testBodyTitleEndedDoesNotLoop() async {
         let fake = FakePlayerEngine()
         fake.presetStructure = menuPreset()
         let vm = PlayerViewModel(engine: fake)
         vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
         await waitPhase(vm, .playing)
 
-        fake.emit(.phaseChanged(.ended))   // menu 再生終了
-        for _ in 0..<200 where !fake.calls.contains("select:item") {
-            try? await Task.sleep(nanoseconds: 2_000_000)
-        }
-        let selects = fake.calls.filter { $0 == "select:item" }
-        XCTAssertEqual(selects.count, 1,
-                       "menu ended で最初の本体タイトルへの select が 1 回発火しない（自動進行）")
-        XCTAssertTrue(fake.calls.contains("play"), "自動進行で再生を続けない（first-play 実挙動）")
-
-        // 実 engine は select(item:) で selectionChanged を送る。それが届いた後の
-        // 本体タイトル の ended では自動進行を重ねない（menu 限定の政策）。
         fake.emit(.selectionChanged(PlaybackSelection(item: ItemID(1))))
         for _ in 0..<200 where vm.selected?.item != ItemID(1) {
             try? await Task.sleep(nanoseconds: 2_000_000)
         }
+        let plays = fake.calls.filter { $0 == "play" }.count
         fake.emit(.phaseChanged(.ended))
         try? await Task.sleep(nanoseconds: 30_000_000)
-        let selects2 = fake.calls.filter { $0 == "select:item" }.count
-        XCTAssertEqual(selects2, 1, "本体タイトルの ended で自動進行が再発火した（menu 限定のはず）")
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, plays,
+                       "本体タイトルの ended で再生し直した（menu 限定のはず）")
+        XCTAssertFalse(fake.calls.contains("select:item"))
+    }
+
+    func testVeryShortMenuStopsInsteadOfLooping() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = MediaStructure(itemKind: .dvdTitles, items: [
+            MediaItem(id: ItemID(0), titleNumber: 0, duration: CMTime(value: 1, timescale: 10)),
+            MediaItem(id: ItemID(1), titleNumber: 1, duration: CMTime(value: 60, timescale: 1)),
+        ])
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+        let plays = fake.calls.filter { $0 == "play" }.count
+
+        fake.emit(.phaseChanged(.ended))
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, plays,
+                       "極短 menu を繰り返した（空転する）")
+        XCTAssertFalse(fake.calls.contains("select:item"))
     }
 
     // MARK: 終了後始末（closeEngineForQuit。03 §1 の close 契約のアプリ側）
