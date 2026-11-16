@@ -109,6 +109,14 @@ public struct AspectResolution: Sendable, Hashable {
         case sampleAspectOnly
         case unresolved
     }
+
+    /// 生成は通常 `AspectResolver` 経由（INV-3: 解決は 1 か所）。この init は
+    /// 既に解決済みの値を組み立てる用途（plan の供給・テストの既知値）に限定する。
+    public init(targetDAR: AspectRatio, cleanAperture: PixelRect, source: AspectSource) {
+        self.targetDAR = targetDAR
+        self.cleanAperture = cleanAperture
+        self.source = source
+    }
 }
 
 /// 比の解決は 1 か所で行う（INV-3: 結果は plan に焼き込む）。
