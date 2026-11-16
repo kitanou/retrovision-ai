@@ -5,7 +5,6 @@ import Foundation
 import Observation
 import RVMediaCore
 import RVPlaybackEngine
-
 // MARK: - PlayerViewModel（#17「UI 状態とエンジンの対応」の実装点）
 //
 // 指針（#17 設計方針 2）: 表示状態はすべて PlayerStateSnapshot / PlayerEvent から導出し、
@@ -160,7 +159,9 @@ final class PlayerViewModel {
         Task {
             do {
                 let selection = PlaybackSelection(item: ItemID(1))
-                _ = try await engine.load(FileMediaSource(url: url), selection: selection)
+                // 一つの入口（#3）: ディレクトリ=VIDEO_TS、ディスクイメージ=ISO mount、
+                // 他=ファイル。型の判定は MediaSourceRouting（RVPlaybackEngineTests で検査）。
+                _ = try await engine.load(MediaSourceRouting.makeSource(for: url), selection: selection)
                 // 開いた直後は再生しない（#17: preparing → ready。transport は user gate）。
             } catch let error as PlaybackError {
                 lastError = error
@@ -175,9 +176,11 @@ final class PlayerViewModel {
     func presentOpenPanel() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
+        // #3: ディレクトリ選択を許す（DVD-Video フォルダ / マウント済みボリュームの入口）。
         // 型フィルタは掛けない（#3 で VIDEO_TS / ISO まで一つの入口に載せる設計。
-        // 開けない素材は engine が .formatRejected / .unsupportedStructure で返す）。
+        // 開けない素材は engine が .unsupportedStructure 等で構造化して返す）。
+        panel.canChooseDirectories = true
+        panel.prompt = "開く"
         if panel.runModal() == .OK, let url = panel.url {
             open(url: url)
         }

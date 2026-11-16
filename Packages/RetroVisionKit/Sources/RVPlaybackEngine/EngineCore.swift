@@ -331,8 +331,12 @@ public actor EngineCore {
     /// source から再生線の配線を作る。判明しているのはファイル source のみ（Phase 2 で DVD に拡張）。
     private func wirePipeline(for source: any MediaSource, structure: MediaStructure) async {
         pipeline = nil
-        guard let fileSource = source as? FileMediaSource,
-              let item = structure.items.first,
+        // 配線口（03 §4）。#3 で DemuxerProviding に一般化: source が item 単位の
+        // demuxer を提供する。selected item が structure にあればそれ、無ければ先頭
+        // （DVD のタイトル切り替え UI は #3 の別増分。load の時点で選べる状況にしない）。
+        guard let provider = source as? any DemuxerProviding else { return }
+        let selected = selection?.item
+        guard let item = structure.items.first(where: { $0.id == selected }) ?? structure.items.first,
               let videoFormat = item.videoFormat,
               let track = item.trackTable.first(where: { $0.kind == .video }) else { return }
         // 音声トラック（#10）。AVFoundation が列挙できるもののみ（DTS はトラックとして現れない
@@ -344,7 +348,7 @@ public actor EngineCore {
             audioTrack = audio.id
             audioFormat = format
         }
-        pipeline = (await fileSource.makeDemuxer(), track.id, videoFormat, audioTrack, audioFormat)
+        pipeline = (await provider.makeDemuxer(itemId: item.id), track.id, videoFormat, audioTrack, audioFormat)
     }
 
     private func handleSessionEvent(_ event: PlaybackSession.Event, line: Int) async {

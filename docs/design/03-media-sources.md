@@ -134,3 +134,110 @@ public protocol DVDCssBackend: Sendable {
 | title / chapter を列挙 | `MediaItem` / `ChapterMark`（§3、§5） |
 | ソースエラーでクラッシュしない | エラー値 + `RecoveryAdvice`（01 §5、§6） |
 | 依存のライセンスと配布義務の文書化 | `ThirdPartyNotices` に機械化された書式で記録（[09 §6](09-testing.md)）。OQ-01 / OQ-03 |
+
+## 9. v1 増分として実装済みの経路（#3。2026-11-16 実測）
+
+§4 の libdvdread/libdvdnav 統合は未実装のまま（OQ-01 のまま）。#3 の第一増分は
+**依存ゼロの経路**で VIDEO_TS / ISO を再生可能にした。以下は実装され、テストで
+固定された形（コード側の実測注記と同源）。
+
+### 9.1 タイトル列挙（IFO 非パースの v1）
+
+```swift
+// RVMediaSources（純 Foundation。RVDecode を import しない境界は維持）
+public struct VideoTsChain: Sendable, Hashable {
+    public let vtsNumber: Int
+    public let partURLs: [URL]      // 連結順（VTS_nn_1, _2, ...）
+    public let hasIfo: Bool
+}
+public enum VideoTsNavigator {
+    /// nil = DVD-Video 構造でない（呼び出し側は .unsupportedStructure を構成できる）。
+    public static func chains(in root: URL) -> (chains: [VideoTsChain], warnings: [StructureWarning])?
+}
+```
+
+- 列挙は VIDEO_TS のファイル名走査のみ。IFO の実パース（タイトル数の権威・chapter・
+  トラック表）は増分として保留。IFO が無い・0 バイトのタイトルは `unreadableIFO` の
+  warning を列挙する（#3 受入基準「IFO と VOB の長さが食い違う等を列挙する」の最初の項）。
+- part 番号の飛びは `missingVOB` を残し、繋がった範囲だけを使う。先頭 part (_1) の
+  無い VTS はタイトルにしない。`VTS_nn_0.VOB`（メニュー用）は列から除く（実 DVD 配置の実測）。
+- 決定的順序: vtsNumber 昇順・part 番号昇順。`VideoTsPlaybackTests` が fixture 配置で
+  タイトル 2 本の列挙と warning 発生を検査する。
+
+### 9.2 多重 VOB 連結（実測で決まった実装形）
+
+AVFoundation の MPEG-PS 処理には 2 つの実測事実がある（2026-11-16、scratch probe +
+`ConcatPSDemuxerTests` が兼実測）:
+
+1. **ファイル単位で 0 起点に正規化する**（生素材の先頭 PTS 2.535 s → track timeRange.start=0）。
+   よって「素の PTS の縫合」では繋がらない。
+2. **AVMutableComposition は PS の sample 時刻を書き換えない**（track timeRange は
+   合成オフセットで伸びるが、AVAssetReader は part2 の sample をファイル単位の素の
+   時戳のまま返す。境界直後に 0.53 s 台の sample が現れる実測で確定）。
+
+一方、DVD 仕様は「タイトルの VOB 連結は 1 本の連続した MPEG プログラムストリーム」を
+保証する（VOB 分割は容器のスライス）。合成 fixture で `cat VTS_01_1 VTS_01_2` が
+母素材とバイト一致であることも実測。よって連結 demux は:
+
+```swift
+// RVDecode。単一 part はコピーを作らず AVFoundationDemuxer(url:) へ直行。
+public actor ConcatPSDemuxer: Demuxer, PCMSampleSource {
+    public init(partURLs: [URL])   // 1MB chunk の逐次写しで一時ファイルを作る
+}
+```
+
+- **バイト連結 + 実証済み単一ファイル経路**を採る。sample 時刻の surgery
+  （`CMSampleBufferCreateCopyWithNewTiming`）も、composition のタイムライン合成も不要。
+- 契約は「連結後の列は母素材を単一ファイルとして読んだ列と一致」（テストで逐語一致）。
+  engine 経由の実測でも demux 180 / 提示 180 が母素材と同じ値で完走（VideoTsPlaybackTests）。
+- 代償: open 時にタイトル 1 本ぶんの一時コピー（実 DVD で 1〜8GB）。無連結の
+  ブロック供給経路は §9.4 のハング実測を受けて OQ のまま（次項）。
+
+### 9.3 ISO（ディスクイメージ）= マウント経路
+
+```swift
+// RVPlaybackEngine。diskutil を process 起動（hdiutil は deprecated 警告のため使わない）。
+public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
+    public init(isoURL: URL)
+    public func close() async   // demuxer を降ろしてから eject（実測で順序が要る）
+}
+```
+
+- `diskutil image --plist attach` → `system-entities[].mount-point` / `dev-entry` を読む
+  （テキスト整形に依存しない。キー名は実測: `dev-entry` の値はノード名のみ）。
+- 解除は `diskutil eject <node or mount>`（`diskutil image` に eject/detach は無い）。
+  AVFoundation がボリューム上の file を開いたままだと素の eject は
+  "at least one volume could not be unmounted" で失敗 → **demuxer cache を降ろしてから
+  eject、失敗時は force**（force は常に出る。UI の eject 同意は optical 実装まで棚上げ）。
+- 開いた後は内部の `VideoTsMediaSource`（マウント点の VIDEO_TS）へ委派。e2e は
+  装置ゲート付き（attach 失敗環境では数値を主張しない。実機では合成 ISO で 180 完走実測）。
+
+### 9.4 無マウント（ブロック供給 → AVFoundation）の実測結果
+
+`BlockReader`（memory/ファイル供給）から AVFoundation へ渡す無名経路は、合成 ISO の
+供給で `loadTracks` が解決されず 30 s 超ハング（2026-11-16 実測、issue #3 に記録）。
+libdvdread の `DVDFileIO`（C のブロック読み口）に相当する差し込み口は AVFoundation に
+対応物がない。よって §4 の block-reader 統合は libdvdread 実装の設計として残し、
+無名供給で AVFoundation を読ませる道は separate gate の実験（OQ-01 の証拠として記録）。
+
+### 9.5 一つの入口（URL → source 型）
+
+```swift
+public enum MediaSourceRouting {
+    public static func makeSource(for url: URL) -> any MediaSource
+    public static func isDiskImageURL(_ url: URL) -> Bool
+}
+```
+
+- ディレクトリ → `VideoTsMediaSource`（ボリュームルート/VIDEO_TS 直下の両対応）、
+  ディスクイメージ UTI → `DiscImageMediaSource`、その他 → `FileMediaSource`。
+- `FileMediaSource` の disk-image 事前ゲート（AVError -11828 実測）は安全網として維持。
+- Engine の配線口は `DemuxerProviding`（item 引数つき）に一般化。FileMediaSource は
+  itemId を無視する退化ケース（`makeDemuxer(itemId:)` = 同一实例の約束は継続）。
+
+## 10. v1 増分で未実装のまま残す項目（#3 の続き）
+
+- IFO 実パース（chapter 列挙・タイトル長の権威・menu/angle）・`preflight(item:)`・
+  タイトル切り替え UI（`select(item:)` は配線済み、UI 未実装）。
+- 光学ドライブ（`DADiskAppeared/Disappeared` 検出・mediaRemoved 実運用）。
+- CSS/AACS（§7。OQ-03 のまま）。

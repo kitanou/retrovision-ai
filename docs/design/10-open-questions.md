@@ -119,6 +119,18 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **境界検査**: アプリ source は RVMediaCore / RVMediaSources / RVPlaybackEngine のみを import する（INV-8）。`ImportBoundaryAppTests` が機械検査。アプリは単独 SPM パッケージ（App/RetroVisionApp）で、make と CI に build/test を追加（00 §2 の構造どおり。Xcode ワークスペース化と App Sandbox・署名は #16）。
 - **比率の暫定実装**: 表示比率は最初の提示帧の `format`（codedSize + aspectSignals）から AspectResolver で解決し、枠の aspectRatio に反映。NTSC 720x480（PAR 10:11）が 4:3 になる回帰を 2 本（単位 + e2e）で固定。信号が無い素材は 1:1 画素比で仮表示し、メニューで明示選択を促す（推測で 4:3 に倒さない = 01 §2 の方針継続）。
 
+### 2026-11-16 — DVD/ISO source（#3 v1 増分）の実装決定（実測は 03 §9 に反映）
+
+- **AVFoundation の MPEG-PS タイムラインは「ファイル単位 0 起点正規化」だと確定**（実測: 生素材の先頭 PTS 2.535 s → track timeRange.start = 0、先頭 sample PTS = 0.0）。多重 VOB の連結は「素の PTS の縫合」では成立しない（part2 が 0 台から始まり衝突する）。
+- **AVMutableComposition による連結は不採用**（設計候補を実測で否定）: composition はタイムライン構造（track timeRange）だけ合成し、**PS 由来の圧縮 sample の時刻を書き換えない**（part2 の sample がファイル単位の素の時戳のまま届く。track 終端 3.04 s の直後に 0.47〜0.53 s 台の sample が並ぶ実測で確定。`datacount` probe: 174 buffer / 有効 166、tail は素の 2.90 のまま）。`CMSampleBufferCreateCopyWithNewTiming` の自前 surgery を避けるため、**バイト連結 + 実証済み単一ファイル経路**へ切り替えた。DVD 仕様は「タイトル VOB の連結は 1 本の連続 MPEG-PS」を保証するため正当（VOB は容器のスライス）。fixture の `cat` が母素材とバイト一致であることも実測で確認（検査の根拠に使う）。
+- **連結後の契約は「単一ファイルとして読んだ列と一致」**（`ConcatPSDemuxerTests` が逐語一致で固定。engine e2e でも母素材と同じ demux 180 / 提示 180・境界跨ぎの位置連続を実測）。sample 列は MPEG の復号順（IPPP/IBBP の 3 周期 PTS 列）で presentation 順ではない — 単調化は engine の位置契約（02 §4 床ガード）の仕事、と demux 段の境界を明確化（#13 の seek 着地実測の続測）。
+- **title 列挙は VIDEO_TS ファイル名走査（v1）**。IFO 実パースは増分として保留（OQ-01 の libdvdread 設計はそのまま）。IFO 欠落・0 バイト IFO は `unreadableIFO`、part 飛び・先頭 part 欠落は `missingVOB` を structure.warnings に列挙（#3 受入基準の第一条項をテストで固定）。`VTS_nn_0.VOB`（menu）は列から除く（実 DVD 配置対策）。
+- **ISO はマウント経路に決めた**（実測で三つの事実）: (1) AVFoundation は ISO を直接 demux できない（-11828。#3 事前ゲートの続測）、(2) ブロック供給の無名経路は `loadTracks` が解決せず 30 s 超ハング（無名供給 → AVFoundation の道は separate gate の実験として OQ-01 の証拠に記録）、(3) `diskutil image --plist attach` の plist（`system-entities[].mount-point` / `dev-entry`）は決定的に読める。解除は `diskutil eject`（`diskutil image` に eject/detach は無い）+ AVFoundation の開いた取扱いが残っていると素の eject は失敗（"at least one volume could not be unmounted"）→ **demuxer を降ろしてから eject、失敗時 force** の順で固定（テスト後の /Volumes 残留 0 を検査）。CLI 選択: hdiutil は deprecated 警告のため diskutil（Makefile・コードとも）。
+- **Engine 配線口の一般化**: `FileMediaSource` 特例だった wirePipeline を `DemuxerProviding`（`makeDemuxer(itemId:)`）へ一般化（03 §9.5）。item 単位 demuxer（VTS ごと）+ 単一实例の約束（track id 対応）は継続。selected item が structure に無ければ先頭（title 切り替え UI は未実装のまま）。
+- **一つの入口**: `MediaSourceRouting`（directory→VideoTs / disk-image UTI→DiscImage / その他→File）。App の NSOpenPanel は canChooseDirectories=true（ボリュームルート/VIDEO_TS 直下の両対応で開く）。FileMediaSource の disk-image 事前ゲートは安全網として維持。
+- **fixture**: `Scripts/gen-dvd-fixture.sh`（母素材 ntsc480i-ac3-01.mpg を pack 境界・セクタ境界で 2 分割 → VTS_01_1/2.VOB + 単一 VTS_02 + 0 バイト IFO/BUP + `hdiutil makehybrid` ISO）。`make gen-fixtures` の末尾に接続。マニフェストには derived fixture として**母素材の sha256 を記録**（ISO/VOB の再生成は非決定的。内容の integrity は母素材側で担保 — OQ-21 の約束の延伸）。`hdiutil makehybrid -quiet` は失敗理由を隠して exit 1（実測。付けない）。
+- 新規 API 面の気づき（CLAUDE.md 収集方針）: `diskutil image attach` の stdout はタブ区切り（テキスト解析はもたない。`--plist` は `diskutil image --plist <subcommand>` の位置で効く）。`FileHandle` の Swift イニシャライザは現 SDK で `init(forReadingFrom:)/init(forWritingTo:)`（`forReadingAt:` は無い）。AVAssetReader の `timeRange` は sample pts の逐語比較で選ぶ（seek 着地に境界 marker が 1 本混ざる意味論は #13 と同一）。AVMutableComposition の track `timeRange.duration` は符号順末尾の無データ marker を含む（挿入範囲を実測終端で切る設計は不採用＝連結方式の変更で消滅）。
+
 
 ## 意思決定の運用
 
