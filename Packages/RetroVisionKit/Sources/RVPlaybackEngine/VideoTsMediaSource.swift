@@ -19,6 +19,10 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
     public let rootURL: URL
     private var chainsByID: [ItemID: VideoTsChain] = [:]
     private var demuxers: [ItemID: any Demuxer] = [:]
+    /// open の結果（冪等化）。タイトル切り替えは「同じ source の再 open」で再 loadされるが、
+    /// 再 probe（= 多重 VOB の再連結コピー、実 DVD で 1〜8GB）をやり直さないための cache。
+    /// demuxer の同一实例契約（track id 対応）とも整合する（DemuxerProviding の注記）。
+    private var opened: OpenedSource?
 
     public init(rootURL: URL) { self.rootURL = rootURL }
 
@@ -30,6 +34,7 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
     }
 
     public func open() async throws -> OpenedSource {
+        if let opened { return opened }   // 冪等（タイトル切り替えの再 load で再 probe・再連結しない）
         guard let found = VideoTsNavigator.chains(in: rootURL) else {
             throw PlaybackError(kind: .source(.unsupportedStructure),
                                 causeDescription: "VIDEO_TS ディレクトリが見つかりません（\(rootURL.lastPathComponent)）",
@@ -82,9 +87,11 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
         // （ISO 経路ではマウント点の実ファイル。03 §2 の optical 実装時に置き換える）。
         let probePart = self.chainsByID[first.id]?.partURLs.first
             ?? rootURL.appendingPathComponent("VIDEO_TS")
-        return OpenedSource(reader: FileBlockReader(url: probePart),
-                            structure: structure,
-                            formatHint: .mpegProgramStream)
+        let opened = OpenedSource(reader: FileBlockReader(url: probePart),
+                                  structure: structure,
+                                  formatHint: .mpegProgramStream)
+        self.opened = opened
+        return opened
     }
 
     /// Engine 向けの配線口（DemuxerProviding。open() で probe 済みの同一实例を返す —

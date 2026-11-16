@@ -235,9 +235,40 @@ public enum MediaSourceRouting {
 - Engine の配線口は `DemuxerProviding`（item 引数つき）に一般化。FileMediaSource は
   itemId を無視する退化ケース（`makeDemuxer(itemId:)` = 同一实例の約束は継続）。
 
-## 10. v1 増分で未実装のまま残す項目（#3 の続き）
+### 9.6 タイトル切り替え（2026-11-17 実装済み。#3 追加分）
 
-- IFO 実パース（chapter 列挙・タイトル長の権威・menu/angle）・`preflight(item:)`・
-  タイトル切り替え UI（`select(item:)` は配線済み、UI 未実装）。
+実運用で「ISO を開くとおそらく最初のチャプター（実際は VTS_01 タイトル）しか再生されない」
+と報告された。v1 の境界（全タイトルを列挙するが engine は ItemID(1) を選ぶだけ）への
+応答として、`select(item:)` を実際の切り替えとして実装した。
+
+- **切り替え意味論（決定）**: `EngineCore.select(item:)` = 「同じ source の再 load」。
+  lineGeneration を進めて旧線を黙らせ、旧 session を stop、新しい item へ配線し直して
+  warmup → `.preparing → .ready`。position は 0 に戻る（`positionUpdated(.zero)` が
+  単一の初期化経路）。再生の継続ではなく停止 → 押し直し（v1。 autoplay の継続は増分）。
+- **items.first 固定の修正（実測で顕在化）**: snapshot の duration / available、seek の
+  duration イベント、rebuildPlan、tracksChanged は selected item に従う（`selectedItem()`
+  経由）。2 本目に切り替えても UI の長さが 1 本目のまま、という実測が修正の根拠。
+- **source 側の冪等 open**: VideoTsMediaSource は構造と demuxer を、DiscImageMediaSource は
+  マウントを cache（再 load で再 probe・再連結・再 attach をしない。実測: attached の ISO を
+  再度 attach すると「〜 1」付きの別マウントが増える。多重 VOB の再連結コピーは GB 級）。
+  demuxer の同一实例契約は open をまたいても保つ（検査で固定）。
+- **load での session 停止**: 以前は 2 回目の load で旧 session が止められていなかった
+  （ファイルの 2 回目 open でも同じ。本増分で load 冒頭に停止を追加）。
+- **UI**: メニューバーの「映像タイトル」（transport バーの film アイコン）。multi-item
+  構造のときだけ表示。選択は engine へ `select(item:)` を投げ、表示更新は
+  selectionChanged / tracksChanged / positionUpdated(.zero) からのみ反映（#17 の単一経路）。
+- **fixture 変更（判别可能化）**: VTS_02_1.VOB を truncated-01.mpg（4.04 s の別素材）の
+  複製に変更。単一 MPEG の機械スライスだとタイトル 1 に近く、e2e が数値で区別できなかった。
+  実測: タイトル 2 の raw probe = total 122 / valid 120 / lastPTS 3.971 s、
+  engine 経由 = demux 120 / 提示 120（0 長 marker 2 件は demux 縁の間引き。OQ-23 の意味論と一致）。
+  タイトル 1 の 180 と明確に区別される。`VideoTsPlaybackTests.testTitleSwitchPlaysSecondTitle`
+  が 120/120 で兼実測固定。
+
+## 10. v1 増分以降も未実装のまま残す項目（#3 の続き）
+
+- IFO 実パース（chapter 列挙・タイトル長の権威・menu/angle）・`preflight(item:)`。
+- タイトル内の chapter マーカー表示と章単位 seek（切り替え UI は §9.6 で実装済み）。
 - 光学ドライブ（`DADiskAppeared/Disappeared` 検出・mediaRemoved 実運用）。
 - CSS/AACS（§7。OQ-03 のまま）。
+- 実在 DVD/ISO の fixture registry（OQ-16/#15。ユーザー実 ISO での open・再生・タイトル
+  切り替えの動作は 2026-11-17 に実機で確認済みだが、検査可能な素材として登録されていない）。

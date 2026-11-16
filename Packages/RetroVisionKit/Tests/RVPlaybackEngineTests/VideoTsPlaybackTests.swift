@@ -214,4 +214,72 @@ final class VideoTsPlaybackTests: XCTestCase {
         XCTAssertEqual(outcome.demuxedSampleCount, 180,
                        "ISO 経由の demux 実数が母素材の実測（180）と違う")
     }
+    // MARK: - 5. タイトル切り替え: 別素材のタイトル 2 を選ぶとそちらが再生される
+    //
+    // 実測（2026-11-17、vts2count probe）: VTS_02（truncated-01 複製）は
+    // total=122 / valid=120 / lastPTS=3.971s。タイトル 1（母素材連結 = 180）と
+    // 数値で区別できる。この検査が兼実測で、engine 側の厳密値を固定する。
+
+    func testTitleSwitchPlaysSecondTitle() async throws {
+        let root = try dvdRoot()
+        let engine = EngineCore()
+        let events = await engine.events()
+        try await engine.load(VideoTsMediaSource(rootURL: root),
+                              selection: PlaybackSelection(item: ItemID(1)))
+        await engine.select(item: ItemID(2))
+
+        let snap = await engine.snapshot()
+        XCTAssertEqual(snap.selected?.item, ItemID(2), "選択が更新されない")
+        guard let duration = snap.duration else {
+            return XCTFail("duration がタイトル 2 の長さに更新されない（selectedItem 未反映）")
+        }
+        XCTAssertGreaterThan(duration.seconds, 3.5, "duration が短すぎる: \(duration.seconds)")
+        XCTAssertLessThan(duration.seconds, 4.5, "duration が古い item のまま: \(duration.seconds)")
+
+        let box = SnapshotBox()
+        let consumer = Task {
+            for await event in events {
+                box.handle(event)
+                if box.done { break }
+            }
+        }
+        await engine.play()
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline && !box.done {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        consumer.cancel()
+        let outcome = await engine.playbackOutcome() ?? PlaybackOutcome()
+        await engine.close()
+
+        XCTAssertNil(box.failedMessage, "タイトル 2 の再生が失敗: \(box.failedMessage ?? "")")
+        XCTAssertTrue(box.endedFlag, "タイトル 2 で phase .ended に到達しない")
+        // 兼実測で厳密値を固定（2026-11-17 実測）: engine 経由で 120/120 で完走。
+        // （raw probe では total=122 — 0 長 marker 2 件は demux 縁の間引きで除かれる OQ-23 の意味論）。
+        // タイトル 1 の 180 とは明確に区別される。
+        XCTAssertEqual(outcome.demuxedSampleCount, 120,
+                       "タイトル 2 の実測（120）と違う: \(outcome.demuxedSampleCount)")
+        XCTAssertEqual(outcome.stats.presented, 120)
+        print("title-2 e2e: demux=\(outcome.demuxedSampleCount) presented=\(outcome.stats.presented)")
+        let positions = box.collectedPositions.map(\.seconds)
+        for i in 1..<positions.count {
+            XCTAssertGreaterThanOrEqual(positions[i], positions[i - 1] - 1e-9, "position 逆行（02 §4）")
+        }
+        XCTAssertLessThan(positions.max() ?? 0, 4.4, "タイトル 2 の終端（4.0 s 級）を超えて進む: \(positions.max() ?? -1)")
+    }
+
+    // MARK: - 6. open は冪等（タイトル切り替えの再 load で再 probe・再連結・再 attach をしない）
+
+    func testOpenIsIdempotentAndKeepsDemuxerIdentity() async throws {
+        let source = VideoTsMediaSource(rootURL: try dvdRoot())
+        let first = try await source.open()
+        let second = try await source.open()
+        XCTAssertEqual(second.structure.items.map(\.id), first.structure.items.map(\.id))
+        XCTAssertEqual(second.structure.items.count, 2)
+        // demuxer の同一实例契約: 再 open をまたいも同じ instance（track id 対応の担保 —
+        // DemuxerProviding.swift の注記。切り替え経路で新しい instance になると壊れる）。
+        let d1 = await source.makeDemuxer(itemId: ItemID(2))
+        let d2 = await source.makeDemuxer(itemId: ItemID(2))
+        XCTAssertTrue((d1 as AnyObject) === (d2 as AnyObject), "demuxer の实例が変わった")
+    }
 }

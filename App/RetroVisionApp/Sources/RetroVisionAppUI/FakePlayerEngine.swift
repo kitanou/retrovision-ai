@@ -42,15 +42,32 @@ public final class FakePlayerEngine: PlayerEngine, VideoSurfaceBinding {
 
     public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws -> MediaStructure {
         calls.append("load")
-        let structure = MediaStructure(itemKind: .singleItem,
-                                      items: [MediaItem(id: selection.item,
-                                                       duration: CMTime(seconds: 60, preferredTimescale: 1))])
+        let structure = presetStructure ?? MediaStructure(itemKind: .singleItem,
+                                                         items: [MediaItem(id: selection.item,
+                                                                          duration: CMTime(seconds: 60, preferredTimescale: 1))])
+        let isReload = nilWasSet
+        nilWasSet = true
         structureRef = structure
+        // 実 engine（EngineCore.load）と同じ順序で流す — VM の派生状態は events からのみ
+        // 更新されるので、実装側の単一経路（tracksChanged → selectionChanged → 再 load 時の
+        // positionUpdated(.zero)）を fake も踏む（02 §6 の意味論）。
         emit(.phaseChanged(.preparing))
         emit(.structureChanged(structure))
+        emit(.tracksChanged(structure.items.first(where: { $0.id == selection.item })?.trackTable
+                             ?? structure.items.first?.trackTable ?? []))
+        emit(.selectionChanged(selection))
+        if isReload {
+            emit(.positionUpdated(position: .zero,
+                                  duration: structure.items.first(where: { $0.id == selection.item })?.duration
+                                    ?? structure.items.first?.duration, clockDriftMS: 0))
+        }
         emit(.phaseChanged(.ready))
         return structure
     }
+    private var nilWasSet = false
+    /// テスト・プレビューで multi-title 構造など既知の構造を流したいときの差し込み口
+    /// （タイトルメニューの検査用。未設定なら従来どおり singleItem）。
+    public var presetStructure: MediaStructure?
 
     public func close() async {
         calls.append("close")
