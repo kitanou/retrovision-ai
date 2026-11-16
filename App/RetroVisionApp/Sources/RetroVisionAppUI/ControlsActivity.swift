@@ -31,10 +31,20 @@ public final class ControlsActivityMonitor {
         token = NSEvent.addLocalMonitorForEvents(
             matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .scrollWheel]
         ) { event in
+            // オプトイン診断（既定は沈黙・「アプリはログを書かない」方針は不変）。
+            // RV_DEBUG_ACTIVITY=1 のときだけ stderr に活動イベントを流す。実機での
+            // 登録/発火の切り分けに実測で使った（2026-11-17、#22: 窓の mouse-moved
+            // 生成が既定 false で monitor に一行も届かない状態を確定させた計器）。
+            if ProcessInfo.processInfo.environment["RV_DEBUG_ACTIVITY"] != nil {
+                FileHandle.standardError.write("activity event=\(event.type.rawValue)\n".data(using: .utf8)!)
+            }
             // local monitor の handler は main thread で同期呼出し（sendEvent の
             // 分发前。検査 ControlsActivityMonitorTests で実測固定）。
             MainActor.assumeIsolated { notify() }
             return event   // イベントを吞まない（バー自身の操作 — timeline ドラッグ等 — を壊さない）
+        }
+        if ProcessInfo.processInfo.environment["RV_DEBUG_ACTIVITY"] != nil {
+            FileHandle.standardError.write("controls activity monitor registered\n".data(using: .utf8)!)
         }
     }
 
