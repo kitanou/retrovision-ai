@@ -1,3 +1,4 @@
+import CoreVideo
 import Foundation
 import RVMediaCore
 
@@ -169,10 +170,18 @@ public struct ModelHealth: Sendable, Hashable {
     }
 }
 
+/// 推論の入出力に使う pixel buffer の箱（CVPixelBuffer は Sendable 注釈が無いため、所有の受け渡しをここで明示する）。
+public struct InferenceFrame: @unchecked Sendable {
+    public let pixelBuffer: CVPixelBuffer
+    public init(_ pixelBuffer: CVPixelBuffer) { self.pixelBuffer = pixelBuffer }
+}
+
 public protocol ModelRuntimeProtocol: Sendable {
     func discover() async -> [ModelManifest]
     func load(_ id: ModelID) async throws
     func unload(_ id: ModelID) async
-    func predict(_ request: InferenceRequest) async throws
+    /// 1 frame の推論。方針 A（06 §4）: CVPixelBuffer を image 入力として渡し、出力も pixel buffer で返す。
+    /// deadline 超過・breaker open・shape 不一致は `PlaybackError.model(...)` で返す（再生は止めない）。
+    func predict(_ request: InferenceRequest, input: InferenceFrame) async throws -> InferenceFrame
     func health(of id: ModelID) async -> ModelHealth
 }

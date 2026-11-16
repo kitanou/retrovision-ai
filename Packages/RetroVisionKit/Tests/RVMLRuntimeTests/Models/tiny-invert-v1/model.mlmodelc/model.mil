@@ -1,0 +1,15 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3605.1.1"}, {"coremlc-version", "3600.25.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp32, [1, 3, 32, 32]> image) {
+            fp16 sub_0_x_0_to_fp16 = const()[name = string("sub_0_x_0_to_fp16"), val = fp16(0x1.fep+7)];
+            string image_to_fp16_dtype_0 = const()[name = string("image_to_fp16_dtype_0"), val = string("fp16")];
+            tensor<fp16, [1, 3, 32, 32]> image_to_fp16 = cast(dtype = image_to_fp16_dtype_0, x = image)[name = string("cast_1")];
+            tensor<fp16, [1, 3, 32, 32]> sub_0_cast_fp16 = sub(x = sub_0_x_0_to_fp16, y = image_to_fp16)[name = string("sub_0_cast_fp16")];
+            fp16 out_tensor_alpha_0_to_fp16 = const()[name = string("out_tensor_alpha_0_to_fp16"), val = fp16(0x0p+0)];
+            fp16 out_tensor_beta_0_to_fp16 = const()[name = string("out_tensor_beta_0_to_fp16"), val = fp16(0x1.fep+7)];
+            tensor<fp16, [1, 3, 32, 32]> out_tensor_cast_fp16 = clip(alpha = out_tensor_alpha_0_to_fp16, beta = out_tensor_beta_0_to_fp16, x = sub_0_cast_fp16)[name = string("out_tensor_cast_fp16")];
+            string out_tensor_cast_fp16_to_fp32_dtype_0 = const()[name = string("out_tensor_cast_fp16_to_fp32_dtype_0"), val = string("fp32")];
+            tensor<fp32, [1, 3, 32, 32]> out_tensor = cast(dtype = out_tensor_cast_fp16_to_fp32_dtype_0, x = out_tensor_cast_fp16)[name = string("cast_0")];
+        } -> (out_tensor);
+}

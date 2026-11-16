@@ -252,3 +252,11 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査**: 5 つの位相すべてで 10 frame 目にロックし位相が合う、全縞あり / 全縞なしの分類、9 frame ではロックしない、1 回の食い違いでは抜けず 2 連続で抜ける、telecine → 全縞ありで interlaced22 に落ち着く、根拠の再現性（`CadenceAnalyzerTests`）。
 - **未実装（A1 の残り）**: comb スコアを GPU の SAD kernel から取り出して analyzer へ流す配線、`.auto` の mode 選択（telecine → inverseTelecine）、inverseTelecine の復元と 2:3 提示、`CadenceDecision` の plan / 診断への記録。OQ-22（60i の film-origin pull-down）の実素材検証（#15）も要る。
 
+### 2026-11-17 — #6 A2: Core ML 実行層（load / predict / tiny model ハーネス）
+
+- **許可**: `coremltools` の取得はユーザーの許可を得て、プロジェクトの `.venv-tools`（`.gitignore` 済み）の仮想環境にだけ入れた（coremltools 9.0 + numpy）。重み・外部モデルは取得していない。
+- **決定（実装）**: `CoreMLModelRuntime`（actor）が `ModelRuntimeProtocol` を実装する。`<modelsDirectory>/<name>/model.json`（`ModelManifest`）+ コンパイル済み `.mlmodelc` を discover / load し、方針 A（06 §4）で `CVPixelBuffer` を image 特徴として渡して出力も pixel buffer で受ける。`predict` は `InferenceFrame`（Sendable の箱）で入出力する。失敗はすべて `PlaybackError.model(...)` の値で返す: 未 load → `notCompiled`、寸法違い → `shapeMismatch`（モデルの不調ではないので breaker に数えない）、期限超過 → `deadlineExceeded`（結果を捨てる。breaker に数えない）、推論例外 → `runtimeFailure`（breaker に加算）、breaker open → `disabledByBreaker`。`measuredOn` / `expectedLatencyMS` の無いモデルは既定で load を拒否する（G3 の運用ルール。契約検査用の tiny model だけ `requireMeasurement: false`）。`ModelHealthTracker`（前の増分）が p50/p95・失敗率・breaker を保持する。
+- **tiny model**: `Scripts/make-tiny-model.py` が 32x32 BGR を 255-x に反転するモデルを生成する（約 20 KB の `.mlmodelc` と `model.json` を `Tests/RVMLRuntimeTests/Models/tiny-invert-v1` に置く）。coremltools 9.0 では MIL program 直書きの出力 `ImageType` 指定が反映されず multiArray になるため、spec を編集して出力を BGR の画像にしている。
+- **検査（実際の Core ML 推論）**: discover、load → predict（画素値 245/155/55 を確認）→ unload、未計測モデルの拒否、shape 不一致が breaker に数えられない、期限超過が breaker に数えられない、連続失敗で breaker が open して以降は投入されない（`CoreMLModelRuntimeTests`）。
+- **未実装（A2 の残り）**: Metal ↔ テンソルの橋渡し（`tensor_to_texture` kernel・方針 B）と変換コストの分離計測、tile 分割 + overlap blend、memory pressure 連動の unload、`EngineCore` への接続（breaker の open を `ControlSignals.modelBreakerOpen` へ）、実モデルでの compute units 実測（G3）。実モデル（Real-ESRGAN 等）の変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。
+
