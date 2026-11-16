@@ -340,6 +340,63 @@
       }
     },
     {
+      "id": "dvd-video-ts-01",
+      "status": "generated",
+      "kind": "videoTsFolder",
+      "sha256": "80bd81ee36c4f4d5a057092fd00d9f2a5eb89c06230b0dae81eb9f64698cd0ce",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "dvd",
+        "video-ts",
+        "multi-vob",
+        "derived-from:ntsc480i-ac3-generated"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/dvd-video-ts-01",
+      "generator": {
+        "recipe": "Scripts/gen-dvd-fixture.sh",
+        "measuredWith": "macOS 27.2.1 / arm64（生成実測 2026-11-16）",
+        "regenerate": "sh Scripts/gen-dvd-fixture.sh（母材料の .mpg は Git に載せる。ISO と違い VOB の再生成は決定的: pack 境界の byte-slice）"
+      },
+      "expectations": {
+        "layout": "VIDEO_TS/ に VIDEO_TS.IFO/BUP + VTS_01_1.VOB + VTS_01_2.VOB（多重 VOB チェーン）+ VTS_02_1.VOB",
+        "derivedFrom": "ntsc480i-ac3-generated。VTS_01_1+VTS_01_2 の連結は母素材とバイト一致（sha256 は母素材のものを記録: derived fixture の約束）",
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "audioTracks": 1,
+        "audioCodec": "ac3"
+      }
+    },
+    {
+      "id": "dvd-iso-01",
+      "status": "generated",
+      "kind": "discImage",
+      "sha256": "80bd81ee36c4f4d5a057092fd00d9f2a5eb89c06230b0dae81eb9f64698cd0ce",
+      "seconds": 6,
+      "properties": [
+        "generated",
+        "dvd",
+        "iso9660",
+        "derived-from:dvd-video-ts-01"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/dvd-iso-01.iso",
+      "generator": {
+        "recipe": "Scripts/gen-dvd-fixture.sh（hdiutil makehybrid -iso。-quiet は失敗理由を隠し exit 1 — 実測で付けない）",
+        "measuredWith": "macOS 27.2.1 / arm64（生成実測 2026-11-16）",
+        "regenerate": "sh Scripts/gen-dvd-fixture.sh（hdiutil はタイムスタンプ充填で決定的でない。sha256 は内容の母素材のものを記録する）"
+      },
+      "expectations": {
+        "mountable": "diskutil image attach でマウントでき、VIDEO_TS/ が見えること（e2e 検査の実測）",
+        "layout": "dvd-video-ts-01 と同一の VIDEO_TS 配置",
+        "codedSize": "720x480",
+        "frameRate": "30000/1001",
+        "audioTracks": 1,
+        "audioCodec": "ac3"
+      }
+    },
+    {
       "id": "truncated-01",
       "status": "generated",
       "kind": "generatedFile",

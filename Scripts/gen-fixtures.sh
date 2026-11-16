@@ -105,6 +105,9 @@ gen truncated-01.mpg \
   -c:v $M2 $M2I $M2DVD $M2SEQ -t 4
 dd if="$OUT/truncated-01.mpg" of="$OUT/truncated-01-cut.mpg" bs=1024 count=400 2>/dev/null
 
+# 10. 合成 DVD（VIDEO_TS フォルダ + ISO。#3。母材料は ntsc480i-ac3-01.mpg）
+sh "$(dirname "$0")/gen-dvd-fixture.sh"
+
 echo
 echo "--- 生成物 ---"
 ls -l "$OUT"
