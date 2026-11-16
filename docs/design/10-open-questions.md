@@ -190,6 +190,12 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定（アプリ側の終了経路）**: `applicationShouldTerminate` → `closeEngineForQuit()`（async）を走らせてから `reply(toApplicationShouldTerminate:)`。保留中の待ち時間は watchdog（3 s、超過時 rvquit 一行で進行）。**nested run loop で待たせる案は実測で退場**: 素の CFRunLoop を回しても main actor のジョブは流れず（XCTest で 3 s 待っても engine.close が完了しなかった）、同期待ちのつもりが事実上 complete しない。terminateLater で AppKit の通常ループに戻すのが正しい。
 - **検査**: EngineCoreTests（engine.close → source.close が 1 回だけ伝播、2 回目の engine.close は no-op）、PlayerViewModelTests（closeEngineForQuit が engine.close 完了 + events 経由の空状態）。live（実 PICHI ISO）: 再生中のアプリを TERM で終了 → マウント解除と temp 削除を確認（この項の実測は PR 記載）。docs 03 §1 に契約、§9.6 に close と冪等 cache の関係を追記。
 
+### 2026-11-17 — Demuxer.close（続報）: temp 掃除は deinit の時点に任せられない（#3、live 実測）
+
+- **実測**: PR #28 の terminateLater 経路でアプリを終了すると unmount は走ったが、修復写し temp は残った。close→reply→process exit の順では actor（SegmentPSDemuxer）の非同期 deinit / process 終末の deinit が走る前に終る — deinit は「open 経路中断の保険」であって契約にできない。
+- **決定（契約の対）**: `Demuxer.close() async` を追加（資源を持たない demux は no-op 既定）。SegmentPSDemuxer.close は修復写しを**同期的**に削除 + parts/mergedInfo の cache を落とす（close 後の再 probe は ensureParts で作り直し — 検査で成立固定）。VideoTsMediaSource.close と DiscImageMediaSource.close は demuxer の close を await してから手放す。
+- **検査**: SegmentPSDemuxerTests §8（close で temp が消える・close 後の再 probe が壊れない・2 回目の close で残らない）。
+
 ## 意思決定の運用
 
 1. 決めたら**この表に「決定」と「日付」「根拠（実験 ID / レポート ID）」を書く**。本文の既定値は同じ commit で更新する。

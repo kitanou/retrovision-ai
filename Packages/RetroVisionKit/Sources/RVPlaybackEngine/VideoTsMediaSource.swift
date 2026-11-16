@@ -39,7 +39,13 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
         // opened cache も落とす（次の open は再走査・再 probe — close は「開き直し」の
         // 区切りであり、タイトル切り替えの再 load は close を通らない — 03 §9.6）。
         opened = nil
-        releaseDemuxers()
+        // demuxer の明示 close（修復写しの削除 — Demuxer.close 契約）をしてから手放す。
+        let old = demuxers
+        demuxers.removeAll()
+        chainsByID.removeAll()
+        for (_, demuxer) in old {
+            await demuxer.close()
+        }
     }
 
     public func open() async throws -> OpenedSource {
