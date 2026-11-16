@@ -71,12 +71,13 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | 比の解決（01 §2、05 §6） | 実装済み（目標 DAR 優先 + clean aperture 逆算。704/720 の注意をテストで固定） |
 | **MPEG-2 bitstream 解析（04 §2）** | 実装済み（sequence / picture / **picture-coding 拡張（PCE）**。ffprobe と byte-for-byte で突合。`BitstreamTests` に fixture 実バイトの回帰固定） |
 | **demux + VideoToolbox 復号（04 §2・§3）** | 実装済み（AVFoundation ES パススルー、zero-sample ゲート、hint 供給、PCE field 順序、提示順の遅延組み替え）。統合テスト 6 本で回帰固定 |
-| **フォーマット probe（04 §2・09）** | 実装済み（`make probe` → `bench/captures/probe-*.json`。nightly CI が収集） |
+| **フォーマット probe（04 §2・09）** | 実装済み（`make probe` → `probe-*.json`、`make probe-play` → EngineCore 経由の実時間再生測定 `play-*.json`。nightly CI が収集） |
 | 表示スケジュール（05 §5.3） | 実装済み（vsync 整数本の計画、59.94/60/50/24fps のパターンをテストで固定） |
 | 計測とレポート（08 §7） | 実装済み（窓集計の `MetricBus`、JSONL、`BenchmarkReport` の null 保持） |
 | 適応制御（08 §4、§5） | 実装済み（`AdaptivePolicyEngine` の降格順序・hysteresis） |
-| `EngineCore`（02） | 状態機械・設定適用・plan 生成まで実装（復号への実接続は Phase 1 の残り作業） |
-| 未実装（03、05、06、07、音声・同期） | 契約と plan のみ（音声復号は OQ-19、SW 復号は OQ-20 のゲート待ち） |
+| **再生線（EngineCore ↔ demux/decode、#11 前半）** | 実装済み（`PlaybackSession` + `FileMediaSource`。映像のみ: play/pause/resume・PTS 順の提示・位置イベント・`PlaybackOutcome` 計測）。実測: 180 素材で 180/180 提示、realTimeFactor 0.9998、late 0、提示間隔 p50 33.25 ms（目標 33.37）。統合テスト 4 本で回帰固定 |
+| `EngineCore`（02） | 状態機械・設定適用・plan 生成＋上記の再生線接続まで実装（seek は場当たり的な再構築のみ＝#13、音声線は #10） |
+| 未実装（03、05、06、07、音声実装） | 契約と plan のみ（音声は復号経路の実験まで完了＝EXP-002。AudioDecoder/AudioSink/clock 実装は #10、SW 復号は OQ-20 のゲート待ち） |
 | 素材 | `fixtures/manifest.json` 18 登録（**11 を generated として Git 同梱**、実素材 7 は `pending`＝OQ-16）。`make gen-fixtures` で再生成 |
 | ライセンス | `licenses/inventory.json`（Homebrew 版の実測 license・未リンクを区別。`make check-licenses` で検査） |
 | CI | `.github/workflows/ci.yml`（build / unit / integration / licenses / fixtures + nightly の probe 収集） |
@@ -87,6 +88,7 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 make check          # build + test + license 検査 + fixture 検査
 make gen-fixtures   # 合成 fixture 生成（既存ファイルはスキップ）
 make probe          # 全素材の open→全復号を計測し bench/captures/probe-*.json に記録
+make probe-play     # 全素材を EngineCore 経由で実時間再生し bench/captures/play-*.json に記録
 ```
 
 注: `Package.swift` のプラットフォーム下限は macOS 15（CI 互換のための暫定値）。製品の下限は OQ-12 で未決のまま。

@@ -52,7 +52,7 @@
 1. #2: アプリシェル、比率維持のビデオ表示、Open File、再生操作、音量、全画面、設定 UI（状態はプレースホルダ）
 2. #4: ~~FFmpeg による demux~~ → **AVFoundation demux（ES パススルー）/ VideoToolbox ハードウェアデコード**（EXP-001 で FFmpeg なしで成立と決定済み。ソフトウェアフォールバックは OQ-20 ゲート）、CVPixelBuffer への正規化、タイムスタンプ・フレーム長・色メタデータ・DAR の保持、AVFoundation / CoreAudio クロック、seek / pause / トラック選択
 
-**進捗（2026-11-16）**: #4 の映像経路（demux・復号・format 解決・probe 計測）は実装・測定完了。音声復号とクロック、`EngineCore` との実接続、#2 の UI は未着手（音声は OQ-19 を先に実験）。G1 の判定は接続完了後。
+**進捗（2026-11-16）**: #4 の映像経路（demux・復号・format 解決・probe 計測）＋ **EngineCore との実接続（#11 前半・映像再生線）が完了・実測済み**（11 素材すべて最後まで完走、NTSC/PAL/24p の提示間隔が目標に一致、realTimeFactor ≥0.997。`make probe-play` で再現）。残りは音声実装（#10 の AudioSink/clock）、seek（#13）、warmup（#12）、#2 の UI。G1 の判定は音声接続後（映像側資料は 04 §9 に樹立）。
 
 ゲート G1（このフェーズ末で判定）: **AI なしの素の再生パスで、目標マシン（M5 Max 64GB）にて 29.97 / 25 fps が破綻せず、ステージ別の測定値から後段（Metal・Core ML）に使える残り予算が確定する。**
 
@@ -142,7 +142,7 @@ graph LR
 
 | 段階 | 仮予算 | 測定するまで不明な点 |
 |---|---|---|
-| Demux + HW decode | ≤ 5.5 ms → **VideoToolbox 単体は実測で预算内**（decode p50 0.4〜1.7 ms、スループット 176〜1555 fps。[EXP-001](experiments/EXP-001-dependency-and-videotoolbox.md) §4）。open 1.4〜28.5 ms と**初帧 44〜70 ms の warmup**（OQ-18）が別枠 | in-loop（再生線接続後）の実測は未了 |
+| Demux + HW decode | ≤ 5.5 ms → **VideoToolbox 単体は実測で预算内**（decode p50 0.4〜1.7 ms、スループット 176〜1555 fps。[EXP-001](experiments/EXP-001-dependency-and-videotoolbox.md) §4）。open 1.4〜28.5 ms と**初帧 44〜70 ms の warmup**（OQ-18）が別枠 | **in-loop 実測済み**（`make probe-play`。再生線 decode 段 p50: MPEG-2 2.6 ms / H.264 progressive 1.6〜1.9 / **H.264 interlaced 5.7**。数値と late の归属は 04 §9） |
 | Deinterlace + 色変換 | ≤ 3 ms | 選択方式の GPU コスト |
 | Core ML 推論（2x） | ≤ 18 ms | ANE と GPU の差、テンソル変換の実コスト |
 | Post / ノイズ除去 | ≤ 2 ms | 各段を直列にした場合の合成コスト |
@@ -204,7 +204,8 @@ Phase 1〜5 がゲートを通過した時点で、MVP としての判断材料�
 | 9 | 映像 demux + VideoToolbox 復号（#4 の映像本体） | **完了**（AVFoundation ES パススルー + VT 直行。全 10 fixture 通過、提示順の順序保証を統合テストで固定） |
 | 10 | MPEG-2 bitstream 解析（frame rate / field 順序の一次情報） | **完了**（ffprobe と byte-for-byte 突合。PCE 解析。回帰テスト 14 本） |
 | 11 | 合成 fixture 生成・登録・検査（gen-fixtures / check-fixtures） | **完了**（10 本 Git 同梱。実素材は OQ-16） |
-| 12 | probe 計測基盤（`make probe` + nightly 収集） | **完了**（映像 + 音声復号実験＝[EXP-002](experiments/EXP-002-audio-pcm-path.md)。clock・in-line は未計測 → OQ-19 残り / OQ-18） |
+| 12 | probe 計測基盤（`make probe` / `make probe-play` + nightly 収集） | **完了**（映像 + 音声復号実験＝[EXP-002](experiments/EXP-002-audio-pcm-path.md) + 再生線の実時間計測。clock・音声 in-loop は未計測 → OQ-19 残り / OQ-18） |
+| 13 | EngineCore ↔ demux/decode の実接続（#11 前半・映像再生線） | **完了**（PlaybackSession + FileMediaSource。11 素材完走・realTimeFactor ≥0.997・提示間隔は目標に一致（04 §9）。統合テスト 4 本）。seek（#13）・音声線（#10）・warmup（#12）は別作業 |
 
 ## 10. 関連
 

@@ -49,6 +49,18 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **提示順序の責任**（04 §3 に反映済み）: 同期 `VTDecompressionSession` の出力は decode 順。decoder が 1 サンプル分保持して PTS 順に組み替え、提示可能分だけ返す。統合テストで固定。
 - **色キャリア**: 復号 pix_fmt は `420v`（BT.601・映像 range）でメタデータと一致。ただし `Guesses` フラグが立つ component range があるため、声明値の優先読みは component range 側（01 §2 に反映済み）。
 
+### 2026-11-16 — 再生線前半（#11）の実装決定（映像のみ。実測は 04 §9 の表に記録）
+
+- **仮クロック（映像のみ）**: 提示時刻 = 初回提示の wall 基点 + メディア PTS 差分。音声 master clock（04 §5）確立までの暫定だが、Phase 2 の Metal 提示（#5）は**同じフックに PresentSchedule を差し込む**形へ進める。TimeSource 注入で決定的テスト（DeterministicTimeSource）を先に固定した。
+- **遅延フレームはドロップせず提示し `late++`**（02 §1 の「連続性最優先」の徹底）。`presented` は増え、`realTimeFactor` は維持される。late は測定パラメータ（既定 2 ms 閾値）の産物である点を 04 §9 に明記。
+- **待ちは締切合わせ**: `run()` のスリープは固定 1 ms ポーリングから「キュー先頭 PTS の締切から逆算」に変えた（MPEG-2 系の late 5→0 を実測）。固定ポーリングは late を量子の産物で膨らませるため測定として不適。
+- **pause/resume はクロック基点の再アンカー**（停止区間が後方遅延に積算されない）。testPauseResumes で固定。
+- **比率未声明素材（H.264 mp4 等）は load が `chooseAspect` を要求**——resolver が推測で 4:3 に倒さない設計（01 §2）どおりの動作と確認。headless 計測（probe-play）だけ「明示 4:3 を選んだユーザー」の代理を JSON に記録して通す。UI（#2）の実装まで既定値は作らない。
+- **H.264 系の late（22/29）の帰属を確定**: 復号スループット不足ではない（realTimeFactor 0.9998・全帧提示）。同一呼吸内で同期復号（interlaced H.264 p50 5.7 ms）を済らせてから提示判定する構造の阻塞。**構造的修復は #5（復号と提示時刻の分離）**。当面は数値を残して受け取る。
+- **実測された原価**: 復号 p50 — MPEG-2 2.6 ms、H.264 progressive 1.6〜1.9 ms、**H.264 interlaced 5.7 ms（progressive の約 3 倍）**。04 §1 の videoDecode 予算 3 ms は MPEG-2 では満たす interlaced H.264 では超過。Phase 2 の 05 §1 見直し資料。
+- **素材の穴は素材のまま測る**: 切り詰め素材には提示順序上の PTS 穴（100 ms 級）が実在（ffprobe で確認）。テストは「提示間隔=pts 間隔 ±2 ms」で検査し、固定値（33.37 ms 期待）では検査しない。
+- 新ツール: `make probe-play`（EngineCore 経由の実測。nightly CI が `probe-*.json` と `play-*.json` を収集）。
+
 ### 2026-11-16 — EXP-002 にもとづく決定（根拠: [docs/experiments/EXP-002](../experiments/EXP-002-audio-pcm-path.md)）
 
 - **OQ-19（復号経路部分）**: **AC-3 → PCM は AVFoundation の linear PCM 出力で復号する**（A1。実時間率 ≈1100×、要求仕様どおりの 48 kHz/int16/packed 出力）。FFmpeg shim・AudioToolbox 自前管理は音声には使わない。依存ゼロ方針は音声にも及ぶ。

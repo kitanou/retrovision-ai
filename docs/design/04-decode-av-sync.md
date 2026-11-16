@@ -181,4 +181,23 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 | A/V drift | 0.1 s 間隔で drift を記録、p50/p95/max を集計 | 08 §4 |
 | 音声の underrun | schedule 済み buffer の残数 | 08 §3 |
 
-**確立済みの計測ツール（Phase 1）**: `make probe`（`rvprobe --json`）が fixture ごとに開く→全サンプル復号し、`probe-*.json` を残す（decode 時間分布、PTS ゲイン p50/p90/p99/max、フレームレート解決の根拠、decode 順と提示順、bitstream / PCE の声明値、PAR）。EXP-001 の再現手順がそのまま手順化されている。留意点として **初回フレームのスパイク（44〜70 ms）**が毎セッション観測されるため、常時再生の数値を取るには warmup が必要（OQ 追記参照・未着手）。音声側（`StageID.audioDecode`・underrun・drift）は未実測。
+**確立済みの計測ツール（Phase 1）**:
+1. `make probe`（`rvprobe --json`）: fixture ごとに open→全サンプル復号。`probe-*.json`（decode 時間分布、PTS ゲイン、フレームレート解決の根拠、decode 順と提示順、bitstream / PCE 声明、PAR、音声実験）。
+2. `make probe-play`（`rvprobe --json --play`）: **EngineCore を通した実時間再生**。`play-*.json` に提示間隔・late・起動遅延・realTimeFactor・decode stage 分布を残す（#11 の G1 前半資料。nightly CI が両方収集）。
+
+**in-loop 実測（2026-11-16、映像のみ・11 素材）**:
+
+| 素材 | 提示 | late | realTimeFactor | 提示間隔 p50 | 備考 |
+|---|---|---|---|---|---|
+| ntsc480i-22-01.mpg | 180/180 | 0 | 0.9998 | 33.36 ms | 目標 33.37 ms に一致。初帧 61 ms（OQ-18） |
+| pal576i-22-01.mpg | 150/150 | 0 | 0.9998 | 40.00 ms | 25 fps 一致 |
+| film24p-01.mpg | 144/144 | 0 | 0.9997 | 41.66 ms | 24 fps 一致 |
+| ntsc480i-h264-01.mp4 | 180/180 | **22** | 0.9998 | 33.36 ms | **H.264 interlaced の復号 p50 5.7 ms が同期復号の待ち時間で閾値 2 ms を超える**（後述） |
+| progressive-sd-mp4-01.mp4 | 180/180 | **29** | 0.9998 | 33.34 ms | 同上の構造（復号自体は p50 1.6〜1.9 ms。間隔の 67 ms はスタールの巻き取り残跡。両素材の pts に穴は無いことを ffprobe で確認済み） |
+| 他 6 素材 | 全提示 | 0 | ≥0.997 | 目標一致 | truncated 系は切り詰め境界に実際の PTS 穴（100 ms 級）があり、そのまま提示間隔に出る（素材側の事実。決定的テストでは「間隔=pts 間隔±2 ms」で検査） |
+
+- **late の含义**: 当経路は「遅れても提示し late に数える」設計（02 §1・04 §3）。realTimeFactor ≈1 なので**スループット不足ではない**。H.264 の late は、`topUpDecode` が同一呼吸内で同期復号（1 件 2〜7 ms）を済らせてから `presentDue` を呼ぶ構造の取り分（復号が提示パスを阻塞する）。**修复は Phase 2 の #5（Metal 提示と PresentSchedule で復号と提示時刻を分離）**。数値だけ見ると誤誘導なので、表ごと残す。
+- **復号原価の素材差（映像段の実測）**：MPEG-2 p50 2.6 ms / H.264 progressive p50 1.6〜1.9 ms / **H.264 interlaced p50 5.7〜5.8 ms（field-pair 復号で progressive の約 3 倍）**。フレーム予算（04 §1 の videoDecode 3 ms）は MPEG-2 で満たすが H.264 interlaced を DVD 相当で扱う場合は超過。→ 設計反映は 05 §1 と Phase 2 で（regen 素材に interlaced H.264 の比率を持たせない判断もありうる）。
+- 比率の宣言が無い素材（H.264 mp4 等）は `load` が `needsUserAction(.chooseAspect)` を返す（01 §2 の resolver は設計どおり、推測で 4:3 に倒さない）。`probe-play` は headless のため明示 4:3 を適用した事実を `aspectPolicyApplied` に記録する。
+- 音声側（`StageID.audioDecode`・underrun・drift）は**未実測**（再生線が映像のみ。#10 の残り）。
+- 留意点として **初回フレームのスパイク（44〜70 ms）**が毎セッション観測される（warmup 設計は OQ-18 / issue #12）。
