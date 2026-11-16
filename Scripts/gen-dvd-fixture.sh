@@ -35,17 +35,12 @@ open(os.path.join(outdir, "VTS_01_2.VOB"), "wb").write(data[idx:])
 print(f"VTS_01 分割: {idx} / {len(data)} バイト")
 PY
 
-# タイトル 2 は単一パート（小さい切り出し。列挙の検査用で、再生 e2e はタイトル 1 を使う）。
-python3 - "$SRC" "$OUT/dvd-video-ts-01/VIDEO_TS" <<'PY'
-import sys, os
-src, outdir = sys.argv[1], sys.argv[2]
-data = open(src, "rb").read()
-head, idx = data[:200000], len(data)
-tail_idx = data.rfind(b"\x00\x00\x01\xba")  # 終端パケットへ切りを寄せる
-assert 0 < tail_idx < idx
-open(os.path.join(outdir, "VTS_02_1.VOB"), "wb").write(data[:tail_idx])
-print(f"VTS_02 切り出し: {tail_idx} バイト")
-PY
+# タイトル 2 は別素材（truncated-01 の複製。単一 MPEG の機械スライスだと本数が
+# タイトル 1 に近く、タイトル切り替えの e2e が数値で区別できなかった — 実測で別素材に
+# 変更: タイトル 1 = 180 / タイトル 2 = 120（engine 経由。raw probe total=122 / 有効 120）。
+# 列挙・切り替えの実測対象）。
+cp "$OUT/truncated-01.mpg" "$OUT/dvd-video-ts-01/VIDEO_TS/VTS_02_1.VOB"
+echo "VTS_02 = truncated-01.mpg の複製（4.04 s）"
 
 # 合成 ISO（#3 のテスト対象は「マウントして VIDEO_TS が見えること」。実 DVD と同じ ISO9660）。
 # 実測: `-quiet` を付けると失敗理由を出力せず exit 1 になる（2026-11-16）。素の出力で通す。

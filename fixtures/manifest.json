@@ -360,7 +360,7 @@
         "regenerate": "sh Scripts/gen-dvd-fixture.sh（母材料の .mpg は Git に載せる。ISO と違い VOB の再生成は決定的: pack 境界の byte-slice）"
       },
       "expectations": {
-        "layout": "VIDEO_TS/ に VIDEO_TS.IFO/BUP + VTS_01_1.VOB + VTS_01_2.VOB（多重 VOB チェーン）+ VTS_02_1.VOB",
+        "layout": "VIDEO_TS/ に VIDEO_TS.IFO/BUP + VTS_01_1.VOB + VTS_01_2.VOB（多重 VOB チェーン）+ VTS_02_1.VOB（truncated-01 の複製=別素材 4.04 s。タイトル 1=180/タイトル 2=120 の実測で タイトル切り替え e2e を数値判別できるようにした・2026-11-17）",
         "derivedFrom": "ntsc480i-ac3-generated。VTS_01_1+VTS_01_2 の連結は母素材とバイト一致（sha256 は母素材のものを記録: derived fixture の約束）",
         "codedSize": "720x480",
         "frameRate": "30000/1001",
