@@ -1,5 +1,6 @@
 import Foundation
 import RVDiagnostics
+import RVDecode
 import RVEnhancement
 import RVMediaCore
 import RVMediaSources
@@ -26,6 +27,7 @@ public actor EngineCore {
     }
 
     private var phase: EnginePhase = .empty
+    private let deps: Deps
     private var structure: MediaStructure?
     private var settings = PlayerSettings()
     private var selection: PlaybackSelection?
@@ -40,7 +42,17 @@ public actor EngineCore {
     private var continuation: AsyncStream<PlayerEvent>.Continuation?
     private var stream: AsyncStream<PlayerEvent>?
 
+    // 再生線（#11）。pipeline は「その source を実際に走らせるための配線」で、
+    // ファイル source 以外は Phase 2 で同じスロットに収める（FileMediaSource の注記参照）。
+    private var pipeline: (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription)?
+    private var session: PlaybackSession?
+    private var sessionTask: Task<Void, Never>?
+    private var lastOutcome: PlaybackOutcome?
+    private var position: MediaTime = .zero
+    private var lastPositionEmitSeconds: Double?
+
     public init(deps: Deps = Deps()) {
+        self.deps = deps
         let (s, c) = AsyncStream.makeStream(of: PlayerEvent.self, bufferingPolicy: .bufferingNewest(256))
         self.stream = s
         self.continuation = c
@@ -56,10 +68,11 @@ public actor EngineCore {
 
     public func snapshot() -> PlayerStateSnapshot {
         var quality = QualityPresentation(requestedTier: settings.enhancement.tier,
-                                         activeTier: controller.state.activeTier)
+                                         activeTier: controller.state.activeTier,
+                                         frameStats: lastOutcome?.stats ?? FrameStats())
         quality.appliedStages = activePlan?.stages.map(\.stage) ?? []
         return PlayerStateSnapshot(phase: phase,
-                                   position: .zero,
+                                   position: position,
                                    duration: structure?.items.first?.duration,
                                    selected: selection,
                                    available: structure?.items.first?.trackTable ?? [],
@@ -78,6 +91,7 @@ public actor EngineCore {
             let opened = try await source.open()
             self.openedSource = opened
             self.structure = opened.structure
+            await wirePipeline(for: source, structure: opened.structure)
             continuation?.yield(.structureChanged(opened.structure))
             continuation?.yield(.tracksChanged(opened.structure.items.first?.trackTable ?? []))
             try rebuildPlan()
@@ -96,6 +110,12 @@ public actor EngineCore {
     }
 
     public func close() async {
+        sessionTask?.cancel()
+        sessionTask = nil
+        session = nil
+        pipeline = nil
+        lastOutcome = nil
+        position = .zero
         openedSource = nil
         structure = nil
         activePlan = nil
@@ -103,16 +123,37 @@ public actor EngineCore {
         transition(to: .empty)
     }
 
+    /// 直前（または最中）の再生の測定結果。probe と診断 UI 向け（#11 の G1 資料）。
+    public func playbackOutcome() -> PlaybackOutcome? { lastOutcome }
+
     // MARK: 運送
 
     public func play() async {
         guard phase == .ready || phase == .paused || phase == .stalled(reason: .mediaSlow) else { return }
         promotePendingPlan()
         transition(to: .playing)
+        // 再生線がある場合は実際にフレームを回す。ない場合（DVD 等・Phase 2）は状態機械のみ。
+        if let session {
+            await session.resume()
+            return
+        }
+        if let pipeline, activePlan ?? pendingPlan != nil {
+            let session = PlaybackSession(
+                demuxer: pipeline.demuxer,
+                decoder: VideoToolboxDecoder(),
+                config: PlaybackSession.Config(videoTrack: pipeline.track, videoFormat: pipeline.format),
+                time: deps.time,
+                report: { [weak self] event in
+                    Task { await self?.handleSessionEvent(event) }
+                })
+            self.session = session
+            sessionTask = Task { await session.run() }
+        }
     }
 
     public func pause() async {
         guard phase == .playing else { return }
+        if let session { await session.pause() }
         transition(to: .paused)
     }
 
@@ -120,7 +161,14 @@ public actor EngineCore {
         guard phase == .playing || phase == .paused else { return }
         preSeekPhase = phase
         transition(to: .seeking(target: time))
-        // 実際のシーク手順（音声 0.2 s 前から・映像は keyframe から）は RVDecode の実装と共に入れる（04 §6）。
+        // 実際のシーク手順（音声 0.2 s 前から・映像は keyframe から）は #13 で実装する。
+        // 再生線がある場合、一時停止して配線を作り直す（#13 まで这是ら暫定）。
+        if let session {
+            await session.pause()
+            self.session = nil
+            sessionTask?.cancel()
+            sessionTask = nil
+        }
         transition(to: preSeekPhase ?? .paused)
     }
 
@@ -188,6 +236,33 @@ public actor EngineCore {
     }
 
     // MARK: 内部
+
+    /// source から再生線の配線を作る。判明しているのはファイル source のみ（Phase 2 で DVD に拡張）。
+    private func wirePipeline(for source: any MediaSource, structure: MediaStructure) async {
+        pipeline = nil
+        guard let fileSource = source as? FileMediaSource,
+              let item = structure.items.first,
+              let videoFormat = item.videoFormat,
+              let track = item.trackTable.first(where: { $0.kind == .video }) else { return }
+        pipeline = (await fileSource.makeDemuxer(), track.id, videoFormat)
+    }
+
+    private func handleSessionEvent(_ event: PlaybackSession.Event) {
+        switch event {
+        case .position(let pts):
+            position = pts
+            // イベント洪水を防ぐ（UI 向け 0.25 s 間隔。診断は outcome を見る）。
+            if lastPositionEmitSeconds == nil || pts.seconds - (lastPositionEmitSeconds ?? -1) >= 0.25 {
+                lastPositionEmitSeconds = pts.seconds
+                continuation?.yield(.positionUpdated(position: pts, duration: structure?.items.first?.duration,
+                                                     clockDriftMS: 0))
+            }
+        case .finished(let outcome):
+            lastOutcome = outcome
+            continuation?.yield(.statisticsUpdated(DiagnosticsSummary(frames: outcome.stats)))
+            if phase == .playing { transition(to: .ended) }
+        }
+    }
 
     private func transition(to next: EnginePhase) {
         phase = next

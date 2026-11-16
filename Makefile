@@ -1,7 +1,7 @@
 # 開発の入口（09 §7 の CI と同じ手順をローカルで実行できるようにする）
 PKG := Packages/RetroVisionKit
 
-.PHONY: all build release test check licenses fixtures gen-fixtures probe clean
+.PHONY: all build release test check licenses fixtures gen-fixtures probe probe-play clean
 
 all: check
 
@@ -37,6 +37,17 @@ probe:
 	   ./"$(PKG)/.build/debug/rvprobe" --json "$$f" 2>"bench/captures/probe-$$b.json" >/dev/null || echo "probe failed: $$b"; \
 	 done
 	 @echo "probe: bench/captures/probe-*.json（見る: python3 Scripts/show-probe.py bench/captures/probe-*.json）"
+
+# 再生線の実時間計測（#11・G1 前半資料）。EngineCore を通した最初→最後の提示を測る。
+# 素材長ぶん実時間で走る（11 素材で約 1.5 分）。結果は bench/captures/play-*.json。
+probe-play:
+	 cd $(PKG) && swift build -c debug --product rvprobe
+	 @codesign --force --sign - $(PKG)/.build/debug/rvprobe
+	 @mkdir -p bench/captures && for f in fixtures/generated/*; do \
+	   b=$$(basename "$$f"); \
+	   ./"$(PKG)/.build/debug/rvprobe" --json --play "$$f" 2>"bench/captures/play-$$b.json" >/dev/null || echo "play failed: $$b"; \
+	 done
+	 @echo "probe-play: bench/captures/play-*.json（見る: python3 Scripts/show-probe.py bench/captures/play-*.json）"
 
 check: build test licenses fixtures
 	 @echo "OK"

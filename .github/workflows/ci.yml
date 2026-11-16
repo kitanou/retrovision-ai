@@ -56,9 +56,13 @@ jobs:
         working-directory: Packages/RetroVisionKit
         run: swift test --parallel
       - name: Probe measurements over generated fixtures
-        run: make probe
+        run: |
+          make probe
+          make probe-play
       - uses: actions/upload-artifact@v4
         with:
           name: probe-measurements
-          path: bench/captures/probe-*.json
+          path: |
+            bench/captures/probe-*.json
+            bench/captures/play-*.json
       # bench-full / quality / model-convert は Phase 1 以降にジョブを追加する（09 §7）。

@@ -4,19 +4,23 @@ import CoreVideo
 import Foundation
 import RVMediaCore
 import RVDecode
+import RVPlaybackEngine
 
 // 能力測定・実験の記録用（docs/experiments/）。再生経路には載せない。
 //
 // 使い方:
 //   swift run rvprobe --json fixtures/generated/ntsc480i-22-01.mpg ...
+//   swift run rvprobe --json --play fixtures/generated/ntsc480i-22-01.mpg ...
 //
 // 出力は 1 素材について以下を順に読む:
 //   1. AVFoundation が開けるか（開けない場合は理由）→ OQ-01/OQ-02 の判定材料
 //   2. demux が何を渡すか（format description の attachment キー・verbatim ヘッダの有無）→ OQ-08
 //   3. VideoToolbox で復号できるか、何が出力に復元されるか（field・色・比）→ OQ-08
 //   4. 処理スループット（1 帧あたりの wall time）→ 開発計画 §5 の予算検証
+//   --play は EngineCore を通した実時間再生を測る（#11 の G1 前半資料: 提示間隔・late・起動遅延）
 struct Options {
     var json = false
+    var play = false
     var paths: [URL] = []
     var limit = 0
 
@@ -25,6 +29,7 @@ struct Options {
         for argument in arguments {
             switch argument {
             case "--json": options.json = true
+            case "--play": options.play = true
             case "--limit": options.limit = -2            // 次を取り出す
             default:
                 if options.limit == -2 { options.limit = Int(argument) ?? 0; continue }
@@ -38,14 +43,18 @@ struct Options {
 
 let options = Options.parse(Array(CommandLine.arguments.dropFirst()))
 guard !options.paths.isEmpty else {
-    FileHandle.standardError.write("usage: rvprobe [--json] [--limit N] <media>...\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: rvprobe [--json] [--play] [--limit N] <media>...\n".data(using: .utf8)!)
     exit(64)
 }
 
 var report = ProbeReport()
 for path in options.paths {
     print("=== \(path.lastPathComponent) ===")
-    await report.probe(url: path, frameLimit: options.limit)
+    if options.play {
+        await report.playEntry(url: path)
+    } else {
+        await report.probe(url: path, frameLimit: options.limit)
+    }
 }
 if options.json {
     let text = try String(data: JSONSerialization.data(withJSONObject: report.jsonValue,
@@ -432,6 +441,80 @@ final class ProbeReport: @unchecked Sendable {
 
     private func attachmentKeys(of buffer: CVPixelBuffer) -> [String] {
         AttachmentValues(CVBufferCopyAttachments(buffer, .shouldPropagate)).keys
+    }
+
+    /// EngineCore を通した実時間再生の測定（#11 の G1 前半資料）。
+    /// 提示間隔・late・起動遅延・スループットを JSON に残す。
+    func playEntry(url: URL) async {
+        var entry: [String: Any] = ["file": url.lastPathComponent, "mode": "playback"]
+        let engine = EngineCore()
+        let events = await engine.events()
+        // 比率の宣言がない素材（H.264 mp4 等）は設計どおり load が user action を要求する
+        // （chooseAspect。推測で 4:3 に倒さない）。headless の実測には「明示指定したユーザー」の
+        // 代理として 4:3 を適用し、その事実を JSON に残す。
+        do {
+            let scout = AVFoundationDemuxer(url: url)
+            let stream = try await scout.probe()
+            if let video = stream.tracks.first(where: { $0.kind == .video }),
+               case .video(let format) = video.format {
+                let resolution = AspectResolver.resolve(codedSize: format.codedSize,
+                                                       signals: format.aspectSignals,
+                                                       policy: .followSource)
+                if resolution.source == .unresolved {
+                    var settings = PlayerSettings()
+                    settings.aspectPolicy = .explicit(.dar4x3)
+                    await engine.apply(settings)
+                    entry["aspectPolicyApplied"] = "explicit 4:3（素材に比率宣言なし。chooseAspect の headless 代理）"
+                }
+            }
+        } catch {}
+        do {
+            try await engine.load(FileMediaSource(url: url), selection: PlaybackSelection(item: ItemID(1)))
+        } catch {
+            entry["playStatus"] = "load-failed"
+            entry["loadError"] = String(describing: error)
+            entries.append(entry)
+            print(entry)
+            return
+        }
+        // 目標値（フレームレート）は demux と同じ規則で読む（比較対象のための静的値）。
+        if let stream = try? await AVFoundationDemuxer(url: url).probe(),
+           let video = stream.tracks.first(where: { $0.kind == .video }),
+           case .video(let format) = video.format, let rate = format.frameRate {
+            entry["targetFrameRate"] = String(describing: rate)
+            entry["targetFrameIntervalMS"] = 1_000 / rate.framesPerSecond
+        }
+        let began = Date()
+        await engine.play()
+        var endState: String?
+        let deadline = began.addingTimeInterval(300)   // 10 秒素材に対する安全側上限
+        for await event in events {
+            if case .phaseChanged(let phase) = event {
+                switch phase {
+                case .ended: endState = "ended"
+                case .failed(let error): endState = "failed: \(error.userMessage)"
+                default: break
+                }
+            }
+            if endState != nil || Date() > deadline { break }
+        }
+        entry["playStatus"] = endState ?? "timeout"
+        entry["wallMS"] = Date().timeIntervalSince(began) * 1_000
+        if let outcome = await engine.playbackOutcome() {
+            let stats = outcome.stats
+            entry["presented"] = stats.presented
+            entry["late"] = stats.late
+            entry["demuxedSampleCount"] = outcome.demuxedSampleCount
+            entry["firstPresentDelayMS"] = outcome.firstPresentDelayMS
+            entry["totalWallMS"] = outcome.totalWallMS
+            entry["mediaDurationMS"] = outcome.mediaDurationMS
+            entry["realTimeFactor"] = outcome.totalWallMS > 0 ? outcome.mediaDurationMS / outcome.totalWallMS : 0
+            entry["presentIntervalMS"] = statistics(outcome.presentIntervalMS)
+            entry["decodeStageMS"] = statistics(outcome.decodeStageMS)
+            if !outcome.errors.isEmpty { entry["errors"] = outcome.errors }
+        }
+        entries.append(entry)
+        print(entry)
     }
 
     private func statistics(_ values: [Double]) -> [String: Any] {

@@ -11,6 +11,9 @@ KEYS = (
     "decodeStatus", "decodeError", "decodePath", "decodedFrameCount",
     "decodeTotalMS", "decodePerFrameMS", "decodeThroughputFPS",
     "decodedPixelFormat", "decodedDimensions", "decodedAttachments", "decodedFormat",
+    "mode", "playStatus", "loadError", "targetFrameRate", "targetFrameIntervalMS",
+    "presented", "late", "firstPresentDelayMS", "totalWallMS", "mediaDurationMS",
+    "realTimeFactor", "presentIntervalMS", "decodeStageMS", "errors",
 )
 
 def main() -> None:
@@ -30,10 +33,11 @@ def main() -> None:
                     print(f"{k}: {json.dumps(v, ensure_ascii=False, sort_keys=True)[:1200]}")
                 else:
                     print(f"{k}: {v}")
-            fr = e.get("decodedFieldRetention") or []
-            print(f"fieldRetention: n={len(fr)} first={json.dumps(fr[0], sort_keys=True) if fr else None}")
-            if len(fr) > 1:
-                print(f"                last={json.dumps(fr[-1], sort_keys=True)}")
+            if "decodedFieldRetention" in e:
+                fr = e["decodedFieldRetention"] or []
+                print(f"fieldRetention: n={len(fr)} first={json.dumps(fr[0], sort_keys=True) if fr else None}")
+                if len(fr) > 1:
+                    print(f"                last={json.dumps(fr[-1], sort_keys=True)}")
             for audio in e.get("audioExperiment") or []:
                 if "error" in audio:
                     print(f"audioExperiment: {json.dumps(audio, ensure_ascii=False)}")

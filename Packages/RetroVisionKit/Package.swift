@@ -63,7 +63,7 @@ let package = Package(
         // 能力測定・実験の記録用実行体（docs/experiments/）。再生経路には載せない。
         .executableTarget(
             name: "RVDecodeProbe",
-            dependencies: ["RVMediaCore", "RVMediaSources", "RVDecode"]
+            dependencies: ["RVMediaCore", "RVMediaSources", "RVDecode", "RVPlaybackEngine"]
         ),
 
         // 境界の機械検査（00 §2 の禁止 import）。
@@ -80,6 +80,7 @@ let package = Package(
             name: "RVDecodeTests",
             dependencies: ["RVDecode", "RVMediaCore", "RVMediaSources"]
         ),
-        .testTarget(name: "RVPlaybackEngineTests", dependencies: ["RVPlaybackEngine"]),
+        .testTarget(name: "RVPlaybackEngineTests",
+                    dependencies: ["RVPlaybackEngine", "RVDecode", "RVMediaCore", "RVMediaSources"]),
     ]
 )
