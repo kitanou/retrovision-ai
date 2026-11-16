@@ -197,7 +197,7 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 
 **確立済みの計測ツール（Phase 1）**:
 1. `make probe`（`rvprobe --json`）: fixture ごとに open→全サンプル復号。`probe-*.json`（decode 時間分布、PTS ゲイン、フレームレート解決の根拠、decode 順と提示順、bitstream / PCE 声明、PAR、音声実験）。
-2. `make probe-play`（`rvprobe --json --play`）: **EngineCore を通した実時間再生**。`play-*.json` に提示間隔・late・起動遅延・realTimeFactor・decode stage 分布を残す（#11 の G1 前半資料。nightly CI が両方収集）。
+2. `make probe-play`（`rvprobe --json --play`）: **EngineCore を通した実時間再生**。`play-*.json` に提示間隔・late・起動遅延（`loadMS`/`playToFirstPresentMS`）・warmup（`warmupMS`/`warmupStageMS`）・realTimeFactor・decode stage 分布を残す（#11/#10/#12 の G1 資料。nightly CI が両方収集）。
 
 **in-loop 実測（2026-11-16、映像のみ・11 素材）**:
 
@@ -226,4 +226,17 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 - 単体契約（`AudioPathTests`）: AC-3→PCM の全 quantum ≤480 帧（max=480 で分割の証拠）/ 帧数と PTS 進みの一致 / 実仕様の初 chunk 確定。AudioClock の frame↔PTS↔host 対応と補間の非累積。DTS がトラックとして現れないこと（A6 の回帰）。e2e（`AudioPlaybackTests`）: 構造的検査（完走・全 180 帧提示・drift 采样の存在・underrun < 5）は常に実行。**drift の数値検査（p95 < 40 ms）は実時間ペーシングを持つ装置のときだけ**実行する（次の項のゲート）。device 無し環境は `audioStatus=failed:…` への縮退を検査（映像線は壊れない）。
 - **CI ランナーの音声装置は「実時間ペーシングを持たない仮想装置」で走ることがある（2026-11-16 の CI 実測で判明・同一コードで drift p95 40.25→91.67 ms と揺れた）**: エンジンは start するが rendered frame 位置が実時間より約 1.09〜1.5 倍速で無料実行する。audio master clock の前提「音声の時間軸 ≈ 実時間」は装置の実時間ペーシング依存なので、CI の drift・提示間隔は設計分布ではなく装置の産物になる（CI: drift p95 +91.7 ms・提示間隔 p50 30.4 ms——clock に忠実に追随した結果。実機の +10.6 ms とは別物）。**判定の作り方（環境の自己申告にしない）**: e2e は独立の AVAudioEngine で 1 s 窓×3 の rendered 進みを測り、**定常窓の実時間比 0.98〜1.03 の装置だけ**数値検査を走る（実機の実測: 起動直後の窓は 0.252 = 装置の起動ユルミ、定常窓 1.00〜1.013。CI 仮想装置は ≥1.09 で除外。ゲートの事実は print して残す）。CI の `play-*.json` 音声欄は「線が動く・破綻しない」の回帰資料として読む。
 - 留意: sink の start 失敗・drain 不発に対する安全弁（`audioDrainTimeoutMS` 既定 2 s で打ち切り、errors に記録）。
-- 留意点として **初回フレームのスパイク（44〜70 ms）**が毎セッション観測される（warmup 設計は OQ-18 / issue #12）。
+
+**起動 warmup の実測（2026-11-16、#12・OQ-18 完了。`make probe-play` の `loadMS/playToFirstPresentMS/warmupMS/warmupStageMS`）**
+
+| 項目 | 実測（合成 11 素材・M5 Max） | 設計値 |
+|---|---|---|
+| 初回复号スパイク（再生線・warmup 段の 1 本目） | 50.5〜68.9 ms（warmupStageMS[0]。warmup 後の 2 本目以降は 0.7〜2.1 ms） | — |
+| play→初帧提示（warmup あり） | **1.1〜3.6 ms**（映像のみ）/ 16.5 ms（AC-3: sink start + clock 初回 anchor の経路。startup UX 実装時に詰める） | **≤ 50 ms**（実測 p95 17 ms に対し安全側） |
+| play→初帧提示（warmup なし・対照実測） | 59.4〜69.0 ms | — |
+| load（open + warmup 込み）→初帧提示 | 60.4〜187.9 ms（max は AC-3。warmup は load 側に 57〜106 ms を移すだけで、open→初帧の合計は変えない） | **≤ 300 ms** |
+
+- **設計（実装済み）**: `EngineCore.load` の .preparing 中に `PlaybackSession.prepare()` を呼び、先頭 3 帧（`warmupFrames`、既定 3）を復号して**保持**（初帧提示にそのまま使う。`reset()` は VT session を invalid 化するので使わない）。音声 prefill（120 ms）は prepare、`sink.start()` は play 初回 tick。`producing` 闸门で prepare/run の二重供給を防ぐ。warmup 失敗は open を失敗させない（縮退経路で再生側に表面化）。
+- **統計の除外規則（実装・テスト固定）**: warmup 段の復号は `warmupStageMS` に分離し常時統計に入れない。非再生 probe の decode-all は**最初のフレーム返す復号**を `firstDecodeMS` に分離して `decodePerFrameMS` から除く（1 帧目の nil 応答＝decoder の遅延を初回复号扱いしない）。上の表の「初回复号スパイク」は warmup 段の値で、これは **no-warmup の再生線でも同一**（対照実測の decodeStage max と一致）。
+- **数値の再解釈（重要）**: EXP-001 が記録した「初帧 44〜70 ms」は**旧コードの decode-all 経路の max**。現在のコードの decode-all は max 1.45 ms（`firstDecodeMS` 1.3 ms・スパイク無しで再現）で、**スパイクは再生線（AVFoundationDemuxer reader + 同一 session 継続）にのみ現れる**（no-warmup 再生で全 11 素材 52〜65 ms）。§9 の #11 表（初帧 61 ms 注記付き）は warmup 前の実測として保持。G1 の「初回复号は別枠」の前提は保つが、内訳は「起動コストは prepare（.ready 側）に移動済み」に更新。
+- warmup の利得は open→初帧短縮ではない（合計は同等）。**play を open 完了から独立にできること（UI の応答性）**、初帧提示の計測が clean になること、stage 統計が常時値で安定すること。UI（#2）では load 完了＝再生用意完了として play を即时化できる。
