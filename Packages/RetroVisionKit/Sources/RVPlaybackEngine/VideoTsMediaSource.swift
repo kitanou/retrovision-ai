@@ -33,6 +33,15 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
                          location: .directoryURL(rootURL))
     }
 
+    public func close() async {
+        // 資源の明示 release（03 §1 の MediaSource.close 契約）。SegmentPSDemuxer は
+        // 修復写しの temp を deinit で掃除する — その参照をここでまとめて手放す。
+        // opened cache も落とす（次の open は再走査・再 probe — close は「開き直し」の
+        // 区切りであり、タイトル切り替えの再 load は close を通らない — 03 §9.6）。
+        opened = nil
+        releaseDemuxers()
+    }
+
     public func open() async throws -> OpenedSource {
         if let opened { return opened }   // 冪等（タイトル切り替えの再 load で再 probe・再連結しない）
         guard let found = VideoTsNavigator.chains(in: rootURL) else {

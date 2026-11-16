@@ -203,6 +203,26 @@ final class EngineCoreTests: XCTestCase {
         XCTAssertTrue(sawZeroPosition, "positionUpdated(.zero) の初期化イベントが無い")
         await engine.close()
     }
+
+    // MARK: source.close の伝搬（03 §1 の MediaSource.close 契約、#3 終了後始末）
+    //
+    // engine.close は「参照を落とす」だけではなく source.close を呼ぶ（process 終末の
+    // deinit 依存にしない — 実測 2026-11-17: 終了時 close 無しで ISO マウントと
+    // 430 MB の修復写し temp が残った）。source は 1 度だけ（close 後は currentSource を
+    // 手放す）。EngineCore.close の 2 回目の呼び出しは no-op のまま。
+
+    func testEngineCloseReleasesSourceResources() async throws {
+        let engine = EngineCore()
+        let source = ClosableTestSource()
+        try await engine.load(source, selection: PlaybackSelection(item: ItemID(1)))
+        await engine.close()
+        let afterFirst = await source.closeCount
+        XCTAssertEqual(afterFirst, 1, "engine.close が source.close に届かない（03 §1 の明示 release 契約）")
+        await engine.close()
+        let afterSecond = await source.closeCount
+        XCTAssertEqual(afterSecond, 1, "close が source に 2 回伝播した（手放した source を握り直している）")
+    }
+
 }
 
 /// テスト用のソース。VIDEO_TS 相当の構造をメモリ上に作る（09 §3）。
@@ -247,6 +267,18 @@ struct TestSource: MediaSource {
                             structure: structure,
                             formatHint: .mpegProgramStream)
     }
+}
+
+/// 03 §1 の close 契約検査用の test double（close 回数を数える）。open/構造は
+/// TestSource と同一形（再生線は走らせず close の伝搬だけ見る）。
+actor ClosableTestSource: MediaSource {
+    nonisolated var descriptor: SourceDescriptor {
+        SourceDescriptor(id: SourceID(77), kind: .videoTsFolder, displayName: "closable",
+                         location: .fileURL(URL(fileURLWithPath: "/tmp/closable")))
+    }
+    private(set) var closeCount = 0
+    func open() async throws -> OpenedSource { try await TestSource().open() }
+    func close() async { closeCount += 1 }
 }
 
 /// 保護 Disc を表すテスト用ソース。ライセンス未確認で開けないケース（03 §7）。

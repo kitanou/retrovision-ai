@@ -183,6 +183,13 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **RV_DEBUG_POSITION=<any>**: PlayerViewModel の events 経路にだけ乗る stderr 診断（`rvtransport:` 行）。phase / selection は毎回、position は 1 s 粒度（フレーム毎で埋めない）。UI 側ミラーの単一更新経路（#17）の観測を写すだけで、engine の契約は変えない。
 - **検査**: auto-open の発火・未設定 noop（既定起動の意味不変）、QA 入口が first-play 政策（menu 既定選択）を通ること。実盤 live 計測はこの夜は画面ロックのため GUI 側は未実施（朝の解錠待ち）。エンジン側の実盤計測は device-gated 検査と RV_AUTO_OPEN 実行の组合せで実施。
 
+### 2026-11-17 — MediaSource.close（明示的资源解除）とアプリ終了後始末（#3、live 実測起因）
+
+- **実測（live 検証の終了後）**: 実 PICHI ISO を再生したアプリを SIGTERM で終らせたとき、(a) ISO マウント（diskimagesiod が残り /Volumes に居続けた）と (b) 修復写し temp `retrovision-psfix-*.mpg` 430,792,704 B が temporaryDirectory に残った。engine.close は openedSource を nil にするだけで、source 側の後始末（unmount・temp 掃除）は process 終末の deinit / Task.detached 任せになっていた — 終末では間に合わない。
+- **決定（契約）**: `MediaSource` に `close() async` を追加（資源を持たない source は protocol extension の no-op 既定）。`EngineCore.close()` は session を止めた**後**に currentSource.close() を await して手放す（reader が動いたままの eject は壊れる — 順を厳守）。DiscImageMediaSource.close（既存）= internal source の demuxer 解放 + eject。VideoTsMediaSource.close を追加 = opened cache 破棄 + releaseDemuxers（SegmentPSDemuxer の temp は deinit で掃除される — 参照をここでまとめて手放す）。タイトル切り替えの再 load は close を通らない（冪等 cache は不変。03 §9.6）。
+- **決定（アプリ側の終了経路）**: `applicationShouldTerminate` → `closeEngineForQuit()`（async）を走らせてから `reply(toApplicationShouldTerminate:)`。保留中の待ち時間は watchdog（3 s、超過時 rvquit 一行で進行）。**nested run loop で待たせる案は実測で退場**: 素の CFRunLoop を回しても main actor のジョブは流れず（XCTest で 3 s 待っても engine.close が完了しなかった）、同期待ちのつもりが事実上 complete しない。terminateLater で AppKit の通常ループに戻すのが正しい。
+- **検査**: EngineCoreTests（engine.close → source.close が 1 回だけ伝播、2 回目の engine.close は no-op）、PlayerViewModelTests（closeEngineForQuit が engine.close 完了 + events 経由の空状態）。live（実 PICHI ISO）: 再生中のアプリを TERM で終了 → マウント解除と temp 削除を確認（この項の実測は PR 記載）。docs 03 §1 に契約、§9.6 に close と冪等 cache の関係を追記。
+
 ## 意思決定の運用
 
 1. 決めたら**この表に「決定」と「日付」「根拠（実験 ID / レポート ID）」を書く**。本文の既定値は同じ commit で更新する。

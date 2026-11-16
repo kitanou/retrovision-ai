@@ -10,6 +10,17 @@ public protocol MediaSource: Sendable {
     var descriptor: SourceDescriptor { get }
     /// 開いて構造を作る。重い処理は内部の IO キューで実行する（INV-4）。
     func open() async throws -> OpenedSource
+    /// 明示的な資源解除（2026-11-17 追加、#3 終了時後始末）。open が作った資源
+    /// （ISO マウント、修復写しの temp など）を release する。engine の close から
+    /// 呼ばれる。process 終末の deinit に依存しない契約にする — 実測で force-kill 時の
+    /// temp 残りは OS 任せとしても、通常の終了経路では残さない（430 MB の修復写しが
+    /// 残った実測がある）。資源を持たない source は既定の no-op で足りる。
+    func close() async
+}
+
+public extension MediaSource {
+    /// 資源を持たない source の既定（FileMediaSource とテスト二重化はこちら）。
+    func close() async {}
 }
 
 public struct SourceDescriptor: Sendable, Hashable, Identifiable {

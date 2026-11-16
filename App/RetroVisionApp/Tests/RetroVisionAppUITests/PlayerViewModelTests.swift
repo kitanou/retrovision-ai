@@ -157,6 +157,23 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertEqual(selects2, 1, "本体タイトルの ended で自動進行が再発火した（menu 限定のはず）")
     }
 
+    // MARK: 終了後始末（closeEngineForQuit。03 §1 の close 契約のアプリ側）
+    //
+    // 終了は terminateLater で保留され、AppKit の通常ループ内でこの async が走る
+    // （AppShell の delegate は薄い配線 — watchdog 3 s と reply は実時間依存なので
+    // ここでは検査しない）。engine.close が完了まで到達すること（= unmount と temp
+    // 掃除の前提。source への伝搬自体は EngineTests で固定）と、close 経由の空状態
+    // への復帰（単一経路）を固定する。
+
+    func testCloseEngineForQuitCompletesEngineClose() async {
+        let fake = FakePlayerEngine()
+        let vm = PlayerViewModel(engine: fake)
+        await vm.closeEngineForQuit()
+        XCTAssertTrue(fake.calls.contains("close"),
+                      "終了後始末で engine.close が完了しない（マウント・temp の後始末が走る前提）")
+        await waitPhase(vm, .empty)   // close の events 経由の空状態（単一経路）も届く
+    }
+
     // MARK: 起動時 QA 入口（RV_AUTO_OPEN / RV_DEBUG_POSITION。opt-in env 约定）
     //
     // RV_AUTO_OPEN が設定されているときだけ autoOpenFromLaunchEnvironment() が open を

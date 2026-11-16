@@ -270,6 +270,24 @@ final class PlayerViewModel {
         displayAspectValue = nil
     }
 
+    /// アプリ終了時の後始末（applicationShouldTerminate → terminateLater 経路から呼ばれる。
+    /// AppKit の通常ループが戻った状態で走るため、engine.close を普通に await できる —
+    /// nested run loop は使わない（実測 2026-11-17: 素の CFRunLoop を回しても main actor の
+    /// ジョブは_drained_されず、 XCTest では 3 s 待っても close が完了しなかった）。
+    /// engine.close は source.close（ISO の unmount、修復写し temp の掃除）まで含む —
+    /// process 終末の deinit に依存しない契約（実測: close 無しで終了するとマウントと
+    /// 430 MB の修復写しが残った）。上限超過时的な打ち切りは delegate 側の watchdog が
+    /// 担当（AppShell）。EngineCore.close は冪等なので closeItem 後に走っても安全。
+    func closeEngineForQuit() async {
+        surface?.reset()
+        await engine.close()
+        position = .zero
+        duration = nil
+        availableTracks = []
+        availableTitles = []
+        displayAspectValue = nil
+    }
+
     /// タイムライン操作（#17 §「UI 状態とエンジンの対応」の row: ドラッグ中はつまみだけ動かし、
     /// 離した時に .exact で 1 回だけ engine に投げる。ドラッグ中の seek はしない —
     /// 04 §6 の preroll を無限に繰り返すことになるため）。
