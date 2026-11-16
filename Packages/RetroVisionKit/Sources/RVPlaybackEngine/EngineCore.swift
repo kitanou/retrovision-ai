@@ -173,6 +173,18 @@ public actor EngineCore {
     // MARK: 運送
 
     public func play() async {
+        // .ended からの play = 先頭から再生し直す（2026-11-17 決定、#22 実測: タイトル終了後
+        // play も seek も拒否されて何も押せない状態になっていた — PICHI 実 ISO で観測）。
+        // 終了線で session は走り終えているので、落としてから seek(.zero) で新しい線を作る。
+        if phase == .ended {
+            sessionTask?.cancel()
+            if let session { await session.shutdown() }
+            sessionTask = nil
+            session = nil
+            sessionRunning = false
+            lastOutcome = nil
+            await seek(to: .zero, tolerance: .exact)
+        }
         guard phase == .ready || phase == .paused || phase == .stalled(reason: .mediaSlow) else { return }
         promotePendingPlan()
         transition(to: .playing)
@@ -260,8 +272,11 @@ public actor EngineCore {
     /// （PlaybackSession.seek がやる）。UI には target 位置を示し、preroll 完了後
     /// （この呼び出しの復帰時）に seek 前の phase へ戻す（04 §6「完了まで待つ」）。
     public func seek(to time: MediaTime, tolerance: SeekTolerance = .default) async {
-        guard phase == .playing || phase == .paused else { return }
-        let resumeTo = phase
+        // ended からも seek できる（2026-11-17 決定、#22 実測: 終了後に timeline を触っても
+        // 無応答で、UI の位置表示だけが動いていた）。完了後は paused として落ち着く
+        // （再生の自動再開はしない — 運送はユーザー操作）。
+        guard phase == .playing || phase == .paused || phase == .ended else { return }
+        let resumeTo: EnginePhase = (phase == .ended) ? .paused : phase
         let myGen = lineGeneration
         transition(to: .seeking(target: time))
         position = time   // プログレスは目標位置を表示（04 §6）
@@ -414,7 +429,10 @@ public actor EngineCore {
             //    小さい値は出さない（非逆行を出力点で決定的に保証する）。
             if case .seeking = phase { return }
             guard seekGeneration >= expectedPositionGeneration else { return }
-            guard pts.seconds >= position.seconds else { return }
+            // Strict 床: 既に published した位置と同じ值是黙る。0 に seek した直後の
+            // PTS=0 初帧のように 0 が二重になると、位置イベントの strictly increasing
+            // contract（02 §4・#14）と衝突する — 再生し直しの実測で判明。
+            guard pts.seconds > position.seconds else { return }
             position = pts
             // イベント洪水を防ぐ（UI 向け 0.25 s 間隔。診断は outcome を見る）。
             if lastPositionEmitSeconds == nil || pts.seconds - (lastPositionEmitSeconds ?? -1) >= 0.25 {

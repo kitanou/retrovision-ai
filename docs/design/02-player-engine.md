@@ -75,7 +75,7 @@ public enum EnginePhase: Sendable {
 public enum StallReason: Sendable { case demuxStarved, decodeStarved, mediaSlow, resourceExhausted }
 ```
 
-遷移（`empty → preparing → ready ⇄ playing ⇄ paused → ended`、`* → failed`、`playing/paused ⇄ seeking`）。
+遷移（`empty → preparing → ready ⇄ playing ⇄ paused → ended`、`* → failed`、`playing/paused ⇄ seeking`）。`ended` からも運送が戻っている（2026-11-17 決定、#22 実測: 終了後に play/seek が両方拒否されると操作不能になる）: `play` は線を落として `seek(.zero)` で作り直し最初から、`seek` は指定位置で `paused` に落ち着く。
 
 遷移で守る規則:
 

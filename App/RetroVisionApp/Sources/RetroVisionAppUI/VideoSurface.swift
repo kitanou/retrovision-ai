@@ -81,6 +81,9 @@ final class SurfaceSink: VideoPresentSink {
 /// displayAspectValue で枠の比率を決めるので、layer は枠いっぱいに .resize（引き伸ばさない）。
 final class VideoLayerView: NSView {
     let videoLayer = AVSampleBufferDisplayLayer()
+    /// transport バー再表示のための活動配線（#22 の実装補完。nil の間は nobody に等しい）。
+    /// local monitor とは独立の配送経路（両方届いても showControls は冪等なので無害）。
+    var onControlsActivity: (@MainActor () -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -95,21 +98,46 @@ final class VideoLayerView: NSView {
         super.layout()
         videoLayer.frame = bounds
         videoLayer.contentsScale = window?.backingScaleFactor ?? 1.0
+        // fullscreen 遷移などで窓の属性が作り直される経路の保险（setter はフラグ書き換えのみ）。
+        window?.acceptsMouseMovedEvents = true
     }
 
     override var isFlipped: Bool { true }
+
+    /// #22 の二次原因（実測 2026-11-17): NSWindow は既定で acceptsMouseMovedEvents=false。
+    /// 既定のままだと mouseMoved イベント自体が生成されず、local monitor
+    /// （ControlsActivityMonitor）は何も観測できない — 配線だけでは足りなかった。
+    /// 映像面が載る window では mouse-moved を生成させる（生成→sendEvent→monitor で再表示）。
+    /// fullscreen など表示環境側が後から false に戻した場合に備え、layout 時にも再宣言する。
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+
+    /// 映像面上のマウス移動は owner 配送の受け口でもある（window が mouse-moved を生成した
+    /// 上で deepest hit-view に届く経路）。local monitor とは独立の配送で、両方届いても
+    /// showControls は冪等なので無害。
+    override func mouseMoved(with event: NSEvent) {
+        onControlsActivity?()
+        super.mouseMoved(with: event)
+    }
 }
 
 struct VideoSurfaceView: NSViewRepresentable {
     let onLayer: @MainActor (AVSampleBufferDisplayLayer) -> Void
+    /// transport バー再表示の活動配線（#22。window の mouse-moved 生成と owner 配送の
+    /// 受け口を確保した上で、View 側に「動きをactivityとして扱う」意図を渡す）。
+    var onActivity: (@MainActor () -> Void)? = nil
 
     func makeNSView(context: Context) -> VideoLayerView {
         let view = VideoLayerView()
+        view.onControlsActivity = onActivity
         onLayer(view.videoLayer)
         return view
     }
 
     func updateNSView(_ nsView: VideoLayerView, context: Context) {
+        nsView.onControlsActivity = onActivity
         nsView.needsLayout = true
     }
 }

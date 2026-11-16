@@ -150,6 +150,14 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査で固定した回路**: local monitor は `NSApp.sendEvent` で発火する（headless で検証可能）、目撃 monitor を先に登録して「吞まない」を検証、start 冪等・stop で解除、keyDown は活動に含めない。
 - API 面の気づき（CLAUDE.md 収集方針）: `NSEvent.addLocalMonitorForEvents` の handler は **新しい登録順に呼ばれ**、nil を返すと event を吞む。`NSEvent.otherEvent(with:)` は mouseMoved を作れない（例外 `WeirdMask`）。合成 mouseMoved は `CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)` → `NSEvent(cgEvent:)` で作れる（type は保持され sendEvent に通る）。`NSApp.sendEvent` を通す局所検証には `NSApplication.shared` の生成だけで足り、run loop は不要（handler は同期呼出しだが検査は RunLoop drain で待って確定させる）。`onContinuousHover` は `NSViewRepresentable` の layer-backed view 上で発火しない（実運用実測。pure SwiftUI 領域では効く）。
 
+### 2026-11-17 — #22 二次原因（mouse-moved の生成自体）と .ended 運送の実装決定
+
+- #23 の local monitor 後もユーザー実測で「マウスを動かしてもバーは出ない」が続いた。**一段深い原因**: `NSWindow.acceptsMouseMovedEvents` の既定は false で、既定のままでは mouseMoved NSEvent が**生成されない**。local monitor は sendEvent の分发前に割込むだけなので、そもそも列に来ないイベントを観測できない。前増分の unit test は `NSApp.sendEvent` 直接投递で生成段を通過していた（test の穴として実測に負けた）。
+- 決定（入力鎖の完成）: ① 映像面 `VideoLayerView` が載る window で `acceptsMouseMovedEvents = true`（viewDidMoveToWindow + layout で再宣言 — fullscreen 経路の保险）。② 生成された mouse-moved の owner 配送受け口として `VideoLayerView.mouseMoved(with:)` → `onControlsActivity`（representable 経由で PlayerScreenView の `showControls()` に接続）。local monitor とは独立の配送で、二重に届いても showControls は冪等。③ `onContinuousHover` と monitor は維持（ SwiftUI 側領域と click/scroll を拾う）。
+- **.ended からの運送（同実測で判明した操作不能バグ）**: PICHI 実 ISO でタイトル終了後、`play` も `seek` も guard に弾かれて何も押せない状態になっていた（UI の position だけ scrub で 0 に動き engine と乖離）。決定: `ended` からの `play` = 古い線を stop → `seek(.zero)` で線を作り直し最初から再生。`ended` からの `seek` = 指定位置で `paused` に落ち着く（自動再生しない）。境界として、seek した 0 と PTS=0 初帧の**二重 0** が position の strictly increasing contract（02 §4・#14）と衝突するため、engine の position 配送は「published 済みと同じ值是黙る」に厳格化（0 地点の初期化イベントは seek/load 側の単一経路が既に送っている）。
+- 検査: window フラグの生成（既定 false → 映像面載せで true、layout 再宣言）、owner 配送 callback、実線 fixture で「終了→再生し直し→全帧提示・position は 0 再出発から strict 増・2 度目の .ended」の e2e。
+- API 気づき: `NSResponder` の Swift 名は `mouseMoved(with:)`。NSWindow の `acceptsMouseMovedEvents` は既定 false（tracking area の無い plain NSView 上のホバーで mouse-moved が生成されない理由）。`NSWindow(contentRect:styleMask:backing:defer:)` は test で使え、`contentView=` 代入で viewDidMoveToWindow が走る（headless で生成契約を検証できた）。
+
 
 ## 意思決定の運用
 

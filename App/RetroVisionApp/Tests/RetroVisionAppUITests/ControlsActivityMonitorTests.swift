@@ -79,4 +79,35 @@ final class ControlsActivityMonitorTests: XCTestCase {
         settle()
         XCTAssertEqual(activity, before, "stop 後も発火している")
     }
+
+    // MARK: 入力生成側（#22 の二次原因: NSWindow は既定で mouse-moved を生成しない）
+
+    /// 映像面が載る window は mouse-moved を生成する旗を立てる。これが無いと
+    /// local monitor も owner 配送も「そもそも届くイベントが無い」状態だった（実測）。
+    func testSurfaceEnablesWindowMouseMovedGeneration() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        XCTAssertFalse(window.acceptsMouseMovedEvents, "既定 false の前提（AppKit の既定契約）")
+        let surface = VideoLayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+        window.contentView = surface
+        XCTAssertTrue(window.acceptsMouseMovedEvents, "映像面が載る window で mouse-moved が生成されない")
+
+        // 表示環境が後から旗を戻しても、layout 時に再宣言される（fullscreen 等の保险）。
+        window.acceptsMouseMovedEvents = false
+        surface.layout()
+        XCTAssertTrue(window.acceptsMouseMovedEvents, "layout での再宣言が行われない")
+    }
+
+    /// 生成された mouse-moved の owner 配送受け口（VideoLayerView.mouseMoved）が
+    /// 活動として配線される。local monitor とは独立の経路で、両方届いても冪等。
+    func testSurfaceMouseMovedIsWiredAsActivity() {
+        var activity = 0
+        let surface = VideoLayerView(frame: NSRect(x: 0, y: 0, width: 64, height: 64))
+        surface.onControlsActivity = { activity += 1 }
+        let cg = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                        mouseCursorPosition: CGPoint(x: 8, y: 8), mouseButton: .left)
+        let moved = try! XCTUnwrap(cg.flatMap { NSEvent(cgEvent: $0) })
+        surface.mouseMoved(with: moved)
+        XCTAssertEqual(activity, 1, "mouseMoved の owner 配送が活動に繋がらない")
+    }
 }

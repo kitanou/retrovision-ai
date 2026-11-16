@@ -328,6 +328,78 @@ final class FilePlaybackTests: XCTestCase {
         strictlyIncreasing(box.collectedPositions)
     }
 
+    /// .ended からの運送（2026-11-17 決定、#22 実測の追試験）。PICHI 実 ISO でタイトル終了後、
+    /// play も seek も無応答で「続きが出ない／何も押せない」状態になっていた（01:16 で停止）。
+    /// play(from .ended) = 古い線を落として seek(.zero) で線を作り直し、最初から最後まで
+    /// 再生し直す。position は線をまたいで逆行してよい（単一行契約 — 02 §4）。
+    func testReplayAfterEndedRebuildsLineAndPlaysToEnd() async throws {
+        final class ReplayBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var sawEndedCount = 0
+            private var positions: [MediaTime] = []
+            func handle(_ event: PlayerEvent) {
+                lock.lock(); defer { lock.unlock() }
+                switch event {
+                case .phaseChanged(let phase):
+                    if case .ended = phase { sawEndedCount += 1 }
+                case .positionUpdated(let position, _, _):
+                    positions.append(position)
+                default: break
+                }
+            }
+            var endedCount: Int { lock.lock(); defer { lock.unlock() }; return sawEndedCount }
+            var collectedPositions: [MediaTime] { lock.lock(); defer { lock.unlock() }; return positions }
+        }
+
+        let url = try fixtureURL("truncated-01-cut.mpg")
+        let engine = EngineCore()
+        let events = await engine.events()
+        try await engine.load(FileMediaSource(url: url),
+                              selection: PlaybackSelection(item: ItemID(1)))
+        let box = ReplayBox()
+        let consumer = Task {
+            for await event in events {
+                box.handle(event)
+                if box.endedCount >= 2 { break }
+            }
+        }
+        defer { consumer.cancel(); }
+
+        await engine.play()
+        let deadline1 = Date().addingTimeInterval(20)
+        while Date() < deadline1 && box.endedCount < 1 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(box.endedCount, 1, "1 本目の .ended に到達しない")
+
+        // 終了後の運送が効くこと（実測で壊れていた点そのもの）。
+        await engine.play()
+        let snap = await engine.snapshot()
+        XCTAssertEqual(snap.phase, .playing, "ended からの play が .playing に戻さない")
+
+        let deadline2 = Date().addingTimeInterval(20)
+        while Date() < deadline2 && box.endedCount < 2 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(box.endedCount, 2, "再生し直しが .ended まで進まない")
+
+        let second = await engine.playbackOutcome()
+        XCTAssertNotNil(second, "2 本目の測定結果が無い（線が作り直されていない？）")
+        XCTAssertEqual(second?.stats.presented, 12, "再生し直しで全帧提示されない")
+
+        // position は new line で 0 近傍から再出発し、その後は単一行で strict 増。
+        let positions = box.collectedPositions
+        guard let lastBack = (1..<positions.count).last(where: {
+            positions[$0 - 1].compared(to: positions[$0]) != .orderedAscending
+        }) else {
+            return XCTFail("線をまたいだ位置の再出発が無い（新しい線のイベントが来ていない）")
+        }
+        strictlyIncreasing(Array(positions[lastBack...]))
+        XCTAssertLessThan(positions[lastBack].seconds, 0.05,
+                         "再生し直しの開始位置が 0 でない: \(positions[lastBack].seconds)")
+        await engine.close()
+    }
+
     /// snapshot の position が再生中に進行すること（UI 向けの位置表示の回路）。
     func testEngineSnapshotPositionAdvances() async throws {
         let url = try fixtureURL("truncated-01-cut.mpg")
