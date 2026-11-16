@@ -76,8 +76,9 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | 計測とレポート（08 §7） | 実装済み（窓集計の `MetricBus`、JSONL、`BenchmarkReport` の null 保持） |
 | 適応制御（08 §4、§5） | 実装済み（`AdaptivePolicyEngine` の降格順序・hysteresis） |
 | **再生線（EngineCore ↔ demux/decode、#11 前半）** | 実装済み（`PlaybackSession` + `FileMediaSource`。映像のみ: play/pause/resume・PTS 順の提示・位置イベント・`PlaybackOutcome` 計測）。実測: 180 素材で 180/180 提示、realTimeFactor 0.9998、late 0、提示間隔 p50 33.25 ms（目標 33.37）。統合テスト 4 本で回帰固定 |
-| `EngineCore`（02） | 状態機械・設定適用・plan 生成＋上記の再生線接続まで実装（seek は場当たり的な再構築のみ＝#13、音声線は #10） |
-| 未実装（03、05、06、07、音声実装） | 契約と plan のみ（音声は復号経路の実験まで完了＝EXP-002。AudioDecoder/AudioSink/clock 実装は #10、SW 復号は OQ-20 のゲート待ち） |
+| **音声線（#10）** | 実装済み（AC-3→PCM 復号は AVFoundation の変換出力 + `AVFoundationAudioDecoder`（480 帧 quantum・実仕様確定）。`AVFoundationAudioSink` は (framePosition, PTS) 対応表と出力遅延補正。`AudioClock` が提示締切の権威）。実測（AC-3 素材）: **drift p50 +6.9 / p95 +10.6 ms（04 §5 のデッドバンド/補正段階の帯域内）、underrun 0**。出力装置の無い環境は暫定 pacing へ縮退（設計どおり。テストで両経路を検査） |
+| `EngineCore`（02） | 状態機械・設定適用・plan 生成＋上記の再生線（映像・音声）の接続まで実装（seek は場当たり的な再構築のみ＝#13） |
+| 未実装（03、05、06、07） | 契約と plan のみ（SW 復号は OQ-20 のゲート待ち。DTS 音声は Phase 4 の shim ゲート＝OQ-02。AVFoundation がトラックを列挙しないのは実測済みで、AudioPathTests に回帰固定） |
 | 素材 | `fixtures/manifest.json` 18 登録（**11 を generated として Git 同梱**、実素材 7 は `pending`＝OQ-16）。`make gen-fixtures` で再生成 |
 | ライセンス | `licenses/inventory.json`（Homebrew 版の実測 license・未リンクを区別。`make check-licenses` で検査） |
 | CI | `.github/workflows/ci.yml`（build / unit / integration / licenses / fixtures + nightly の probe 収集） |

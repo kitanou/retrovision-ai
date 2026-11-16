@@ -29,7 +29,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 | OQ-16 | 実素材フィクスチャの入手元と再配布権（manifest の `pending` 7 件: 実 DVD の VOB、保護盤、市販 H.264 素材等） | 開発は generated 合成素材。検証素材は所有盤から自己抽出し、repo には同梱しない | 素材提供元（自作盤で足りるか）と抽出・非公開利用の可否 | G2 | Phase 2 で着手 |
 | OQ-17 | MP4 mux の MPEG-2 で残る `CVFieldDetail` の読み了と、検出器への供給順位（PCE とどちらを優先するか） | PCE 優先。detail 値は読むだけで使わない | 同一素材の field 声明をコンテナ・bitstream・detail で突き合わせる（mp4-01 fixture） | G2 | Phase 1 残作業 |
 | OQ-18 | 初回フレームのスパイク（44〜70 ms）の warmup 設計（open 直後の使い捨てデコード、セッション预热、測定の除外方法） | open 直後に先頭 2〜3 枚を warmup として復号し、統計から除く | 起動遅延と warmup コストの実測。マルチストリーム切替時の再 warmup 要否 | G2 | Phase 1 残作業 |
-| OQ-19 | 音声復号とクロックの実現（AC-3 を AVFoundation の PCM outputSettings で復号できるか。AudioClock の jitter） | **復号経路は決定済み（2026-11-16、EXP-002 A1）**: AVAssetReader の linear PCM 出力で AC-3 を復号する（依存ゼロ維持）。quantum 分割は AudioDecoder 実装側（A2）。クロックの原料は PCM 経路の valid PTS + 帧数（A3）。残るは AudioSink/clock の実装と jitter 実測 | 実測済み（realtimeFactor ≈1100、in-line 計測は #11）。5.1 配置は実盤で再測（OQ-16） | G1（clock 部分） | Phase 1 残作業 |
+| OQ-19 | 音声復号とクロックの実現（AC-3 を AVFoundation の PCM outputSettings で復号できるか。AudioClock の jitter） | **実装・実測済み（2026-11-16、#10）**: AVAssetReader の linear PCM 出力で AC-3 を復号する（依存ゼロ維持）。quantum 分割は AudioDecoder 実装側（A2、`AVFoundationAudioDecoder.quanta` で 480 帧へ。テスト固定）。クロックの原料は PCM 経路の valid PTS + 帧数（A3）。`AVFoundationAudioSink` + `AudioClock` を実装し、in-loop の drift を実測（04 §9: p50 +6.9 / p95 +10.6 ms、デッドバンド帯域内）。**DTS は AVFoundation がトラックを列挙しない（A6）ため Phase 4 の shim ゲートまで非対応**（`AudioPathTests` で回帰固定） | 5.1 配置・実素材の jitter 分布は実盤で再測（OQ-16）。実測（realtimeFactor ≈1100、合成素材での clock jitter は上にとどまる） | G1（clock 部分） | 完了（実盤計測は OQ-16 に引き継ぎ） |
 | OQ-20 | SW 復号フォールバック（`SoftwareDecoder`）の実現方式（VideoToolbox が弾く pixfmt・codec — WMV1 等） | libavcodec shim。ただし**実際に対象素材が現れるまで作らない**（無依存方針を壊さない） | WMV1 fixture が AVFoundation で開けるかの測定（未実施） | Phase 4 | 対象が判明した時点 |
 | OQ-21 | 合成 fixture の再生成一致性（ffmpeg の版で bit が変わりうる。sha を検証にするか記録にするか） | **決定済み（下記決定ログ）**: `status: generated` で Git 同梱。sha は記録（検査しない） | CI の ffmpeg バージョン漂移の実測 | — | 決定 |
 | OQ-22 | 60i 素材のキャデンス（film-origin pull-down）対応の範囲と ground truth | 未対応（現セットに flag 付き pull-down 素材がない） | 市販 DVD 映画素材の flags と検出器の突合 | G2 | Phase 2 |
@@ -68,6 +68,18 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
   - 未決のまま残る: AudioSink/clock の jitter 実測（#10 の実装作業）、5.1ch 配置（実盤＝OQ-16）。
 - **OQ-18（拡張）**: 音声側にも初期化コスト（passthrough 計 24 ms の初バッチ）がある（A5）。warmup は映像・音声で一括设计すること。
 - **DTS（OQ-02 の測定された例）**: AVFoundation は MPEG-PS 内の DTS をトラックとして列挙しない（A6、警告も出ない = 黙って消える不是）。DVD-Video で音声必須は LPCM/AC-3。**当面の既定: Phase 4 の FFmpeg shim ゲートまで DTS 非対応**。shim 実装時の受け入れ素材として `ntsc480i-dts-01.mpg`（ffmpeg `-strict -2 -c:a dca` で生成、manifest 登録済み）を使う。
+
+### 2026-11-16 — 音声線（#10）の実装決定（実測は 04 §4/§5/§9 に反映）
+
+- **契約は実測で確定した形に同期した**（04 §4 のコードブロックを実装とおりへ更新）: 音声の入口は ES ではなく **PCM 変換済み chunk の供給**（`PCMSampleSource.pcmSamples(for:target:)`）。目標仕様は Sendable 値型 `PCMTargetSettings` — `[String: Any]` は actor 境界を跨げない（Swift 6 の検査で判明。dict は actor 内側で組む）。ES をさばく復号器（DTS 等＝OQ-02 ゲート）は同じ出力側（quantum 列 + outputFormat）で入口だけ差し替える。
+- **AudioSink / AudioClock は class+NSLock**（契約が同期要件で clock が each tick から同期で読むため。DeterministicTimeSource と同じ前例）。
+- **framePosition↔PTS 対応表は AudioSink の内側**（`scheduleBuffer(at: nil)` の順次連結で frame 位置は決定的に追える。decoder が帧数と PTS 進みの対応を保証 — `AudioPathTests` で「帧数と PTS 進みが一致」を固定。04 §5 の設計どおり）。
+- **出力装置の遅延**: 本 SDK の AVAudioNode に `outputLatency` は無い。`outputPresentationLatency`（秒）を読み、rendered 位置から引いた地点を `renderedPTS()` とする。妥当性は drift 実測で担保（p95 +10.6 ms、帯域内）。
+- **縮退は常に存在する**（INV-2 と同じ原則）: 出力装置の無い環境（CI の macOS ランナーがありうる）では `sink.start()` が throw → `audioStatus="failed:…"` で暫定 pacing（#11 の壁時計基点）に落ちる。e2e テストは running 経路と failed 経路の両方を検査する形にした（silent skip で環境差を隠さない）。映像の完走はどちらでも壊れない。
+- **供給方針（初期値）**: prefill 120 ms → start → 稼働中は 150 ms を維持（04 §4 の 0.10〜0.12 s の範囲内）。映像終了後は音声 drain を最大 2 s 待ち、不発なら打ち切って errors に記録（停止しないセッションを作らない安全弁）。
+- **drift は audio master clock の実測として帯域内**（p50 +6.9 / p95 +10.6 ms。04 §5 の 8 ms デッドバンド／40 ms 補正段階に対し、Phase 1 は補正行動を実装せず測って残すだけ）。**audio clock 下で `late`(2 ms 閾値) が 144 計上された**: drift が帯域内でも「同期復号が提示パスを阻塞する構造 + clock 锚の量子化 + 補正なし」で late に出る。**修復は Phase 2 の #5/#6（PresentSchedule で復号と提示時刻を分離。8 ms 超だけ補正）**。H.264 の 22/29 と同じ归属。数値は誤誘導なので 04 §9 に含义ごと記録した。
+- **DTS の非列挙（A6）はテストで回帰固定**（`AudioPathTests`/`AudioPlaybackTests`: DTS 素材は音声なしで完走する。現れたら OQ-02 の判断を更新する）。
+- 新規 API 面の気づき（CLAUDE.md 収集方針）: `CMBlockBufferCreateWithMemoryBlock` は 9 引数（旧 7 引数形は現 SDK に無い）で最終ラベルは `blockBufferOut:`。`CMBlockBufferCopyDataBytes` の destination は **raw memory**（block ではない）。`CMAudioFormatDescriptionCreate` のラベルは `magicCookieSize:/magicCookie:/formatDescriptionOut:`。`CMSampleBufferCreate` は counted-array 形（`sampleCount:/sampleTimingEntryCount:/…`）。PCM の CMSampleBuffer では **sample 数 = frame 数**（EXP-002 の GetNumSamples 実測と一致）。`AVAudioPCMBuffer.mutableAudioBufferList` は non-Optional で `mAudioBuffers` は direct access 不可 — 16bit interleaved なら `int16ChannelData?[0]` が正しい。内部割当の CMBlockBuffer は「empty」状態で `GetDataPointer` に到達できない（自有 memory を渡す）。
 
 ### 2026-11-15〜16 — 運用面の実施決定（実験ゲート外の自己決定）
 

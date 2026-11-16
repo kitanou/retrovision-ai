@@ -83,38 +83,52 @@ public protocol VideoDecoder: Sendable {
 
 ## 4. 音声出力
 
-AVAudioEngine + AVAudioPlayerNode を使う（SDK に存在確認済み）。
+AVAudioEngine + AVAudioPlayerNode を使う（SDK に存在確認済み）。**実装済み（#10）**。
+契約は `Contracts.swift` のとおり（実測で確定した形に同期している）:
 
 ```swift
-public final class AudioSink: Sendable {
-    // AVAudioEngine, AVAudioPlayerNode, AVAudioMixerNode
-    func start() throws
-    func schedule(buffer: AVAudioPCMBuffer, when: AVAudioTime?)   // 0.02〜0.1 s 単位で先に積む
-    func flush(preserveLatency: Bool)
-    var renderedFrames: AVAudioFramePosition { get }               // クロックの原料
-    var outputLatency: TimeInterval { get }                        // ハードウェア出力遅延の補正に使う
+public protocol AudioDecoderProtocol: Sendable {
+    var pathInfo: DecodePathInfo { get async }
+    var outputFormat: AudioFormatDescription? { get async }   // 最初の chunk から実仕様を確定
+    func configure(_ format: AudioFormatDescription, policy: DecodePolicy) async throws
+    func pcm(for track: TrackID) async -> AsyncThrowingStream<AudioPCM, any Error>  // 480 帧 quantum
+}
+public protocol AudioSink: Sendable {   // actor ではなく class+lock（同期要件のため）
+    func start() throws; func stop(); func pause(); func resume(); func flush()
+    func schedule(_ pcm: AudioPCM) throws        // 内部に (framePosition, PTS) 対応表を持つ
+    func scheduledAheadMS() -> Double            // underrun 検出と prefill 制御の材料
+    func renderedFramePosition() -> Int64
+    func renderedPTS() -> MediaTime?             // 対応表 + 出力遅延補正で解決
+    var outputLatencyMS: Double { get }
+    var outputFormat: AudioFormatDescription? { get }
 }
 ```
 
-- PCM quantum は 480 サンプル（10 ms @48 kHz）で生成し、10〜12 本（0.10〜0.12 s 初期値）を先に積む。render thread では allocation をしない。**AVFoundation の変換出力は 8192 帧（≈171 ms）に結合されて返る（EXP-002 A2）ので、この quantum への分割は AudioDecoder 実装側の責任**。
-- **AC-3 復号は AVFoundation の linear PCM 出力で行う（OQ-19 決定・EXP-002 A1。依存ゼロ）**。 AudioDecoder は passthrough の ES サンプルではなく、PCM 変換 outputSettings を使った track output を読む形になる。DVD の LPCM は passthrough でよい。**passthrough 経路を使う場合、ES は ~1.5 s 単位で結合され末尾サンプルの PTS が invalid（A3）**。クロックは PCM 経路の valid PTS + 帧数から進め、passthrough の PTS だけを信用しない。**DTS はトラックとして存在しなくなる（EXP-002 A6 実測: AVFoundation は MPEG-PS 内の DTS を列挙しない、警告も出ない）**。DVD-Video 仕様で音声必須は LPCM/AC-3 で DTS は拡張。当面の既定は **Phase 4 の FFmpeg shim ゲートまで DTS 非対応**（受け入れ検査には `ntsc480i-dts-01.mpg` を使う）。
-- 出力デバイスの遅延は `outputLatency` を引いて video 側に補正する（初期値 0.01〜0.03 s を実測で置く）。
-- device 変更（`AVCaptureDevice`/HAL 変更 notification）は再構成が必要。その間は `stalled` にせず、PCM を 0.2 s まで保持して繋ぐ。
+- PCM quantum は 480 サンプル（10 ms @48 kHz）で生成し、10〜12 本（0.10〜0.12 s 初期値）を先に積む。render thread では allocation をしない。**AVFoundation の変換出力は 8192 帧（≈171 ms）に結合されて返る（EXP-002 A2）ので、この quantum への分割は AudioDecoder 実装側の責任**。実装: `AVFoundationAudioDecoder.quanta(of:)`（480 帧へ切り、各 quantum を自有 memory へのコピーとして独立 block にする。テスト `AudioPathTests` で「全 quantum ≤480 帧・max=480・帧数と PTS 進みの一致」を固定）。
+- **AC-3 復号は AVFoundation の linear PCM 出力で行う（OQ-19 決定・EXP-002 A1。依存ゼロ）**。 AudioDecoder は passthrough の ES サンプルではなく、PCM 変換 outputSettings を使った track output を読む形になる（`PCMSampleSource.pcmSamples(for:target:)` — 目標仕様は Sendable 値型 `PCMTargetSettings`。dict は actor 境界の内側で組む）。DVD の LPCM は passthrough でよい。**passthrough 経路を使う場合、ES は ~1.5 s 単位で結合され末尾サンプルの PTS が invalid（A3）**。クロックは PCM 経路の valid PTS + 帧数から進め、passthrough の PTS だけを信用しない。**DTS はトラックとして存在しなくなる（EXP-002 A6 実測: AVFoundation は MPEG-PS 内の DTS を列挙しない、警告も出ない。AudioPathTests で回帰固定）**。DVD-Video 仕様で音声必須は LPCM/AC-3 で DTS は拡張。当面の既定は **Phase 4 の FFmpeg shim ゲートまで DTS 非対応**（受け入れ検査には `ntsc480i-dts-01.mpg` を使う。DTS 素材は音声なしで完走する）。
+- 出力デバイス側の遅延: `AVAudioNode.outputPresentationLatency`（秒。node から装置到達までの pipeline。**本 SDK に `outputLatency` は無い**）を読み、`renderedFramePosition()` から引いた位置を「いま装置から出ている音」として `renderedPTS()` が解決する。値の当否は §9 の drift 実測で検証（04 §5）。
+- 出力装置が存在しない環境（CI の一部）では `engine.start()` が throw する。**sink start 失敗は「音声なしの暫定 pacing へ縮退」**（PlaybackSession が `audioStatus="failed:…"` にして映像再生は継続。INV-2 と同じ縮退の原則）。
+- 出力デバイス・sample rate の実行時変更は Phase 2 の再生再構成（reconfigure）で扱う。PCM 保持 0.2 s は reconfigure 実装時の仕様として 02 §6 に残す。
 
 ## 5. 同期（audio master clock）
 
-**音声側を権威にする**（Epic・Issue #9 の要求と一致）。
+**音声側を権威にする**（Epic・Issue #9 の要求と一致）。**実装済み（#10。`AudioClock`）**。
 
 ```swift
-public actor AudioClock: TimeSource {
-    /// renderedFrames と schedule 済 buffer の先頭 PTS から現在位置を補間する
+// actor ではなく class+NSLock（TimeSource.now() が nonisolated 同期要件のため。
+// DeterministicTimeSource と同じ理由）。
+public final class AudioClock: MediaClock {
+    @discardableResult public func sample() -> Bool   // sink の rendered PTS をクロックに採る
     public func mediaTime(at host: HostTime) -> MediaTime
-    public func hostTime(for media: MediaTime) -> HostTime
-    public var drift: Double { get }        // 目標に対する映像の遅れ (ms)
+    public func hostTime(for media: MediaTime) -> HostTime   // 映像の提示締切（逆引き）
+    public var currentDriftMS: Double { get async }
 }
 ```
 
-補間の作り方: `AVAudioPlayerNode.lastRenderTime` → `playerTime(forNodeTime:)` で「再生された frame 位置」を取り、対応する PTS と結び付ける。frame 位置と PTS の対応は、schedule 時に `(bufferStartPTS, framePosition)` の table を engine 側で保持して解決する（FFmpeg 由来の PTS と PCM サンプル数の対応は decoder が保証する）。
+補間の作り方: `AVAudioPlayerNode.lastRenderTime` → `playerTime(forNodeTime:)` で「再生された frame 位置」を取り、対応する PTS と結び付ける。frame 位置と PTS の対応は、schedule 時に `(bufferStartPTS, framePosition)` の table を **AudioSink 内部**で保持して解決する（実装: `AVFoundationAudioSink.table`。frame↔PCM 帧数の対応は decoder が保証する — `AudioPathTests` で「帧数と PTS 進みが一致」を固定）。権威サンプルの間は壁時計から等倍で補間し、次の sample（数 ms 間隔で再生駆動と同じ tick）で更新するため、rate のずれは補間窓（数 ms）に閉じ込められる。
+
+**再生線での使い方（#10 実装）**: `PlaybackSession` は音声 prefill（既定 120 ms）後に sink を start し、毎呼吸で clock を sample する。映像の提示締切は `clock.hostTime(for: frame.pts)`（clock が立っていない間は #11 の暫定基点）。drift（+ = 映像が遅い）は提示時に 100 ms 間隔で採り `PlaybackOutcome.clockDriftMS` に残す。underrun（積み残枯渇）は `audioUnderrunEpisodes / TotalMS`。**drift・underrun の実測は §9**。
+注: 提示時刻の補正段階（下表の 8 ms 超の行動 = SyncController）は Phase 2 の #5/#6。Phase 1 は「測って残す」までで、映像は締切どおりにだけ提示する。drift が 8〜40 ms に乗っても補正しないぶん、そのまま `late`（既定 2 ms 閾値）に現れる点は §9 の注記参照。
 
 `SyncController` の判定と方針（初期値。Phase 1 で実測により更新）:
 
@@ -199,5 +213,16 @@ Phase 2〜3 では **ビットマップ字幕（DVD SPU）**と**テキスト字
 - **late の含义**: 当経路は「遅れても提示し late に数える」設計（02 §1・04 §3）。realTimeFactor ≈1 なので**スループット不足ではない**。H.264 の late は、`topUpDecode` が同一呼吸内で同期復号（1 件 2〜7 ms）を済らせてから `presentDue` を呼ぶ構造の取り分（復号が提示パスを阻塞する）。**修复は Phase 2 の #5（Metal 提示と PresentSchedule で復号と提示時刻を分離）**。数値だけ見ると誤誘導なので、表ごと残す。
 - **復号原価の素材差（映像段の実測）**：MPEG-2 p50 2.6 ms / H.264 progressive p50 1.6〜1.9 ms / **H.264 interlaced p50 5.7〜5.8 ms（field-pair 復号で progressive の約 3 倍）**。フレーム予算（04 §1 の videoDecode 3 ms）は MPEG-2 で満たすが H.264 interlaced を DVD 相当で扱う場合は超過。→ 設計反映は 05 §1 と Phase 2 で（regen 素材に interlaced H.264 の比率を持たせない判断もありうる）。
 - 比率の宣言が無い素材（H.264 mp4 等）は `load` が `needsUserAction(.chooseAspect)` を返す（01 §2 の resolver は設計どおり、推測で 4:3 に倒さない）。`probe-play` は headless のため明示 4:3 を適用した事実を `aspectPolicyApplied` に記録する。
-- 音声側（`StageID.audioDecode`・underrun・drift）は**未実測**（再生線が映像のみ。#10 の残り）。
+**in-loop 音声実測（2026-11-16、#10。`make probe-play` の `audioStatus/clockDriftMS/audioUnderrunEpisodes`）**
+
+| 素材 | 音声 | 提示 | late | realTimeFactor | 提示間隔 p50 | drift p50 / p95 | underrun |
+|---|---|---|---|---|---|---|---|
+| ntsc480i-ac3-01.mpg | running（48k/2ch/lpcm16） | 180/180 | **144** | 1.0025 | 32.90 ms | **+6.9 / +10.6 ms** | 0 回 |
+| 他 10 素材 | none（音声トラックなし / DTS＝列挙されず） | 全提示 | 0〜29 | ≥0.997 | 目標一致 | — | 0 回 |
+
+- **drift は audio master clock の実測として目標帯域内**（04 §5 のデッドバンド 8 ms に対し p50 +6.9 ms、補正段階 8〜40 ms の下限帯に p95 +10.6 ms で収まる）。補正行動（present 時刻の寄せ）は Phase 2 の SyncController で、ここで作った `clockDriftMS` を原料に使う。
+- **underrun 0**（prefill 120 ms + 稼働中 150 ms 維持の供給。AC-3→PCM 変換の realtimeFactor ≈1100 が効いている）。
+- **late=144 の含义**（数値だけ見ると誤誘導なので表ごと残す）: 音声 clock が立つと提示締切は `clock.hostTime(for: pts)` になる。当経路は (a) 同一呼吸内で同期復号（MPEG-2 p50 2.6 ms）を済らせてから提示判定する、(b) 締切を 2 ms 超えて遅れたら late に数える、(c) 補正しない——ので、**drift がデッドバンド（8 ms）内に収まっていても late に大量計上される**。H.264 の 22/29 と同じ「復号が提示パスを阻塞する」構造に、clock の锚（rendered 位置は I/O quantum 単位で進む）の量子化が重なる。**修复は Phase 2 の #5/#6（PresentSchedule で復号と提示時刻を分離し、8 ms 超の drift だけを補正する）**。音声 clock 下での `late` は「閾値 2 ms に対する超過」の測定であって知覚の破綻ではない（drift 側が破綻していない）。
+- 単体契約（`AudioPathTests`）: AC-3→PCM の全 quantum ≤480 帧（max=480 で分割の証拠）/ 帧数と PTS 進みの一致 / 実仕様の初 chunk 確定。AudioClock の frame↔PTS↔host 対応と補間の非累積。DTS がトラックとして現れないこと（A6 の回帰）。e2e（`AudioPlaybackTests`）: AC-3 の drift p95 < 40 ms・underrun < 5（device がある環境）。device 無し環境は `audioStatus=failed:…` への縮退を検査（CI の macOS ランナー対策。映像線は壊れない）。
+- 留意: sink の start 失敗・drain 不発に対する安全弁（`audioDrainTimeoutMS` 既定 2 s で打ち切り、errors に記録）。
 - 留意点として **初回フレームのスパイク（44〜70 ms）**が毎セッション観測される（warmup 設計は OQ-18 / issue #12）。
