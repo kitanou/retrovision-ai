@@ -176,6 +176,13 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定（first-play 政策は PlayerViewModel。engine に意味を渡さない）**: 構造に titleNumber 0 が在るときだけ自动再生（実機の盤挿入=再生開始）。無い素材は #17 user gate 不変。menu `.ended` → 最初の本体タイトル（titleNumber 最小）へ `select(item:)`+`play()` 自動進行（phaseChanged(.ended) からのみ発火、`menuAdvancePending` ガード、selectionChanged で解除）。
 - **検査**: navigator（menu 先頭/無し/nn_0 除外）、engine e2e（items [0,1,2]・menu 完走 120/ended）、PlayerViewModelTests（auto-select+auto-play、自動進行 1 回だけ、menu 無しで自动再生しない）。Interactive menu（VMGM PGCI の PU 命令）は未実装 — メニューは video として线性再生するだけ（IFO パース増分とセットの次項。03 §9.7 限界メモ）。
 
+### 2026-11-17 — 起動時 QA 入口: RV_AUTO_OPEN / RV_DEBUG_POSITION（opt-in env）
+
+- **動機（実測環境の制約）**: 実盤 live 検証をしようとした夜、Mac はロック画面（要パスワード）で GUI 自動化が不能。RV_DEBUG_PSREPAIR / RV_DEBUG_ACTIVITY と同じ opt-in env 约定で、画面を出せない環境からも運送の数値を確認できる入口を作る。
+- **RV_AUTO_OPEN=<path>**: RootView.onAppear から `PlayerViewModel.autoOpenFromLaunchEnvironment()` を呼ぶ。設定時だけ起動時にその URL を open する（未設定では何もしない = 既定起動の不変。first-play 政策などの意味は通常の open と共有 — 政策の重複実装を作らない）。
+- **RV_DEBUG_POSITION=<any>**: PlayerViewModel の events 経路にだけ乗る stderr 診断（`rvtransport:` 行）。phase / selection は毎回、position は 1 s 粒度（フレーム毎で埋めない）。UI 側ミラーの単一更新経路（#17）の観測を写すだけで、engine の契約は変えない。
+- **検査**: auto-open の発火・未設定 noop（既定起動の意味不変）、QA 入口が first-play 政策（menu 既定選択）を通ること。実盤 live 計測はこの夜は画面ロックのため GUI 側は未実施（朝の解錠待ち）。エンジン側の実盤計測は device-gated 検査と RV_AUTO_OPEN 実行の组合せで実施。
+
 ## 意思決定の運用
 
 1. 決めたら**この表に「決定」と「日付」「根拠（実験 ID / レポート ID）」を書く**。本文の既定値は同じ commit で更新する。

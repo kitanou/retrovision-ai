@@ -157,6 +157,36 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertEqual(selects2, 1, "本体タイトルの ended で自動進行が再発火した（menu 限定のはず）")
     }
 
+    // MARK: 起動時 QA 入口（RV_AUTO_OPEN / RV_DEBUG_POSITION。opt-in env 约定）
+    //
+    // RV_AUTO_OPEN が設定されているときだけ autoOpenFromLaunchEnvironment() が open を
+    // 発火させる。first-play 政策（menu の自动選択・自动再生）は通常の open と同じ経路
+    // 共有なので、上記の政策検査がそのまま効くことを 1 検査で確認する。
+
+    func testAutoOpenFromLaunchEnvironmentUsesFirstPlayPath() async {
+        setenv("RV_AUTO_OPEN", "/tmp/qa-fake-dvd-root", 1)
+        defer { unsetenv("RV_AUTO_OPEN") }
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        XCTAssertTrue(vm.autoOpenFromLaunchEnvironment(),
+                      "RV_AUTO_OPEN 設定で open が発火しない（QA 入口の退行）")
+        await waitPhase(vm, .playing)
+        XCTAssertEqual(vm.selected?.item, ItemID(0),
+                       "QA 入口が first-play 政策（menu 既定選択）を通っていない")
+    }
+
+    func testAutoOpenIsNoopWithoutEnvironment() async {
+        unsetenv("RV_AUTO_OPEN")
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        XCTAssertFalse(vm.autoOpenFromLaunchEnvironment(),
+                       "RV_AUTO_OPEN 未設定で open が発火した（既定起動の意味変更）")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertFalse(fake.calls.contains("load"), "未設定で load まで走った")
+    }
+
     func testDVDWithoutMenuDoesNotAutoplay() async {
         let fake = FakePlayerEngine()
         fake.presetStructure = MediaStructure(itemKind: .dvdTitles, items: [

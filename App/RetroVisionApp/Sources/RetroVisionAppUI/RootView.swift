@@ -88,6 +88,8 @@ struct PlayerScreenView: View {
             let monitor = ControlsActivityMonitor { showControls() }
             monitor.start()
             activityMonitor = monitor
+            // 起動時 QA 入口（RV_AUTO_OPEN。未設定なら何もしない — 通常起動は従来どおり）。
+            model.autoOpenFromLaunchEnvironment()
         }
         .onDisappear {
             activityMonitor?.stop()
