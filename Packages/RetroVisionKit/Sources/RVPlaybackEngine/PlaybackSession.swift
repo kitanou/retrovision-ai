@@ -141,6 +141,12 @@ public actor PlaybackSession {
         videoSink = sink
     }
 
+    /// 音量（#17 の音量操作 → EngineCore 経由の転送先）。音声線が無いときは no-op
+    /// （映像のみに音量は無い。VM 側の状態だけが保たれる）。
+    public func setVolume(_ gain: Double) {
+        audio?.sink.setVolume(gain)
+    }
+
     // 音声線
     private var audioClock: AudioClock?
     private var audioCursor: AudioCursor?

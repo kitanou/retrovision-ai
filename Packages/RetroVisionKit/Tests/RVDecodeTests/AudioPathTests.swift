@@ -55,6 +55,10 @@ private final class FakeAudioSink: AudioSink, @unchecked Sendable {
     func resume() {}
     func flush() { lock.lock(); table.removeAll(); nextPosition = 0; lock.unlock() }
 
+    func setVolume(_ gain: Double) { lock.lock(); volume = gain; lock.unlock() }
+    var currentVolume: Double { lock.lock(); defer { lock.unlock() }; return volume }
+    private var volume = 1.0
+
     func schedule(_ pcm: AudioPCM) throws {
         let frames = Int64(try pcmFrameCount(pcm.buffer))
         lock.lock()

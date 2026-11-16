@@ -351,7 +351,6 @@ final class FilePlaybackTests: XCTestCase {
     }
 
     // MARK: - 4. seek（#13・OQ-23。決定的駆動）
-
     /// 実行中のセッションのまま中間 seek: 提示は重複も逆行もなく、target 以上の帧だけが続く。
     /// target 前の帧は復号して捨てる（04 §6 手順 4。dropped(.seekDiscarded) に計上）。
     /// 決定的時間源では 120 帧 = seek 前 30 + target 以降の全 90 帧がちょうど提示される。
@@ -427,5 +426,29 @@ final class FilePlaybackTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(interval, expectedMS - 2, "seek 後の提示が詰めすぎ")
             XCTAssertLessThanOrEqual(interval, expectedMS + 2, "seek 後の提示が遅れすぎ")
         }
+    }
+
+    /// seek の最中に close する競合（#2 で実測した reentrancy 不具合の回帰）。
+    /// EngineCore は actor なので seek の await 中に close が割り込める。line generation が
+    /// なければ、遅れて復帰した seek が phase を playing/ended に復活させて .empty に戻らない。
+    func testCloseDuringInFlightSeekLeavesPhaseEmpty() async throws {
+        let url = try fixtureURL("ntsc480i-22-01.mpg")
+        let engine = EngineCore()
+        try await engine.load(FileMediaSource(url: url),
+                              selection: PlaybackSelection(item: ItemID(1)))
+        await engine.play()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        let target = CMTime(seconds: 3.0, preferredTimescale: 1_000_000)
+        let seekTask = Task { await engine.seek(to: target) }
+        // seek（preroll 復号で数十 ms）が生きている窓で close をぶつける。
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        await engine.close()
+        await seekTask.value
+
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.phase, .empty,
+                       "close 後の seek 復帰が phase を復活させた（line generation ガードの後退）")
+        await engine.close()
     }
 }

@@ -84,6 +84,7 @@ public actor EngineCore {
     // MARK: 開く
 
     public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws {
+        lineGeneration &+= 1   // 古い線のイベント・in-flight 運送操作を黙らせる（下記ガード）
         transition(to: .preparing)
         self.selection = selection
         do {
@@ -110,6 +111,7 @@ public actor EngineCore {
     }
 
     public func close() async {
+        lineGeneration &+= 1   // seek 実行中に close されたら、seek 復帰後の phase 復帰を行わない
         sessionTask?.cancel()
         if let session { await session.shutdown() }
         sessionTask = nil
@@ -160,11 +162,13 @@ public actor EngineCore {
             config: config,
             time: deps.time,
             audio: audioLine,
-            report: { [weak self] event in
-                Task { await self?.handleSessionEvent(event) }
+            report: { [weak self, line = lineGeneration] event in
+                // 古い線の session が closer 後に流すイベントは無視（close/load で generation が進む）。
+                Task { await self?.handleSessionEvent(event, line: line) }
             })
         self.session = session
         if let videoSink { await session.setVideoSink(videoSink) }
+        if volumeGain != 1.0 { await session.setVolume(volumeGain) }
         self.sessionRunning = false
     }
     /// 保持する提示サーフェス（OQ-26）。セッション再生成（トラック切替・item 切替）で貼り直す。
@@ -217,6 +221,7 @@ public actor EngineCore {
     public func seek(to time: MediaTime, tolerance: SeekTolerance = .default) async {
         guard phase == .playing || phase == .paused else { return }
         let resumeTo = phase
+        let myGen = lineGeneration
         transition(to: .seeking(target: time))
         position = time   // プログレスは目標位置を表示（04 §6）
         lastPositionEmitSeconds = nil   // 後方 seek でも位置イベントが再開される
@@ -231,6 +236,9 @@ public actor EngineCore {
                 await session?.prepare()
             }
         }
+        // session.seek の最中に close / 別 load が入っていたら、この seek は線の外側。
+        // phase を触らずに黙って終る（actor の reentrancy で close が先に .empty へ進んでいる）。
+        guard lineGeneration == myGen else { return }
         transition(to: resumeTo)
     }
 
@@ -242,6 +250,19 @@ public actor EngineCore {
     public func setRate(_ rate: Double) async {
         // 1.0 以外はまだサポートしない（OQ-09）。
     }
+
+    /// 音量（0.0〜1.0、線形）。#17 の音量スライダーの受け口。保持してセッション再生成
+    /// （トラック・item 切替）でも引き継ぐ。音声線の無い素材では no-op（VM 側の状態だけ保つ）。
+    public func setVolume(_ gain: Double) async {
+        volumeGain = min(max(gain, 0.0), 1.0)
+        await session?.setVolume(volumeGain)
+    }
+    private var volumeGain = 1.0
+
+    /// 再生線の generation（#13 のセッション内ガードの engine 側対応。actor の reentrancy で
+    /// close/load と in-flight の seek が交差すると、遅れて復帰した seek が phase を復活させる。
+    /// 線の切り替えで同期インクリメントし、線の外側になった操作とイベントは黙る）。
+    private var lineGeneration = 0
 
     // MARK: 選択・設定
 
@@ -318,7 +339,8 @@ public actor EngineCore {
         pipeline = (await fileSource.makeDemuxer(), track.id, videoFormat, audioTrack, audioFormat)
     }
 
-    private func handleSessionEvent(_ event: PlaybackSession.Event) async {
+    private func handleSessionEvent(_ event: PlaybackSession.Event, line: Int) async {
+        guard line == lineGeneration else { return }   // 古い線の closer（close/load 済み）
         switch event {
         case .position(let pts):
             position = pts

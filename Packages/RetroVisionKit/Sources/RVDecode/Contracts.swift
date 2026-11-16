@@ -213,6 +213,9 @@ public protocol AudioSink: Sendable {
     func pause()
     func resume()
     func flush()
+    /// 出力ゲイン（0.0〜1.0 の線形値）。再生位置・対応表・クロックを変えない。
+    /// UI の音量操作从这里受ける（#17 の音量スライダー。`PlayerEngine.setVolume` が転送する）。
+    func setVolume(_ gain: Double)
     /// 先に積む。内部で (framePosition, startPTS) の対応表を持つ（04 §5 の clock 原料）。
     func schedule(_ pcm: AudioPCM) throws
     /// 積んでいる残余（ms）。underrun 検出と prefill 制御の材料（04 §9 の「音声の underrun」）。

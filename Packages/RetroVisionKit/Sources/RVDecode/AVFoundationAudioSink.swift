@@ -97,6 +97,12 @@ public final class AVFoundationAudioSink: AudioSink, @unchecked Sendable {
         resetTable()
     }
 
+    /// 音量は player node のゲインだけ触る（AVAudioPlayerNode.volume はスレッド安全。
+    /// 対応表・クロック・再生位置に影響しない = pause と同じ非侵襲性）。
+    public func setVolume(_ gain: Double) {
+        player.volume = Float(min(max(gain, 0.0), 1.0))
+    }
+
     public func schedule(_ pcm: AudioPCM) throws {
         let buffer = pcm.buffer
         guard let format = CMSampleBufferGetFormatDescription(buffer),

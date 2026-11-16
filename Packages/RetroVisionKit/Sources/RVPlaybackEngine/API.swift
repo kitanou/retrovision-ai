@@ -138,6 +138,9 @@ public protocol PlayerEngine: AnyObject {
     func seek(to time: MediaTime, tolerance: SeekTolerance) async
     func step(_ direction: StepDirection) async
     func setRate(_ rate: Double) async
+    /// 音量（0.0〜1.0、線形。#17 の音量スライダー）。phase を変えない（INV-3 と同じ非侵襲性）。
+    /// 音声線の無い素材では no-op だが、UI の状態は保持される（決定ログ #14）。
+    func setVolume(_ gain: Double) async
 
     func select(_ track: TrackID, for kind: TrackKind) async
     func select(item: ItemID) async
