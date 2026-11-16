@@ -122,8 +122,10 @@ public final class MetalRenderGraph: @unchecked Sendable {
         timing.colorAssumptionApplied = constants.assumptionApplied
 
         let stageBegan = ContinuousClock.now
+        let wantsHighQuality = (plan.stage(of: .scale)?.parameters as? ScaleParameters)?.filter == .highQuality
         try encodeColorConvert(constants: constants, aspect: input.aspect,
-                              y: yTex, uv: uvTex, target: target, command: command)
+                              y: yTex, uv: uvTex, target: target, command: command,
+                              highQualityScale: wantsHighQuality)
         timing.stageEncodeMS.append((.colorConvert, msSince(stageBegan)))
 
         // 完了処理: pool 返却と CVMetalTexture の flush（GPU 使用後）。
@@ -287,11 +289,8 @@ public final class MetalRenderGraph: @unchecked Sendable {
                                    aspect: AspectResolution,
                                    y: any MTLTexture, uv: any MTLTexture,
                                    target: any MTLTexture,
-                                   command: any MTLCommandBuffer) throws {
-        let pso = try context.renderPipeline(vertex: "rv_vs_fullscreen",
-                                             fragment: "rv_colorConvert_v1",
-                                             colorFormat: target.pixelFormat,
-                                             label: "colorConvert_v1")
+                                   command: any MTLCommandBuffer,
+                                   highQualityScale: Bool = false) throws {
         var p = ColorParams()
         p.m = (matrix.m[0], matrix.m[1], matrix.m[2],
                matrix.m[3], matrix.m[4], matrix.m[5],
@@ -301,6 +300,15 @@ public final class MetalRenderGraph: @unchecked Sendable {
                                targetWidth: target.width, targetHeight: target.height)
         p.sourceRect = geo.source
         p.destRect = geo.dest
+        // highQuality（bicubic）は拡大時だけ: 出力側の画素数が取り込み域より多いとき。縮小は linear。
+        let srcPixelsW = Double(geo.source.2) * Double(y.width)
+        let dstPixelsW = Double(geo.dest.2) * Double(target.width)
+        let upscaling = dstPixelsW > srcPixelsW * 1.01
+        let useBicubic = highQualityScale && upscaling
+        let pso = try context.renderPipeline(vertex: "rv_vs_fullscreen",
+                                             fragment: useBicubic ? "rv_colorConvert_bicubic_v1" : "rv_colorConvert_v1",
+                                             colorFormat: target.pixelFormat,
+                                             label: useBicubic ? "colorConvert_bicubic_v1" : "colorConvert_v1")
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target

@@ -63,6 +63,53 @@ fragment float4 rv_colorConvert_v1(const VSOut in [[stage_in]],
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
 }
 
+// ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
+//
+// 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。
+// chroma は 4:2:0 で元々低解像なので linear のまま（bicubic にしても見た目が変わらず tap だけ増える）。
+// overshoot は clamp(0,1) で抑える。縮小時は host 側が linear を選ぶ（bicubic は折り返しを強めるため）。
+
+static float4 rv_catmullRomWeights(float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return float4(-0.5 * t3 + t2 - 0.5 * t,
+                  1.5 * t3 - 2.5 * t2 + 1.0,
+                  -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+                  0.5 * t3 - 0.5 * t2);
+}
+
+fragment float4 rv_colorConvert_bicubic_v1(const VSOut in [[stage_in]],
+                                           constant ColorParams& p [[buffer(0)]],
+                                           texture2d<float> yTex [[texture(0)]],
+                                           texture2d<float> uvTex [[texture(1)]],
+                                           sampler s [[sampler(0)]]) {
+    float2 q = (in.uv - p.destRect.xy) / p.destRect.zw;
+    float2 suv = p.sourceRect.xy + q * p.sourceRect.zw;
+    float2 size = float2(yTex.get_width(), yTex.get_height());
+    float2 pos = suv * size - 0.5;
+    float2 base = floor(pos);
+    float2 f = pos - base;
+    float4 wx = rv_catmullRomWeights(f.x);
+    float4 wy = rv_catmullRomWeights(f.y);
+    int2 maxC = int2(size) - 1;
+    float acc = 0.0;
+    for (int j = 0; j < 4; j++) {
+        float row = 0.0;
+        for (int i = 0; i < 4; i++) {
+            int2 c = clamp(int2(base) + int2(i - 1, j - 1), int2(0), maxC);
+            row += wx[i] * yTex.read(uint2(c)).r;
+        }
+        acc += wy[j] * row;
+    }
+    float y = clamp(acc, 0.0, 1.0);
+    float2 cbcr = uvTex.sample(s, suv).rg;
+    float3 ycb = float3(y, cbcr.x, cbcr.y);
+    float3 rgb;
+    rgb.r = dot(float3(p.m[0], p.m[1], p.m[2]), ycb) + p.b[0];
+    rgb.g = dot(float3(p.m[3], p.m[4], p.m[5]), ycb) + p.b[1];
+    rgb.b = dot(float3(p.m[6], p.m[7], p.m[8]), ycb) + p.b[2];
+    return float4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+
 // ---------- deinterlace: bob（safe 側。各 field を full height へ） ----------
 // 入力: r8(Y, WxH), rg8(UV, W/2 x H/2)（weave 済み: 走査線が field 交互）。
 // 出力: 同じ寸法の progressive Y/UV。topFieldFirst=true: 符号列 0 = 上 field。

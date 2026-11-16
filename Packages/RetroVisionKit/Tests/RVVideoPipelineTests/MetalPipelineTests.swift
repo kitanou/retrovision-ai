@@ -354,6 +354,46 @@ final class MetalPipelineTests: XCTestCase {
         XCTAssertLessThan(Int(moving[4][10].r), 110)
     }
 
+    // MARK: - 5c. highQuality スケール（拡大時は bicubic。エッジが bilinear より鋭い）
+
+    private func renderStepEdge(filter: ScaleParameters.ScaleFilter, targetSize: Int) throws -> [UInt8] {
+        let w = 16, h = 16
+        let pb = try makeNV12(width: w, height: h,
+                              luma: { _ in (0..<w).map { $0 < w / 2 ? 40 : 200 } },
+                              chroma: { _ in [UInt8](repeating: 128, count: w) })
+        let input = progressiveInput(pb, width: w, height: h)
+        let target = try makeTarget(width: targetSize, height: targetSize)
+        let plan = RenderPlan(id: PlanID(6), tier: .metalOnly,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters()),
+                                       .init(stage: .scale, parameters: ScaleParameters(filter: filter))],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(targetSize), height: Int32(targetSize)),
+                                                     aspect: input.aspect, present: .offscreen))
+        _ = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        return readBack(target)[targetSize / 2].map(\.r)
+    }
+
+    func testHighQualityScaleSharpensEdgesWhenUpscalingOnly() throws {
+        guard gpuGate() else { return }
+        // 16 → 64 の拡大（4 倍）。遷移幅 = 暗側 10% 〜 明側 90% の間に居る画素数。
+        func transitionWidth(_ row: [UInt8]) -> Int {
+            let lo = Int(row.first ?? 0), hi = Int(row.last ?? 0)
+            let a = lo + (hi - lo) / 10, b = hi - (hi - lo) / 10
+            return row.filter { Int($0) > a && Int($0) < b }.count
+        }
+        let linear = try renderStepEdge(filter: .bilinear, targetSize: 64)
+        let cubic = try renderStepEdge(filter: .highQuality, targetSize: 64)
+        XCTAssertLessThan(transitionWidth(cubic), transitionWidth(linear),
+                          "拡大時の highQuality は bilinear よりエッジが鋭い（遷移幅が狭い）はず")
+        // 縮小（16 → 8）では highQuality でも linear と同じ経路（bicubic は使わない）。
+        let linearDown = try renderStepEdge(filter: .bilinear, targetSize: 8)
+        let cubicDown = try renderStepEdge(filter: .highQuality, targetSize: 8)
+        XCTAssertEqual(linearDown, cubicDown, "縮小は filter に関わらず同じ（linear）")
+        // 平坦部は変えない（overshoot を clamp で抑えても、元の暗/明の値が保たれる）。
+        XCTAssertEqual(Int(cubic.first ?? 0), Int(linear.first ?? 0), accuracy: 2)
+        XCTAssertEqual(Int(cubic.last ?? 0), Int(linear.last ?? 0), accuracy: 2)
+    }
+
     // MARK: - 6. field 間 SAD（05 §5.1 detector の土台。kernel 直接）
 
     func testFieldMatchSADProducesKnownDifference() throws {

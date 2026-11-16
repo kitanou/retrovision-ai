@@ -233,3 +233,9 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定**: `EngineCore` が位置イベント（提示のたび）を契機に、窓（`controller.config.windowMS` = 2 s）が満ちたときだけ評価する。専用タイマーは持たない。窓の `FrameStats` は session の累積 stats の差分（`windowedStats`。session 再生成で累積が戻っても負にせず 0 に丸め、新 session では窓を取り直す）。thermal は `ProcessInfo.thermalState` を写像。窓が満ちるまで session に触れない（提示のたびの呼び出しを安く保つ）。evaluate の action は `applyControlActions` へ。
 - **未接続の信号（既定値のまま）**: memory pressure（normal）、modelBreakerOpen（false。A2 の runtime と `ModelHealthTracker` が載るまで）、presentJitterMS（0。`MetalPresenter.onPresented` の集計が載るまで）、endToEnd の p95（0）。このため現状 AI 段が無い構成では tier は metalOnly のままで、action は実質発火しない。ベンチマークレポート・品質インジケータ UI・負荷注入テストも未実装。
 
+### 2026-11-17 — #5 A1c: highQuality スケール（bicubic。拡大時のみ）
+
+- **決定**: `ScaleFilter.highQuality`（plan の既定）は、**拡大時**（出力側の画素数 > 取り込み域 × 1.01）だけ `rv_colorConvert_bicubic_v1`（輝度 4x4 tap の Catmull-Rom、overshoot は clamp(0,1)）を使い、縮小・等倍は従来の linear。chroma は 4:2:0 で元々低解像なので linear のまま。bicubic は縮小時に折り返しを強めるため使わない。
+- **検査**: 16→64 の階段エッジで遷移幅が bilinear より狭いこと、16→8 の縮小では filter に関わらず同一出力、平坦部が保たれること（`MetalPipelineTests`）。
+- **未実施**: 実素材での画質評価（リンギングの主観評価・Lanczos 等との比較は 07 の評価に置く）、GPU 時間の実測（G2）。
+
