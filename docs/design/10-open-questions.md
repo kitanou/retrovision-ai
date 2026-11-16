@@ -131,6 +131,17 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **fixture**: `Scripts/gen-dvd-fixture.sh`（母素材 ntsc480i-ac3-01.mpg を pack 境界・セクタ境界で 2 分割 → VTS_01_1/2.VOB + 単一 VTS_02 + 0 バイト IFO/BUP + `hdiutil makehybrid` ISO）。`make gen-fixtures` の末尾に接続。マニフェストには derived fixture として**母素材の sha256 を記録**（ISO/VOB の再生成は非決定的。内容の integrity は母素材側で担保 — OQ-21 の約束の延伸）。`hdiutil makehybrid -quiet` は失敗理由を隠して exit 1（実測。付けない）。
 - 新規 API 面の気づき（CLAUDE.md 収集方針）: `diskutil image attach` の stdout はタブ区切り（テキスト解析はもたない。`--plist` は `diskutil image --plist <subcommand>` の位置で効く）。`FileHandle` の Swift イニシャライザは現 SDK で `init(forReadingFrom:)/init(forWritingTo:)`（`forReadingAt:` は無い）。AVAssetReader の `timeRange` は sample pts の逐語比較で選ぶ（seek 着地に境界 marker が 1 本混ざる意味論は #13 と同一）。AVMutableComposition の track `timeRange.duration` は符号順末尾の無データ marker を含む（挿入範囲を実測終端で切る設計は不採用＝連結方式の変更で消滅）。
 
+### 2026-11-17 — タイトル切り替え（#3 追加分）の実装決定（実測は 03 §9.6 に反映）
+
+- **実運用で境界が顕在化した**: ユーザーの実 DVD ISO がアプリで開けて再生できたが「おそらく最初のチャプターのみ」と報告された。v1 の設計境界（全タイトルを列挙するが engine は ItemID(1) を選ぶだけ・切り替え UI 未実装）そのもの。優先度を上げる実測として受け、同日増分化した。
+- **切り替えの意味論は「同じ source の再 load」**: `EngineCore.select(item:)` は lineGeneration を進め、旧 session を stop し、新しい item へ配線し直して warmup → `.preparing → .ready`。position は 0（`positionUpdated(.zero)` が単一の初期化経路）。再生の自動継続はせず停止で止まる（v1。autoplay 継続は増分として保留）。
+- **items.first 固定を selectedItem() に置換**（実測された不具合の修正）: snapshot の duration / available、seek と position の duration イベント、rebuildPlan、tracksChanged が選択 item に従うようになった。「2 本目に切り替えても UI の duration が 1 本目のまま」という実測が根拠。
+- **source の open は冪等**: VideoTsMediaSource は構造/demuxer、DiscImageMediaSource はマウントを cache。理由の実測: 再 open での再 probe は多重 VOB の再連結コピー（GB 級）をやり直す。attached の ISO を再度 `diskutil image attach` すると「〜 1」付きの別マウントが増える。demuxer の同一实例契約（track id 対応）は open をまたいても保つことを検査で固定。
+- **load が旧 session を止める**（潜在バグの修正）: 以前は 2 回目の load で旧 session が止められていなかった（ファイルを連続で開いても同じ）。
+- **選択も events 由来**: load で `selectionChanged` を送る（タイトルメニューの現在選択が単一経路で更新される）。FakePlayerEngine は実 engine と同じ順序（structureChanged → tracksChanged → selectionChanged → positionUpdated(.zero) → ready）で流す。
+- **fixture を判别可能にした**: VTS_02_1.VOB を別素材（truncated-01.mpg 複製・4.04 s）に変更。単一 MPEG の機械スライスだと 2 タイトルの sample 数が近く、e2e が切り替えを数値で区別できなかった（設計上の落ち度。実測で発覚）。実測値: VTS_02 raw total=122 / valid=120 / lastPTS 3.971 s、engine 経由 demux 120 / 提示 120（0 長 marker 2 件は demux 縁の間引き = OQ-23 と同一の意味論）。タイトル 1 の 180 と明確に区別でき、`testTitleSwitchPlaysSecondTitle` が 120/120 で兼実測固定。
+- **UI**: transport バーに「映像タイトル」メニュー（multi-item 構造のときだけ表示）。選択は engine に `select(item:)` を投げるだけで、表示は events からのみ更新される（#17 の単一経路原則）。単一項目 source ではメニューが出ないことを fake 検査で固定。
+
 
 ## 意思決定の運用
 
