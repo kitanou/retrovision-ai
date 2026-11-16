@@ -239,3 +239,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査**: 16→64 の階段エッジで遷移幅が bilinear より狭いこと、16→8 の縮小では filter に関わらず同一出力、平坦部が保たれること（`MetalPipelineTests`）。
 - **未実施**: 実素材での画質評価（リンギングの主観評価・Lanczos 等との比較は 07 の評価に置く）、GPU 時間の実測（G2）。
 
+### 2026-11-17 — #8 A3: 非 AI（metalGuided）ノイズ除去を graph に実装
+
+- **決定**: `MetalRenderGraph` が plan の `.denoise` 段を実行する（deinterlace の後・colorConvert の前）。強さは `LumaChromaDenoiseRequest.metalDenoiseStrength`（RVVideoPipeline 側の最小契約。`DenoiseParameters` が metalGuided のときだけ適合値を返す — RVVideoPipeline は RVEnhancement に依存できないため）。learned 実装（ML 段）は nil で、この段は実行しない。強さ 0 は段を実行せず恒等。
+- **アルゴリズム**: 輝度は 5x5 の bilateral（空間重み × 値差重み。値差の sigma は `mix(0.01, 0.12, strength)`、輝度 [0,1] 正規化）、色は 3x3 の bilateral。強い edge（字幕・線画・顔の輪郭）は値差が sigma の数倍で平均に入らず保たれ、小振幅の揺らぎ（ブロック・粒子・色ノイズ）だけが均される。temporal blend は前 *出力* が要るため v1 に入れない（ghost 回避）。
+- **検査**: ±8 の市松ノイズ領域の振れ幅が半分未満に均され、強い edge の暗側・明側が保たれること、strength 0 は恒等であること（`MetalPipelineTests`）。
+- **未実施**: 実素材での評価（顔・アニメ線画・粒子を塗り潰さないかの主観評価、before/after キャプチャ — 07 §7）、protect / targets の実際の反映（現状は strength のみ）、GPU 時間の実測、UI からの強度操作の配線。
+

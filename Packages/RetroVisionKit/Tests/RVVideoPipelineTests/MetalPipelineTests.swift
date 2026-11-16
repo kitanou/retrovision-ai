@@ -394,6 +394,50 @@ final class MetalPipelineTests: XCTestCase {
         XCTAssertEqual(Int(cubic.last ?? 0), Int(linear.last ?? 0), accuracy: 2)
     }
 
+    // MARK: - 5d. 非 AI denoise（エッジ保存。小振幅の揺らぎは均し、強い edge は保つ）
+
+    private struct TestDenoise: LumaChromaDenoiseRequest {
+        var metalDenoiseStrength: Double?
+        var canonicalForm: String { "test-denoise=\(metalDenoiseStrength ?? -1)" }
+    }
+
+    private func renderNoisyEdge(strength: Double?) throws -> [[UInt8]] {
+        let w = 32, h = 32
+        // 左半分: 128 を中心に ±8 の市松ノイズ。右半分: 平坦な 220（x=16 に強い edge）。
+        let pb = try makeNV12(width: w, height: h,
+                              luma: { row in
+            (0..<w).map { x in x < 16 ? ((x + row) % 2 == 0 ? UInt8(120) : UInt8(136)) : UInt8(220) }
+        }, chroma: { _ in [UInt8](repeating: 128, count: w) })
+        let input = progressiveInput(pb, width: w, height: h)
+        var stages: [StageRequest] = [.init(stage: .colorConvert, parameters: ColorConvertParameters())]
+        if let strength { stages.insert(.init(stage: .denoise, parameters: TestDenoise(metalDenoiseStrength: strength)), at: 0) }
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(8), tier: .lightML, stages: stages,
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        XCTAssertEqual(timing.denoiseApplied, (strength ?? 0) > 0)
+        drainGPU()
+        return readBack(target).map { $0.map(\.r) }
+    }
+
+    func testMetalGuidedDenoiseSmoothsNoiseButKeepsStrongEdges() throws {
+        guard gpuGate() else { return }
+        func noiseRange(_ px: [[UInt8]]) -> Int {   // 平坦なノイズ領域（edge から離れた x 4...10）の振れ幅
+            let vals = (8...24).flatMap { y in (4...10).map { x in Int(px[y][x]) } }
+            return (vals.max() ?? 0) - (vals.min() ?? 0)
+        }
+        let off = try renderNoisyEdge(strength: nil)
+        let zero = try renderNoisyEdge(strength: 0)
+        let on = try renderNoisyEdge(strength: 0.8)
+        XCTAssertEqual(noiseRange(zero), noiseRange(off), "strength 0 は恒等（段を実行しない）")
+        XCTAssertLessThan(noiseRange(on), noiseRange(off) / 2, "ノイズ領域の振れ幅が半分未満に均される")
+        // 強い edge は保たれる: 暗側（x=12）は暗いまま、明側（x=20）は明るいまま。
+        let y = 16
+        XCTAssertLessThan(Int(on[y][12]), 150, "暗側が edge を越えて明るくならない")
+        XCTAssertGreaterThan(Int(on[y][20]), 190, "明側が edge を越えて暗くならない")
+    }
+
     // MARK: - 6. field 間 SAD（05 §5.1 detector の土台。kernel 直接）
 
     func testFieldMatchSADProducesKnownDifference() throws {

@@ -134,6 +134,13 @@ public struct ColorConvertParameters: StageParameters, Sendable {
     public var canonicalForm: String { "assume601=\(assumeBT601WhenUnstated)" }
 }
 
+/// 非 AI（Metal）のノイズ除去段が graph に渡す最小の契約。`DenoiseParameters`（RVEnhancement）が
+/// 適合する — RVVideoPipeline は RVEnhancement に依存できない（依存方向）ので、graph が読む
+/// 値だけをここで受ける。nil / 0 は「この段を実行しない」（learned 実装は ML 段が担当する）。
+public protocol LumaChromaDenoiseRequest: StageParameters {
+    var metalDenoiseStrength: Double? { get }
+}
+
 public struct ScaleParameters: StageParameters, Sendable {
     public var filter: ScaleFilter
     public init(filter: ScaleFilter = .highQuality) { self.filter = filter }

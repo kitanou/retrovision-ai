@@ -110,6 +110,62 @@ fragment float4 rv_colorConvert_bicubic_v1(const VSOut in [[stage_in]],
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
 }
 
+// ---------- denoise: metalGuided（非 AI。エッジ保存の空間フィルタ。07 §3） ----------
+//
+// 輝度: 5x5 の bilateral（空間重み × 値差の重み）。値差の sigma を strength で決めるので、
+// 強い edge（字幕・線画・顔の輪郭）は値差が大きく平均に入らず保たれ、ブロックノイズ・粒子の
+// ような小振幅の揺らぎだけが均される。strength 0 は恒等。
+// 色: 3x3 の bilateral（chroma noise・色の滲み。小振幅のみ均す）。
+// 時間方向（temporal blend）は前 *出力* が要るため v1 には入れない（ghost を避ける）。
+
+kernel void rv_denoise_metalGuided_v1(texture2d<float, access::read>  inY  [[texture(0)]],
+                                      texture2d<float, access::read>  inUV [[texture(1)]],
+                                      texture2d<float, access::write> outY [[texture(2)]],
+                                      texture2d<float, access::write> outUV [[texture(3)]],
+                                      constant float& strength [[buffer(0)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    int w = int(outY.get_width());
+    int h = int(outY.get_height());
+    int x = int(gid.x), y = int(gid.y);
+    if (x < w && y < h) {
+        float c = inY.read(gid).r;
+        float sigmaR = mix(0.01, 0.12, strength);   // 値差の許容（輝度 [0,1]）。強いほど大きい振幅まで均す
+        float acc = 0.0, wsum = 0.0;
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int sx = clamp(x + dx, 0, w - 1), sy = clamp(y + dy, 0, h - 1);
+                float v = inY.read(uint2(sx, sy)).r;
+                float ds = float(dx * dx + dy * dy);
+                float dv = v - c;
+                float wgt = exp(-ds / 4.5) * exp(-(dv * dv) / (2.0 * sigmaR * sigmaR));
+                acc += wgt * v;
+                wsum += wgt;
+            }
+        }
+        outY.write(float4(acc / max(wsum, 1e-6), 0.0, 0.0, 1.0), gid);
+    }
+    int cw = int(outUV.get_width());
+    int ch = int(outUV.get_height());
+    if (x < cw && y < ch) {
+        float2 c = inUV.read(gid).rg;
+        float sigmaC = mix(0.01, 0.12, strength);
+        float2 acc = float2(0.0);
+        float wsum = 0.0;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int sx = clamp(x + dx, 0, cw - 1), sy = clamp(y + dy, 0, ch - 1);
+                float2 v = inUV.read(uint2(sx, sy)).rg;
+                float2 d = v - c;
+                float wgt = exp(-float(dx * dx + dy * dy) / 2.0) * exp(-dot(d, d) / (2.0 * sigmaC * sigmaC));
+                acc += wgt * v;
+                wsum += wgt;
+            }
+        }
+        float2 o = acc / max(wsum, 1e-6);
+        outUV.write(float4(o.x, o.y, 0.0, 1.0), gid);
+    }
+}
+
 // ---------- deinterlace: bob（safe 側。各 field を full height へ） ----------
 // 入力: r8(Y, WxH), rg8(UV, W/2 x H/2)（weave 済み: 走査線が field 交互）。
 // 出力: 同じ寸法の progressive Y/UV。topFieldFirst=true: 符号列 0 = 上 field。
