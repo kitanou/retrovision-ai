@@ -118,6 +118,17 @@ public protocol Demuxer: Sendable {
     func samples(for track: TrackID) async -> AsyncThrowingStream<CompressedSample, any Error>
     func seek(to target: MediaTime, tolerance: SeekTolerance) async throws -> SeekEffect
     var streamInfo: ProbedStream { get async }
+    /// 明示的な資源解除（03 §1 の MediaSource.close と対の契約。#3 終了後始末）。
+    /// SegmentPSDemuxer の修復写し temp のように「ファイルを作る」demux がある —
+    /// deinit 時点まかせでは終了処理に間に合わない（実測 2026-11-17: close→reply→
+    /// process exit の順で actor の async deinit が走る前に終り、temp が残った）。
+    /// 資源を持たない demux（AVFoundationDemuxer など）は既定の no-op。
+    func close() async
+}
+
+public extension Demuxer {
+    /// 資源を持たない demux の既定。
+    func close() async {}
 }
 
 public enum DecodePath: String, Sendable, CaseIterable { case videoToolbox, software }

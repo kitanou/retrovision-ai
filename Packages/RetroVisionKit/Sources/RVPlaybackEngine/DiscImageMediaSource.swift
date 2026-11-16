@@ -68,7 +68,7 @@ public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
     /// 開いた取扱いを持つと eject が失敗する — 実測で降ろしてから eject の順に固定）。
     public func close() async {
         if let internalSource {
-            await internalSource.releaseDemuxers()
+            await internalSource.close()   // 修復写しの削除を含む（Demuxer.close 伝搬）
         }
         if let device = mountedDevice {
             await Self.detach(device)

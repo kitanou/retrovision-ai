@@ -475,6 +475,68 @@ final class SegmentPSDemuxerTests: XCTestCase {
                        "continuation の明示時刻 sample が届かない（修復の適用が不正）")
     }
 
+    // MARK: - 8. demux の明示解除（Demuxer.close 契約。#3 終了後始末）
+    //
+    // 修復写し temp は deinit の時点まかせにしない — 実測 2026-11-17: アプリ終了の
+    // close→reply→process exit 順で actor の deinit が走る前に終り、430 MB の temp が
+    // 残った（unmount は同期経路なので走る）。close で消えること、close 後の再 probe で
+    // 壊れないこと（作り直し）をここで固定する。
+
+    func testDemuxerCloseRemovesRepairTemps() async throws {
+        let base = try singleURL("ntsc480i-ac3-01.mpg")
+        let data = try Data(contentsOf: base)
+        let cut = data.count * 9 / 10
+        // §6 と同じ生成（後方へ倒した tail。実測の最低値から +0.67 s を床に round-trip
+        // を作る — 検出は §6 の検査に任せ、ここは資源解除だけをみる）。
+        var minRawAfterCut = Int64(UInt64.max / 4)
+        data.withUnsafeBytes { rawBuf in
+            let buf = UnsafeRawBufferPointer(rawBuf)
+            for f in ProgramStreamRepair.timestampFields(in: buf) where f.at >= cut {
+                minRawAfterCut = min(minRawAfterCut, ProgramStreamRepair.timestampValue(buf, at: f.at))
+                if f.hasDTS { minRawAfterCut = min(minRawAfterCut, ProgramStreamRepair.timestampValue(buf, at: f.at + 5)) }
+            }
+        }
+        let shiftBack: Int64 = -(minRawAfterCut - 60_000)
+        var targets: [(at: Int, hasDTS: Bool)] = []
+        data.withUnsafeBytes { rawBuf in
+            targets = ProgramStreamRepair.timestampFields(in: UnsafeRawBufferPointer(rawBuf)).filter { $0.at >= cut }
+        }
+        var bytes = [UInt8](data)
+        for f in targets {
+            ProgramStreamRepair.applyWriteShift(&bytes, local: f.at, delta: shiftBack)
+            if f.hasDTS { ProgramStreamRepair.applyWriteShift(&bytes, local: f.at + 5, delta: shiftBack) }
+        }
+        let sourceFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rv-close-temp-src-\(UUID().uuidString).mpg")
+        try Data(bytes).write(to: sourceFile)
+        defer { try? FileManager.default.removeItem(at: sourceFile) }
+
+        // temp 名の差分で見る（並行テスト・既存ファイルとの混同を避ける）。
+        func psfixTemps() -> Set<String> {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: FileManager.default.temporaryDirectory.path)) ?? []
+            return Set(names.filter { $0.hasPrefix("retrovision-psfix-") })
+        }
+        let before = psfixTemps()
+
+        let segment = SegmentPSDemuxer(partURLs: [sourceFile])
+        _ = try await segment.probe()
+        let created = psfixTemps().subtracting(before)
+        XCTAssertEqual(created.count, 1, "shifted tail で修復写しで作成が発生しない（fixture の退行）")
+
+        await segment.close()
+        let afterClose = created.intersection(psfixTemps())
+        XCTAssertTrue(afterClose.isEmpty,
+                      "demuxer.close で修復写しが消えない（終了処理が deinit の時点に依存する契約に戻る）")
+
+        // close 後の再 probe は作り直しで成立する（cache を落とす意味論）。
+        let probedAgain = try await segment.probe()
+        XCTAssertTrue(probedAgain.warnings.contains { $0.code == .ptsRestartRepaired },
+                      "close 後の再 probe で連鎖が成立しない（close が素材を壊している）")
+        await segment.close()
+        let leftover = psfixTemps().subtracting(before)
+        XCTAssertTrue(leftover.isEmpty, "2 回目の close で修復写しが残る")
+    }
+
     // MARK: - 7. ProgramStreamRepair の計算（合成バイト列で決定的 + 実ファイルの符号化形）
 
     private func packHeader(stuffing: UInt8 = 0) -> [UInt8] {

@@ -51,9 +51,25 @@ public actor SegmentPSDemuxer: Demuxer, PCMSampleSource {
 
     deinit {
         // 修復コピーの後始末（open 経路が中断した場合も含む。09 §4 の一時素材方針）。
+        // 通常の解除は下の close()（明示契約）で済む — deinit は actor で非同期かつ
+        // process 終末では走らないため、当てにしている側（source・engine）は close を呼ぶ。
         for temp in repairTemps {
             try? FileManager.default.removeItem(at: temp)
         }
+    }
+
+    /// 資源の明示解除（RVDecode.Contracts の Demuxer.close 契約）。修復写しをここで
+    /// **同期的に**消す（実測 2026-11-17: 終了処理の close→exit 順では actor の
+    /// deinit が走る前に process が終り、430 MB の temp が残った）。close 後の
+    /// probe/samples は ensureParts で作り直しになる（cache を落とす）。
+    public func close() async {
+        let temps = repairTemps
+        repairTemps = []
+        for temp in temps {
+            try? FileManager.default.removeItem(at: temp)
+        }
+        parts = nil
+        mergedInfo = nil
     }
 
     public var streamInfo: ProbedStream {
