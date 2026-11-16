@@ -238,6 +238,7 @@ public actor EngineCore {
                 Task { await self?.handleSessionEvent(event, line: line) }
             })
         self.session = session
+        adaptiveWindowStart = nil   // 新 session は累積 stats が 0 から始まる（窓を取り直す）
         expectedPositionGeneration = await session.currentSeekGeneration   // 新 session: 生成時点の世代から受理
         if let videoPresenter { await session.setVideoPresenter(videoPresenter) }
         else if let videoSink { await session.setVideoSink(videoSink) }
@@ -399,6 +400,72 @@ public actor EngineCore {
         }
     }
 
+    // MARK: 適応制御の窓評価（08 §3・§4。信号の生成と controller への配線）
+    //
+    // 位置イベント（提示のたび）を契機に、窓（既定 2 s）が満ちたときだけ評価する。専用タイマーを
+    // 持たない（再生線と同じ流れの中で完結し、止まっている間は評価しない）。窓の FrameStats は
+    // session の累積値の差分。thermal は ProcessInfo、memory pressure / breaker / present jitter は
+    // 供給元（A2 の runtime、MetalPresenter.onPresented）が載るまで既定値（normal / false / 0）。
+
+    private var adaptiveWindowStart: ContinuousClock.Instant?
+    private var adaptiveLastStats = FrameStats()
+
+    /// 累積 stats の窓差分（session 再生成などで累積が戻った場合は負にせず 0 に丸める）。
+    static func windowedStats(previous: FrameStats, current: FrameStats) -> FrameStats {
+        func delta(_ now: Int, _ before: Int) -> Int { max(0, now - before) }
+        var reasons: [DropReason: Int] = [:]
+        for (reason, count) in current.dropReasons {
+            let d = delta(count, previous.dropReasons[reason] ?? 0)
+            if d > 0 { reasons[reason] = d }
+        }
+        let presented = delta(current.presented, previous.presented)
+        let dropped = delta(current.dropped, previous.dropped)
+        return FrameStats(total: presented + dropped, presented: presented, dropped: dropped,
+                          late: delta(current.late, previous.late),
+                          enhancementSkipped: delta(current.enhancementSkipped, previous.enhancementSkipped),
+                          dropReasons: reasons)
+    }
+
+    static func thermalState(from state: ProcessInfo.ThermalState) -> ThermalState {
+        switch state {
+        case .nominal: .nominal
+        case .fair: .fair
+        case .serious: .serious
+        case .critical: .critical
+        @unknown default: .nominal
+        }
+    }
+
+    private func evaluateAdaptiveWindowIfDue(thermal: ThermalState = EngineCore.thermalState(from: ProcessInfo.processInfo.thermalState)) async {
+        guard phase == .playing, let session else { return }
+        let now = ContinuousClock.now
+        if let start = adaptiveWindowStart,
+           adaptiveClockMS(now) - adaptiveClockMS(start) < controller.config.windowMS {
+            return   // 窓が満ちるまで session に触れない（提示のたびの呼び出しを安くする）
+        }
+        let current = await session.outcomeSnapshot().stats
+        guard let start = adaptiveWindowStart else {
+            adaptiveWindowStart = now
+            adaptiveLastStats = current
+            return
+        }
+        let elapsedMS = adaptiveClockMS(now) - adaptiveClockMS(start)
+        let window = Self.windowedStats(previous: adaptiveLastStats, current: current)
+        adaptiveWindowStart = now
+        adaptiveLastStats = current
+        guard window.total > 0 else { return }
+        let signals = ControlSignals(summary: DiagnosticsSummary(windowMS: elapsedMS, frames: window),
+                                     thermal: thermal)
+        let actions = controller.evaluate(signals: signals, atMS: adaptiveClockMS(now))
+        if !actions.isEmpty { applyControlActions(actions) }
+    }
+
+    private let adaptiveClockOrigin = ContinuousClock.now
+    private func adaptiveClockMS(_ instant: ContinuousClock.Instant) -> Double {
+        let d = instant - adaptiveClockOrigin
+        return Double(d.components.seconds) * 1_000 + Double(d.components.attoseconds) / 1e15
+    }
+
     /// 適応制御から届いた action を適用する（08 §5）。plan の作り直しは frame 境界で行う。
     public func applyControlActions(_ actions: [ControlAction]) {
         for action in actions {
@@ -449,6 +516,7 @@ public actor EngineCore {
         guard line == lineGeneration else { return }   // 古い線の closer（close/load 済み）
         switch event {
         case .position(let pts, let seekGeneration):
+            await evaluateAdaptiveWindowIfDue()
             // 位置イベントの契約（02 §4。2026-11-16 の CI で実測した逆行の修正 — 決定ログ #14）。
             // 三重の濾過:
             //  ① seeking のあいだは全て黙る（UI は target を表示済み。この窓のイベントは

@@ -227,3 +227,9 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **実測（実アプリ窓、`dvd-video-ts-01` の menu）**: edge-directed 固定では焼き込み timecode の静止桁が崩れていたが、motion-adaptive では静止桁が鮮明になり、毎 frame 変わる桁だけが空間内挿になる（想定どおり）。
 - **未実装（A1b の残り）**: detector（FieldMatch / CadenceAnalyzer と判定根拠の記録）、inverseTelecine（24p 化）、`ScaleFilter.highQuality` の kernel、OQ-10（表示同期方式）。G2 判定（combing の客観検査・GPU 時間）は実素材（#15）が要るため未実施。
 
+### 2026-11-17 — #9 A4: 適応制御ループの配線（監査で未接続を確認 → 接続）
+
+- **監査（実コード確認）**: `AdaptivePolicyEngine.evaluate` はテストからしか呼ばれず、`EngineCore.applyControlActions` の呼び出し元も無く、`AdaptiveController`（actor）は生成されていなかった。実再生では信号が作られず、制御は一度も動いていなかった。
+- **決定**: `EngineCore` が位置イベント（提示のたび）を契機に、窓（`controller.config.windowMS` = 2 s）が満ちたときだけ評価する。専用タイマーは持たない。窓の `FrameStats` は session の累積 stats の差分（`windowedStats`。session 再生成で累積が戻っても負にせず 0 に丸め、新 session では窓を取り直す）。thermal は `ProcessInfo.thermalState` を写像。窓が満ちるまで session に触れない（提示のたびの呼び出しを安く保つ）。evaluate の action は `applyControlActions` へ。
+- **未接続の信号（既定値のまま）**: memory pressure（normal）、modelBreakerOpen（false。A2 の runtime と `ModelHealthTracker` が載るまで）、presentJitterMS（0。`MetalPresenter.onPresented` の集計が載るまで）、endToEnd の p95（0）。このため現状 AI 段が無い構成では tier は metalOnly のままで、action は実質発火しない。ベンチマークレポート・品質インジケータ UI・負荷注入テストも未実装。
+

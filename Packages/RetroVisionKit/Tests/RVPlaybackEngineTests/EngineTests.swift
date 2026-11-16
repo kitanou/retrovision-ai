@@ -294,3 +294,37 @@ struct FailingSource: MediaSource {
                             userMessage: "この盤は保護されており、再生ライセンスの確認が完了していません")
     }
 }
+
+/// 適応制御の窓評価（08 §3）: 累積 stats の差分と thermal の写像。
+final class AdaptiveWindowTests: XCTestCase {
+    func testWindowedStatsIsTheDifferenceOfCumulativeStats() {
+        let previous = FrameStats(total: 100, presented: 90, dropped: 10, late: 4,
+                                  enhancementSkipped: 1, dropReasons: [.late: 4])
+        let current = FrameStats(total: 160, presented: 140, dropped: 20, late: 10,
+                                 enhancementSkipped: 3, dropReasons: [.late: 10])
+        let w = EngineCore.windowedStats(previous: previous, current: current)
+        XCTAssertEqual(w.presented, 50)
+        XCTAssertEqual(w.dropped, 10)
+        XCTAssertEqual(w.total, 60, "窓の total = 提示 + 落とした")
+        XCTAssertEqual(w.late, 6)
+        XCTAssertEqual(w.dropReasons[.late], 6)
+        XCTAssertEqual(w.deadlineMissRatio, 16.0 / 60.0, accuracy: 1e-9, "(dropped + late) / total")
+    }
+
+    func testWindowedStatsNeverGoesNegativeWhenCumulativeResets() {
+        let previous = FrameStats(total: 500, presented: 480, dropped: 20, late: 9)
+        let fresh = FrameStats(total: 3, presented: 3)
+        let w = EngineCore.windowedStats(previous: previous, current: fresh)
+        XCTAssertEqual(w.total, 0, "新 session で累積が戻っても窓は負にならない（0 に丸める）")
+        XCTAssertEqual(w.dropped, 0)
+        XCTAssertEqual(w.late, 0)
+    }
+
+    func testThermalStateMapping() {
+        XCTAssertEqual(EngineCore.thermalState(from: .nominal), .nominal)
+        XCTAssertEqual(EngineCore.thermalState(from: .fair), .fair)
+        XCTAssertEqual(EngineCore.thermalState(from: .serious), .serious)
+        XCTAssertEqual(EngineCore.thermalState(from: .critical), .critical)
+    }
+}
+
