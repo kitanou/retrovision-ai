@@ -142,6 +142,14 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **fixture を判别可能にした**: VTS_02_1.VOB を別素材（truncated-01.mpg 複製・4.04 s）に変更。単一 MPEG の機械スライスだと 2 タイトルの sample 数が近く、e2e が切り替えを数値で区別できなかった（設計上の落ち度。実測で発覚）。実測値: VTS_02 raw total=122 / valid=120 / lastPTS 3.971 s、engine 経由 demux 120 / 提示 120（0 長 marker 2 件は demux 縁の間引き = OQ-23 と同一の意味論）。タイトル 1 の 180 と明確に区別でき、`testTitleSwitchPlaysSecondTitle` が 120/120 で兼実測固定。
 - **UI**: transport バーに「映像タイトル」メニュー（multi-item 構造のときだけ表示）。選択は engine に `select(item:)` を投げるだけで、表示は events からのみ更新される（#17 の単一経路原則）。単一項目 source ではメニューが出ないことを fake 検査で固定。
 
+### 2026-11-17 — transport バー再表示の入力源（#22）の実装決定
+
+- **実測**: ユーザー実機で ISO 再生中、バーは自動非表示で消えた後、**マウスを動かしても一切戻らない**。ウィンドウ検査（CGWindowList で `RetroVision AI` 1541×847 の再生ウィンドウを特定）とスクリーンショットで「映像は表示、bar は無し」を裏取りした。
+- **原因**: #17 方針1 の再表示入力が `.onContinuousHover`（ZStack 側）だけだった。映像面 `VideoLayerView`（layer-backed NSView の `NSViewRepresentable`）が再生中は画面を覆い、AppKit は `mouseMoved` を deepest hit-test 側へ送るため SwiftUI の hover tracking に届かない。一度 auto-hide したら戻る経路が無い。
+- **決定（意味論は変えない）**: 入力源に AppKit の `NSEvent` **local monitor** を追加（`ControlsActivityMonitor`）。sendEvent の分发前に割込むため view 階層に依存しない。拾う範囲は mouse-moved / click / scroll（キーは含めない — shortcut は bar の可視に依存しない）。`onContinuousHover` は併存（bar 自身の上では SwiftUI 側も効く。二重発火は `showControls()` の冪等性で無害）。イベントは return して吞まない（timeline ドラッグ等のバー操作を壊さない）。再生画面の onAppear で start / onDisappear で stop。
+- **検査で固定した回路**: local monitor は `NSApp.sendEvent` で発火する（headless で検証可能）、目撃 monitor を先に登録して「吞まない」を検証、start 冪等・stop で解除、keyDown は活動に含めない。
+- API 面の気づき（CLAUDE.md 収集方針）: `NSEvent.addLocalMonitorForEvents` の handler は **新しい登録順に呼ばれ**、nil を返すと event を吞む。`NSEvent.otherEvent(with:)` は mouseMoved を作れない（例外 `WeirdMask`）。合成 mouseMoved は `CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)` → `NSEvent(cgEvent:)` で作れる（type は保持され sendEvent に通る）。`NSApp.sendEvent` を通す局所検証には `NSApplication.shared` の生成だけで足り、run loop は不要（handler は同期呼出しだが検査は RunLoop drain で待って確定させる）。`onContinuousHover` は `NSViewRepresentable` の layer-backed view 上で発火しない（実運用実測。pure SwiftUI 領域では効く）。
+
 
 ## 意思決定の運用
 
