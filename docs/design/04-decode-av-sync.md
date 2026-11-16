@@ -75,7 +75,7 @@ public protocol VideoDecoder: Sendable {
 
 - **format description hint**: AVFoundation は sample 自身に description を添えないことがある（MPEG-PS で実測）。probe 段の track description を hint として復号器に渡す（`FormatDescriptionHolder` の実測注記）。
 - **出力順序（F13・実測で確定）**: 同期的な `VTDecompressionSession` の出力ハンドラは**入力順（＝decode 順）でフレームを返す**。提示順は PTS 順であるため、`decode` は内部で受理済みフレームが 2 件以上になるまで 1 件を保持し（1 サンプル分遅延させて PTS 順に組み替え）、提示可能な次の 1 件だけを返す。`flush` で残りを PTS 順に返す。順序保証を decoder の責務として固定したので、上層は「受理順＝提示順」を前提にできる。統合テストで回帰固定済み（`DecodePathTests.framePresentationOrderIsPresentationOrderByPTS`）。
-- **field 順序の供給元（F10）**: MPEG-PS の container は `CVFieldCount`（本数）しか運ばず、順序は **PCE の `top_field_first`** から取る（全 fixture で tff=0 = bottom-first を実測）。H.264 の interlaced fixture は復号段階で field 信号が**全て消える**（F11。MP4 mux の MPEG-2 では `CVFieldDetail` が残るが未読了）。順序の最終確定は 05 §5 の detector 経路に依存する。復元できない場合は `.unknown` として扱い、既定の bob 相当に倒さない（誤った weave より安全な表示を選ぶ）。
+- **field 順序の供給元（F10）**: MPEG-PS の container は `CVFieldCount`（本数）しか運ばず、順序は **PCE の `top_field_first`** から取る（全 fixture で tff=0 = bottom-first を実測）。H.264 の interlaced fixture は復号段階で field 信号が**全て消える**（F11。MP4 mux の MPEG-2 では `CVFieldDetail` が残り、実測値は空間順の `SpatialFirstLineLate` — PCE の bottom-first と整合するが、順序の源は PCE のまま。OQ-17）。順序の最終確定は 05 §5 の detector 経路に依存する。復元できない場合は `.unknown` として扱い、既定の bob 相当に倒さない（誤った weave より安全な表示を選ぶ）。
 - 復号 pix_fmt は `420v`（映像 range・ITU-R BT.601）でメタデータと一致し、キャリアは container の声明値を保持する（F9）。ただし `Guesses` フラグの立つ component range があるため、色キャリアの優先読みは component range 側。
 
 - 出力 pool は `CVPixelBufferPool`（Metal 互換属性付き、01 §4）。`kCVPixelBufferIOSurfacePropertiesKey` を付け、IOSurface 経由で Metal・Core ML に**コピー 1 回で**（理想的にはゼロコピーで）渡る形を目標にする。

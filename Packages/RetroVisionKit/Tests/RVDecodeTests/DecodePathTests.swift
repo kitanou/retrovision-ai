@@ -67,6 +67,29 @@ final class DecodePathTests: XCTestCase {
         XCTAssertEqual(format.aspectSignals.mpegAspectInformation, .dar4x3)
     }
 
+    /// OQ-17（#14）: MP4 mux の MPEG-2 が container に残す CVFieldDetail の実値を固定する。
+    /// 値は temporal ではなく空間順の SpatialFirstLineLate で、PCE（bottom-first）と
+    /// 方向が整合する。順序の源は PCE のまま（detail は読むだけ。fieldOrder に写像しない）。
+    func testMP4MuxedMPEG2ContainerFieldDetailIsSpatialLateAndAgreesWithPCE() async throws {
+        let url = try fixtureURL("ntsc480i-22-01-in-mp4.mp4")
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let descs = try await track.load(.formatDescriptions)
+        let desc = try XCTUnwrap(descs.first)
+        let detail = CMFormatDescriptionGetExtension(desc, extensionKey: kCVImageBufferFieldDetailKey) as? String
+        XCTAssertEqual(detail, MediaAttachmentValue.fieldDetailSpatialFirstLineLate,
+                       "container の CVFieldDetail が実測（SpatialFirstLineLate）と異なる")
+        // temporal 値ではないので、現行の写像では順序に使われない（PCE が源）。
+        XCTAssertNotEqual(detail, MediaAttachmentValue.fieldDetailTopFirst)
+        XCTAssertNotEqual(detail, MediaAttachmentValue.fieldDetailBottomFirst)
+
+        let stream = try await AVFoundationDemuxer(url: url).probe()
+        let (_, format) = try videoTrack(of: stream)
+        XCTAssertEqual(format.interlace.fieldOrder, .bottomFirst, "PCE 由来の順序（bottom-first）")
+        // Late（最初の行が後の field）= bottom field が先、で PCE と整合する。
+    }
+
     func testPALProgramStreamResolves25And576() async throws {
         let demuxer = AVFoundationDemuxer(url: try fixtureURL("pal576i-22-01.mpg"))
         let stream = try await demuxer.probe()

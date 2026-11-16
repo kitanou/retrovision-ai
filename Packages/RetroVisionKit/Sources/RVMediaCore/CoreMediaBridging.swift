@@ -47,6 +47,11 @@ public enum MediaAttachmentKey {
 public enum MediaAttachmentValue {
     public static let fieldDetailTopFirst = String(kCVImageBufferFieldDetailTemporalTopFirst as NSString)
     public static let fieldDetailBottomFirst = String(kCVImageBufferFieldDetailTemporalBottomFirst as NSString)
+    /// 空間順（temporal ではない）。MP4 mux の MPEG-2 が container に残す値（OQ-17、EXP-001 §5）。
+    /// 語彙の記録用で、**fieldOrder への写像には使わない**（順序の源は PCE。決定ログ OQ-17）。
+    /// Late = フレームの最初の行が後の field に属する（= bottom field が先）、Early はその逆。
+    public static let fieldDetailSpatialFirstLineEarly = String(kCVImageBufferFieldDetailSpatialFirstLineEarly as NSString)
+    public static let fieldDetailSpatialFirstLineLate = String(kCVImageBufferFieldDetailSpatialFirstLineLate as NSString)
 
     public static let primariesBT709 = String(kCVImageBufferColorPrimaries_ITU_R_709_2 as NSString)
     public static let primariesEBU3213 = String(kCVImageBufferColorPrimaries_EBU_3213 as NSString)
