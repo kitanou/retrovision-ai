@@ -95,7 +95,7 @@ public actor EngineCore {
 
     // MARK: 開く
 
-    public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws {
+    public func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws {
         lineGeneration &+= 1   // 古い線のイベント・in-flight 運送操作を黙らせる（下記ガード）
         // 古い再生線を止める（タイトル切り替え = 同じ source への再 load 経路を含む。
         // 以前は初回 load 前提で旧 session を止めておらず、2 回目の load で線が取り残された）。
@@ -116,13 +116,24 @@ public actor EngineCore {
         currentSource = source
         // 選択自体も events で流す（UI は selectionChanged からのみ現在の選択を導出する —
         // タイトルメニューの now 表示が古い選択のままにならないため、open でも送る）。
-        continuation?.yield(.selectionChanged(selection))
+        if let selection {
+            continuation?.yield(.selectionChanged(selection))
+        }
         do {
             let opened = try await source.open()
             self.openedSource = opened
             self.structure = opened.structure
             await wirePipeline(for: source, structure: opened.structure)
             continuation?.yield(.structureChanged(opened.structure))
+            // 構造駆動の既定選択（メニュー増分、03 §5 の実挙動合わせ）: selection nil は
+            // open 後の構造を見て先頭 item で解決する。VIDEO_TS では menu（VMGM の
+            // VIDEO_TS.VOB）が列の先頭 → menu 優先、menu が無ければ先頭タイトル（従来形）。
+            // tracksChanged より先に流す（tracksChanged は selectedItem() を読むため）。
+            if selection == nil, let first = opened.structure.items.first {
+                let resolved = PlaybackSelection(item: first.id)
+                self.selection = resolved
+                continuation?.yield(.selectionChanged(resolved))
+            }
             // 選ばれている item のトラック表を載せる（items.first 固定だとタイトル切り替えで
             // UI のトラック選択が古い表のままになる — select(item:) の実装で顕在化）。
             continuation?.yield(.tracksChanged(selectedItem()?.trackTable ?? []))

@@ -64,7 +64,12 @@ public struct StructureWarning: Sendable, Hashable {
              /// 映像トラックが無い（容器は読めたが再生できない）。
              noVideoTrack,
              /// 容器そのものが読めない。FFmpeg shim での対応判断材料にする（OQ-02）。
-             containerUnreadable
+             containerUnreadable,
+             /// part 内部のプログラム再開始（main feature の後に別プログラムが続く実測形。
+             /// 03 §9.2 の実測と修復。IFO の cell 時間が本来の権威 — 増分で切り分ける）。
+             ptsRestartRepaired,
+             /// チェーン内の part でトラック表の一致が取れない（境界の縫合は index 対応で進む）。
+             trackTableMismatch
     }
     public let code: Code
     public let detail: String

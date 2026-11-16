@@ -67,10 +67,12 @@ public final class DefaultPlayerEngine: PlayerEngine {
 
     // MARK: PlayerEngine
 
-    public func load(_ source: any MediaSource, selection: PlaybackSelection) async throws -> MediaStructure {
+    public func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws -> MediaStructure {
         startPumpIfNeeded()
         try await core.load(source, selection: selection)
-        mirror.selected = selection
+        if let resolved = await core.snapshot().selected {
+            mirror.selected = resolved
+        }
         if let structure = await core.currentStructure() {
             applyToLocal(.structureChanged(structure))
         }

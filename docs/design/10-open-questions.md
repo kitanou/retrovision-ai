@@ -160,6 +160,22 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - 実機 e2e 検証（統合前・分支ビルドを実行し CGEvent/HID 合成入力で測定済み）: 再生→活動→2.5 s でバー自動非表示→pure mouseMoved sweep で再表示（画面検査 + monitor 発火の実測 count）。切り分けのために `RV_DEBUG_ACTIVITY=1` のオプトイン stderr 診断を残す（既定は沈黙。「アプリはログを書かない」方針は不変。binary を直接起動して stderr を取れる形でのみ観測可能）。
 
 
+### 2026-11-17 — 多重 VOB: バイト連結から無連結 segment demux + PTS 再開始修復へ差し替え（#3）
+
+- **実測（PICHI 実 ISO、issue #3）**: 4 連結の duration 76.064 s 崩壊 / part 4 単体 92,865 s 誤読・reader 92 sample 停止。VTS_01 parts 1〜4 の PES PTS は raw 連続（0.189→2935.455 s）なのに part 4 のバイト 338,876,430 で 0.189→75.965 s（≈ −2,935 s）へ戻る。**pack SCR はこの点を跨いでも連続**（338.6〜339.0 MB 窓に負のジャンプ無し実測）= part 内部のプログラム再開始が根本原因で、連結の器は壊れていない。
+- **決定（設計差し替え）**: ConcatPSDemuxer 退場。`SegmentPSDemuxer`（part 単位の `AVFoundationDemuxer` + duration 累積オフセット + `CMSampleBufferCreateCopyWithNewTiming` の時刻 surgery を demux 内侧に閉じ込める）へ全チェーン（単一 part 含む）を流す。sample 時戳 surgery を「避ける」とした旧方針は「連結が壊れる以上 surgery を避けられる経路が無い」で転換。engine・session の契約（04 §2 の単一 sample 列）は不変。
+- **決定（修復の形）**: `ProgramStreamRepair` が PS を start code で歩き、PES PTS の逆行 ≥ 2.0 s（`programBreakSeconds`）だけを検出して以降を 5-byte タイムスタンプフィールド単位で `lastSeen` 直後へ平行移動する写しを tempfile に作る（発火はスキャン検出のみ、heuristics 無し。clean part は写しを作らない — PICHI parts 1〜3 で plan ゼロ実測）。SCR は読まない（FFmpeg の PS demuxer も pack header を読む設計ではない — libavformat/mpeg.c 確認）。警告 code `.ptsRestartRepaired` を structure に載せる。
+- **実測（修復妥当性の実証）**: canonical layout（`lead P[32:30] '1' P[29:15] '1' P[14:0] '1'`、P[29:15] は bit31..17）の PES のみ修復で part 4 相当を全文字読み: duration 357.184 s / reader 完走 10,699 sample（未修復 92）。実 PICHI フィールド 0x31000184eb = 0.18903 s の delta 0 round-trip 恒等で符号化を確定。PES ヘッダは PES-2（'10xx' marker）と PES-1 旧形（'001x' 直後形。ffmpeg fixture。ffprobe pts/dts とバイト一致）の 2 形両対応（FFmpeg と同じ判別 `(c & 0xE0) == 0x20`）。*初期 2 実装（Python 実証・Swift 初版）は marker bit を 1 本誤読し、当時の実測数値（319.266 s 等）は取り消し。round-trip 検査に差し替え。
+- **既知のトレードオフ（受容して進む。cell 時刻縫合は別増分）**: 累積 duration オフセットは母素材タイムラインより fixture +0.123 s 大きい（境界 interleave 二重計上。実写の 0.5 s 級 gap で有界）。合成 mpeg2 fixture は open GOP で境界 4 帧喪失（176/180 実測。fixture は ffprobe keyframe 位置へ切るのは 15 帧喪失を避けるため。実 DVD closed-GOP cell では喪失 0 = PICHI で part 全文字通し実測）。
+- **検査**: `SegmentPSDemuxerTests`（9 検査。構造一致・frame 集合契約（喪失 ≤ 4・幽霊 0・drift < 0.25）・修復算術の厳密値・実バイト canonical round-trip・PICHI part 1 clean・2 連結形の限界記録）。engine e2e 更新: VTS_01 の demux/提示 180 → 176（実測追記）。`make check` 緑（2026-11-17）。
+
+### 2026-11-17 — menu（VMGM）列挙と first-play 政策（ユーザー実測要望「メニュー画面も出るように」）
+
+- **決定（列の約束）**: `VideoTsChain.isMenu` を追加。`VIDEO_TS.VOB` を `vtsNumber 0`・`isMenu true` のチェーンとして chains 先頭に置く。`VideoTsMediaSource` は `MediaItem(id: ItemID(0), titleNumber: 0)` を同じ経路で作り、UI は titleNumber 0 を「メニュー」と表示（model 変更なし。0 は menu 予約値）。VTS_nn_0.VOB（VTS メニュー）は対象外継続。多重 part VMGM 未対応（観測例なし。OQ 扱いで形式外 name warning に残す）。
+- **決定（選択の構造駆動化）**: `PlayerEngine.load(_:selection:)` の selection を `PlaybackSelection?` に（nil = open 後 structure 先頭 item で engine が解決し selectionChanged を単一経路で流す。tracksChanged より先）。menu の有无に関わらず「Disc を開くと盤が選ぶ順序で始まる」を engine 側ではなく**構造の順序**で表現する。明示指定の既存呼び出しは不変。
+- **決定（first-play 政策は PlayerViewModel。engine に意味を渡さない）**: 構造に titleNumber 0 が在るときだけ自动再生（実機の盤挿入=再生開始）。無い素材は #17 user gate 不変。menu `.ended` → 最初の本体タイトル（titleNumber 最小）へ `select(item:)`+`play()` 自動進行（phaseChanged(.ended) からのみ発火、`menuAdvancePending` ガード、selectionChanged で解除）。
+- **検査**: navigator（menu 先頭/無し/nn_0 除外）、engine e2e（items [0,1,2]・menu 完走 120/ended）、PlayerViewModelTests（auto-select+auto-play、自動進行 1 回だけ、menu 無しで自动再生しない）。Interactive menu（VMGM PGCI の PU 命令）は未実装 — メニューは video として线性再生するだけ（IFO パース増分とセットの次項。03 §9.7 限界メモ）。
+
 ## 意思決定の運用
 
 1. 決めたら**この表に「決定」と「日付」「根拠（実験 ID / レポート ID）」を書く**。本文の既定値は同じ commit で更新する。
