@@ -60,6 +60,11 @@ final class PlayerViewModel {
     private var eventTask: Task<Void, Never>?
     private var surface: SurfaceSink?
     private var lastOpenedURL: URL?
+    /// RV_DEBUG_POSITION 設定時のみ stderr に選択・phase・位置（1 s 粒度）を流す。
+    /// RV_DEBUG_ACTIVITY / RV_DEBUG_PSREPAIR と同じ opt-in 约定。画面を出せない環境
+    /// （画面ロック中の実盤検証など）でも運送の進みを数値で確認するための QA 入口。
+    private let positionDebug = ProcessInfo.processInfo.environment["RV_DEBUG_POSITION"] != nil
+    private var lastPositionLogSecond = -1
     /// menu 再生終了の自動進行のガード（同一 .ended を複数回発火させない。
     /// selectionChanged が観測されたら解除 — 単一更新経路の原則（#17）と同じ場所で行う）。
     private var menuAdvancePending = false
@@ -90,6 +95,7 @@ final class PlayerViewModel {
         switch event {
         case .phaseChanged(let phase):
             self.phase = phase
+            logTransport("phase=\(phase)")
             if case .failed(let error) = phase { lastError = error }
             if case .empty = phase { lastError = nil }
             if case .ended = phase { scheduleMenuAutoAdvance() }
@@ -97,6 +103,16 @@ final class PlayerViewModel {
             guard !timelineScrubbing else { return }   // ドラッグ中のつまみはユーザー操作に固定（#17）
             self.position = position
             if let duration { self.duration = duration }
+            if positionDebug {
+                // 1 s 粒度で記録（無制限だと帧毎の position で埋れる — 実盤 50 分の運送確認が
+                // 目的。選択と phase は毎回出力するので境界の目視はそちらで行う）。
+                let second = Int(position.seconds)
+                if second != lastPositionLogSecond {
+                    lastPositionLogSecond = second
+                    let total = duration?.seconds ?? self.duration?.seconds ?? -1
+                    logTransport(String(format: "pos=%.3fs total=%.1fs", position.seconds, total))
+                }
+            }
         case .structureChanged(let structure):
             // 構造から表示材料を採る（item 1 個のファイル素材では duration / trackTable がここに乗る。
             // 複数 item（DVD タイトル）はタイトルメニューの材料に載せる — 選択中の duration と
@@ -110,6 +126,7 @@ final class PlayerViewModel {
         case .selectionChanged(let selection):
             selected = selection
             menuAdvancePending = false   // 選択が動いた = 直前の menu 終端処理は完了
+            logTransport("selection item=\(selection.item.rawValue)")
         case .qualityChanged(let presentation):
             quality = presentation
         case .enhancementDegraded:
@@ -121,6 +138,25 @@ final class PlayerViewModel {
         case .statisticsUpdated:
             break   // 診断 inspector は Phase 5（#9）
         }
+    }
+
+    /// RV_DEBUG_POSITION 限定の stderr 出力（opt-in 约定。ControlsActivity.swift と同じ形）。
+    private func logTransport(_ line: String) {
+        guard positionDebug else { return }
+        FileHandle.standardError.write(Data("rvtransport: \(line)\n".utf8))
+    }
+
+    /// 起動時 QA 入口（opt-in env 约定: RV_DEBUG_* と同じ思想。UI なしの実盤検証・
+    /// 自動検証のためのものなので、first-play 政策などの意味は通常の open と共有する）。
+    /// RV_AUTO_OPEN にメディアのパスが指定されているときだけ起動時に開く。
+    /// 返り値 = 発火したか（未設定・空・すでに開いている では false）。
+    @discardableResult
+    func autoOpenFromLaunchEnvironment() -> Bool {
+        guard lastOpenedURL == nil,
+              let path = ProcessInfo.processInfo.environment["RV_AUTO_OPEN"], !path.isEmpty
+        else { return false }
+        open(url: URL(fileURLWithPath: path))
+        return true
     }
 
     // MARK: - 有効・無効（#17 の表。phase から ONLY に導出する）
