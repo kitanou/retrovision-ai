@@ -11,7 +11,13 @@ public protocol MediaSource: Sendable {
     var descriptor: SourceDescriptor { get }
     /// 開いて構造を作る。重い処理は内部の demuxQueue で実行する（INV-4）
     func open() async throws -> OpenedSource
+    /// 明示的な資源解除（2026-11-17 追加、#3 終了後始末）。open が作った資源
+    /// （ISO マウント、修復写しの temp）を release する。engine の close 経由で呼ぶ。
+    /// 資源を持たない source は既定 no-op（protocol extension）。
+    func close() async
 }
+
+public extension MediaSource { func close() async {} }   // 資源を持たない source の既定
 
 public struct SourceDescriptor: Sendable, Hashable, Identifiable {
     public enum Kind: Sendable { case opticalDisc, videoTsFolder, discImage, plainFile }
@@ -318,7 +324,9 @@ public enum MediaSourceRouting {
 - **source 側の冪等 open**: VideoTsMediaSource は構造と demuxer を、DiscImageMediaSource は
   マウントを cache（再 load で再 probe・再連結・再 attach をしない。実測: attached の ISO を
   再度 attach すると「〜 1」付きの別マウントが増える。多重 VOB の再連結コピーは GB 級）。
-  demuxer の同一实例契約は open をまたいても保つ（検査で固定）。
+  demuxer の同一实例契約は open をまたいても保つ（検査で固定）。タイトル切り替えの再 load は
+  close を通らない。close（engine.close 経由・アプリ終了時もここ。03 §1 の close 契約と
+  決定ログ 2026-11-17）はこの cache を閉じて資源を release する — 次の open は走り直し。
 - **load での session 停止**: 以前は 2 回目の load で旧 session が止められていなかった
   （ファイルの 2 回目 open でも同じ。本増分で load 冒頭に停止を追加）。
 - **UI**: メニューバーの「映像タイトル」（transport バーの film アイコン）。multi-item

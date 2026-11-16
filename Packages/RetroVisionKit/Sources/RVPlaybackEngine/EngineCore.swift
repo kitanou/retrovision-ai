@@ -169,9 +169,17 @@ public actor EngineCore {
         session = nil
         sessionRunning = false
         pipeline = nil
+        // 資源の明示 release（03 §1 の MediaSource.close 契約）。session を止めた**後**に
+        // 行う（reader が動いたままの eject は壊れるため順守）。process 終末の deinit
+        // 任せにしない — 実測 2026-11-17: 終了時 close 無しだと ISO マウントと
+        // 430 MB の修復写し temp が残った。
+        if let source = currentSource {
+            await source.close()
+        }
         lastOutcome = nil
         position = .zero
         openedSource = nil
+        currentSource = nil
         structure = nil
         activePlan = nil
         pendingPlan = nil
