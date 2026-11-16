@@ -151,6 +151,11 @@ DAR 情報も無いため 05 §6 の fallback 経路が実際に通る。
 **F5 — field 情報は container 側では「数」しか渡らない（PS）。** `CVFieldCount`=2 は立つが
 **順序を語る key は MPEG-PS に存在しない**。MP4 mux では `CVFieldDetail` が現れる
 （値の解読は今回未完了 → 要続き §7）。
+**追記（2026-11-17・OQ-17 / #14）**: `ntsc480i-22-01-in-mp4.mp4` の container format description の
+`CVFieldDetail` は **`SpatialFirstLineLate`**（temporal ではなく空間順。最初の行が後の field =
+bottom field が先）。同素材の PCE は `top_field_first=0`（bottom-first）で方向は整合する。
+復号出力の attachment にもキーは付くが、現行の写像（temporal の 2 値のみ）では `.unknown` になる。
+順序の源は引き続き PCE（detail は読むだけ）。`DecodePathTests` で container 値を固定。
 
 **F6 — field 順序の唯一の信頼できる源は picture_coding_extension。**
 `000001B5` + identifier `1000` に `picture_structure` / `top_field_first` /
@@ -210,7 +215,7 @@ GOP 末尾の P 帧（pts 9009）が B 帧（pts 3003・6006）より先に取�
 
 1. **実 DVD-Video（VIDEO_TS/VOB・IFO の PAR・4:3 flag）での再実行**。合成素材の
    F4/PAR 系統の違いは実盤で結論が変わる可能性がある（fixtures registry の課題と同居）。
-2. **`CVFieldDetail` の値の解読**（MP4 mux の MPEG-2 で観測。field 順序を語っているか）。
+2. ~~`CVFieldDetail` の値の解読~~ → **解読済み（2026-11-17）**: `SpatialFirstLineLate`、PCE と整合（F5 追記）。残: temporal 値を持つ素材での検証と fixture ground truth の確定（生成器 tff 意図 vs 実測 bottom-first）。
 3. **シーク / format change（解像度・profile 切替）時の再設定コスト**。open 実測は
    「先頭から順読み」のみ。
 4. **音声（AC3）デコードと audio master clock**（素材 ntsc480i-ac3-01.mpg は用意済み）。
