@@ -219,3 +219,11 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定（UI 境界）**: App は `CAMetalLayer` を `DefaultPlayerEngine.attachMetalSurface(layer:onAspectResolved:)` へ渡すだけで、RVVideoPipeline を import しない（INV-8。`ImportBoundaryAppTests` 不変）。drawableSize は view が実ピクセル寸法に保ち、変更時に `redrawMetalSurface()` で最後の frame を描き直す。表示比率は plan の `aspect.targetDAR` から通知する（view の枠が DAR、graph の letterbox は同じ DAR なので二重補正にならない）。
 - **実測（2026-11-17、`dvd-video-ts-01` の menu を実アプリ窓で撮影し暫定経路と比較）**: 向き・色の並び・4:3 枠は暫定経路と一致。Metal 側は cleanAperture（704/720）を反映してカラーバーが約 2% 横に広がる（05 §6 の設計どおり。暫定経路は無視）。
 - **既知の差（次の増分）**: インターレース素材の静止した細部（焼き込み timecode）が、`.auto` → edgeDirected の縮退で崩れて見える（暫定経路は weave のままで鮮明）。detector と motionAdaptive（A1b）で解消する。present 間隔・GPU 時間の実測（G2）は未実施で、実素材（#15）も要る。
+
+### 2026-11-17 — #5 A1b: motion-adaptive デインターレース（前 frame 入力）
+
+- **決定**: `DeinterlaceMode.auto` / `.motionAdaptive` は、前 frame があれば `rv_deint_motionAdaptive_v1`、無ければ（先頭 frame・寸法変更直後）従来の edge-directed に倒す。`RenderFrameInput.previousPixelBuffer` を追加（同寸法・NV12 のときだけ取り込む）。`MetalFramePresenter` が直前に渡した frame の pixel buffer を保持して渡す。seek 直後は前 frame が無関係でも、その 1 frame は動き側（空間内挿）に倒れるだけで破綻しない。
+- **アルゴリズム**: 偶数行は保持。奇数行は「前 frame との同位置差」（補間行と上下の保持行の 3 点の最大。同 parity 同士）から `smoothstep(0.03, 0.10, motion)` で weave と空間内挿を混ぜる。静止部は垂直解像度を保ち、動き部は comb を出さない。chroma は源のまま（従来どおり）。
+- **実測（実アプリ窓、`dvd-video-ts-01` の menu）**: edge-directed 固定では焼き込み timecode の静止桁が崩れていたが、motion-adaptive では静止桁が鮮明になり、毎 frame 変わる桁だけが空間内挿になる（想定どおり）。
+- **未実装（A1b の残り）**: detector（FieldMatch / CadenceAnalyzer と判定根拠の記録）、inverseTelecine（24p 化）、`ScaleFilter.highQuality` の kernel、OQ-10（表示同期方式）。G2 判定（combing の客観検査・GPU 時間）は実素材（#15）が要るため未実施。
+

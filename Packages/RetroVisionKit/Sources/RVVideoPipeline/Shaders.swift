@@ -133,6 +133,58 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
     }
 }
 
+// ---------- deinterlace: motion-adaptive（時間 + 空間。05 §5.2 の既定。前 frame が要る） ----------
+//
+// 偶数行は保持（edge-directed と同じ）。奇数行（他 field の線）は画素ごとに動きを測り、
+//   - 静止: 現 frame の他 field の線をそのまま使う（weave。垂直解像度を保つ — 静止した
+//     細い文字・字幕・縞が edge-directed の内挿で崩れない）
+//   - 動き: edge-directed の空間内挿（comb を出さない）
+// を連続的に混ぜる。動きの指標は「前 frame との同位置の差」を、補間行 y とその上下の
+// 保持行 y±1 の 3 点の最大で取る（同 parity 同士の比較なので、field 間の時間差で
+// 静止物を動きと誤判定しない）。しきい値は輝度 [0,1] 正規化値（video range の
+// 約 7〜23 階調）。前 frame が無い / 寸法が違うときは host 側が edge-directed に倒す。
+
+kernel void rv_deint_motionAdaptive_v1(texture2d<float, access::read>  inY  [[texture(0)]],
+                                       texture2d<float, access::read>  inUV [[texture(1)]],
+                                       texture2d<float, access::write> outY [[texture(2)]],
+                                       texture2d<float, access::write> outUV [[texture(3)]],
+                                       texture2d<float, access::read>  prevY [[texture(4)]],
+                                       uint2 gid [[thread_position_in_grid]]) {
+    uint w = outY.get_width();
+    uint h = outY.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    bool keepRow = (gid.y & 1u) == 0u;
+    if (keepRow) {
+        outY.write(inY.read(gid), gid);
+    } else {
+        int x = int(gid.x), y = int(gid.y);
+        int W = int(w) - 1, H = int(h) - 1;
+        int yu = max(y - 1, 0), yd = min(y + 1, H);
+        // 空間内挿（edge-directed と同じ）
+        int bestA = 0;
+        float bestCost = 1e30;
+        for (int a = -4; a <= 4; a++) {
+            float vu = inY.read(uint2(clamp(x + a, 0, W), yu)).r;
+            float vd = inY.read(uint2(clamp(x - a, 0, W), yd)).r;
+            float cost = fabs(vu - vd);
+            if (cost < bestCost) { bestCost = cost; bestA = a; }
+        }
+        float spatial = (inY.read(uint2(clamp(x + bestA, 0, W), yu)).r
+                         + inY.read(uint2(clamp(x - bestA, 0, W), yd)).r) * 0.5;
+        // 動き（前 frame との同位置差の最大。補間行と上下の保持行）
+        float weave = inY.read(gid).r;
+        float mc = fabs(weave - prevY.read(gid).r);
+        float mu = fabs(inY.read(uint2(gid.x, yu)).r - prevY.read(uint2(gid.x, yu)).r);
+        float md = fabs(inY.read(uint2(gid.x, yd)).r - prevY.read(uint2(gid.x, yd)).r);
+        float motion = max(mc, max(mu, md));
+        float k = smoothstep(0.03, 0.10, motion);
+        outY.write(float4(mix(weave, spatial, k), 0.0, 0.0, 1.0), gid);
+    }
+    if (gid.x < w / 2u && gid.y < h / 2u) {
+        outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+    }
+}
+
 // ---------- field 間 SAD（05 §5.1 detector: 1 枚内の 2 field 差分 = comb 信号） ----------
 // 8x8 block ごとに、相邻走査線（= 2 つの field 同士の対応線）の平均絶対差を算出。
 // 値は正規化 [0,1] のまま（GPU 内完結。判定閾値は host 側の detector が決める — #5 次増分）。

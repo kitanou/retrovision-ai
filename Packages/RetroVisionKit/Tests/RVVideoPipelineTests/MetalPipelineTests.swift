@@ -134,7 +134,7 @@ final class MetalPipelineTests: XCTestCase {
         guard gpuGate() else { return }
         let lib = Self.context.library
         for name in ["rv_vs_fullscreen", "rv_colorConvert_v1", "rv_deint_bob_v1",
-                     "rv_deint_edgeDirected_v1", "rv_fieldMatch_sad_v1"] {
+                     "rv_deint_edgeDirected_v1", "rv_deint_motionAdaptive_v1", "rv_fieldMatch_sad_v1"] {
             XCTAssertNotNil(lib.makeFunction(name: name), "shader function 無し: \(name)")
         }
         // 実 PSO 生成（colorConvert は bgra8 の render pipeline、deint/detector は compute）
@@ -302,6 +302,56 @@ final class MetalPipelineTests: XCTestCase {
             XCTAssertGreaterThan(Int(px[r][2 * r - 1].r), 150, "保持行 行\(r) の白側が汚染")
             XCTAssertLessThan(Int(px[r][2 * r + 1].r), 90, "保持行 行\(r) の黒側が汚染")
         }
+    }
+
+    // MARK: - 5b. motion-adaptive（静止は weave、動きは空間内挿。前 frame が無ければ edge-directed）
+
+    /// 偶数行 = A、奇数行 = B（B ≠ A）の縞を作る。前 frame を同じにすれば「静止」、
+    /// 大きく変えれば「動き」。出力の奇数行がどちらになるかで weave / 空間内挿を判定する。
+    private func renderMotionAdaptive(previousLuma: UInt8?) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        let w = 32, h = 16
+        let rowsA: UInt8 = 60, rowsB: UInt8 = 200
+        func stripes(_ even: UInt8, _ odd: UInt8) throws -> CVPixelBuffer {
+            try makeNV12(width: w, height: h,
+                         luma: { row in [UInt8](repeating: row % 2 == 0 ? even : odd, count: w) },
+                         chroma: { _ in [UInt8](repeating: 128, count: w) })
+        }
+        let cur = try stripes(rowsA, rowsB)
+        var input = progressiveInput(cur, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22,
+                                        fieldSource: .formatDescription)
+        if let previousLuma {
+            // 静止: 同じ縞。動き: 全行を別の値にする。
+            input.previousPixelBuffer = previousLuma == 0 ? cur
+                : try makeNV12(width: w, height: h,
+                               luma: { _ in [UInt8](repeating: previousLuma, count: w) },
+                               chroma: { _ in [UInt8](repeating: 128, count: w) })
+        }
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(5), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .motionAdaptive)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        XCTAssertEqual(timing.deinterlaceApplied, previousLuma == nil ? .edgeDirected : .motionAdaptive)
+        return readBack(target)
+    }
+
+    func testMotionAdaptiveKeepsStaticDetailAndInterpolatesMotion() throws {
+        guard gpuGate() else { return }
+        // 保持行（偶数）は A=60 → 暗い。奇数行の源は B=200 → 明るい。
+        let still = try renderMotionAdaptive(previousLuma: 0)        // 前 frame = 同じ縞（静止）
+        let moving = try renderMotionAdaptive(previousLuma: 128)     // 前 frame と大きく違う（動き）
+        let noPrev = try renderMotionAdaptive(previousLuma: nil)     // 前 frame 無し → edge-directed
+        let y = 5   // 奇数行（補間側）
+        XCTAssertGreaterThan(Int(still[y][10].r), 150, "静止部は weave（源の他 field の線）を保つはず")
+        XCTAssertLessThan(Int(moving[y][10].r), 110, "動き部は空間内挿（保持行の明るさ）になるはず")
+        XCTAssertLessThan(Int(noPrev[y][10].r), 110, "前 frame 無しは edge-directed（空間内挿）になるはず")
+        // 保持行は常に源のまま。
+        XCTAssertLessThan(Int(still[4][10].r), 110)
+        XCTAssertLessThan(Int(moving[4][10].r), 110)
     }
 
     // MARK: - 6. field 間 SAD（05 §5.1 detector の土台。kernel 直接）

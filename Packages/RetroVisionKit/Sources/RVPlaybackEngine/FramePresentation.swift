@@ -40,6 +40,8 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     private let presenter: MetalPresenter
     private let lock = NSLock()
     private var lastAspect: AspectRatio?
+    /// 直前に渡した frame の pixel buffer（motion-adaptive の動き検出用）。
+    private var previousBuffer: CVPixelBuffer?
     private var onAspectResolved: (@Sendable (Double) -> Void)?
 
     /// Metal デバイスが無い環境では nil（呼び出し側は暫定経路へ戻す）。
@@ -52,7 +54,10 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
 
     public func attachLayer(_ layer: CAMetalLayer?) {
         presenter.attachLayer(layer)
-        if layer == nil { presenter.clearLast() }
+        if layer == nil {
+            presenter.clearLast()
+            lock.withLock { previousBuffer = nil }
+        }
     }
 
     /// 表示比率（targetDAR）が決まる・変わるたびに通知する（UI が view の枠を決める）。
@@ -69,9 +74,14 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     public func present(_ frame: DecodedVideoFrame, plan: RenderPlan?) async -> FrameDeliveryOutcome {
         guard let plan else { return .dropped }
         notifyAspect(plan.output.aspect.targetDAR)
+        let previous = lock.withLock { () -> CVPixelBuffer? in
+            let p = previousBuffer
+            previousBuffer = frame.pixelBuffer
+            return p
+        }
         let input = RenderFrameInput(pixelBuffer: frame.pixelBuffer, color: frame.format.color,
                                      interlace: frame.format.interlace, aspect: plan.output.aspect,
-                                     frameID: frame.id)
+                                     frameID: frame.id, previousPixelBuffer: previous)
         do {
             switch try presenter.present(input, plan: plan, pts: frame.pts) {
             case .scheduled: return .delivered

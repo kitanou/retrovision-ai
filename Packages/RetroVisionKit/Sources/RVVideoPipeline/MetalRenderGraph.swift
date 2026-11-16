@@ -24,9 +24,13 @@ public struct RenderFrameInput: @unchecked Sendable {
     public var aspect: AspectResolution
     /// 诊断用（frame id など。pipeline は意味を決めない）。
     public var frameID: FrameID?
+    /// 直前に提示した frame（motion-adaptive の動き検出用。無い・寸法違いなら edge-directed に倒す）。
+    public var previousPixelBuffer: CVPixelBuffer?
 
     public init(pixelBuffer: CVPixelBuffer, color: ColorInfo, interlace: InterlaceInfo,
-                aspect: AspectResolution, frameID: FrameID? = nil) {
+                aspect: AspectResolution, frameID: FrameID? = nil,
+                previousPixelBuffer: CVPixelBuffer? = nil) {
+        self.previousPixelBuffer = previousPixelBuffer
         self.pixelBuffer = pixelBuffer
         self.color = color
         self.interlace = interlace
@@ -80,13 +84,23 @@ public final class MetalRenderGraph: @unchecked Sendable {
         }
         var yTex = planes[0].texture
         var uvTex = planes[1].texture
+        // 前 frame（motion-adaptive 用。同寸法・NV12 のときだけ取り込む）
+        var previousPlanes: [PixelBufferImporter.Plane] = []
+        if let prev = input.previousPixelBuffer,
+           CVPixelBufferGetWidth(prev) == CVPixelBufferGetWidth(input.pixelBuffer),
+           CVPixelBufferGetHeight(prev) == CVPixelBufferGetHeight(input.pixelBuffer),
+           let p = importer.importNV12(prev) {
+            previousPlanes = p
+        }
+        let prevYTex: (any MTLTexture)? = previousPlanes.first?.texture
 
         // 2. deinterlace（plan に段があり、source が interlaced のときだけ実行）
         var interimTextures: [any MTLTexture] = []
         if let req = plan.stage(of: .deinterlace), input.interlace.fieldCount >= 2 {
-            let mode = resolveDeinterlace(req: req, input: input, timing: &timing)
+            let mode = resolveDeinterlace(req: req, input: input, previousAvailable: prevYTex != nil,
+                                          timing: &timing)
             try encodeDeinterlace(mode: mode, fieldOrder: input.interlace.fieldOrder,
-                                 y: yTex, uv: uvTex,
+                                 y: yTex, uv: uvTex, prevY: prevYTex,
                                  into: &yTex, uvOut: &uvTex, interim: &interimTextures, command: command)
         }
 
@@ -114,7 +128,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
         // 完了処理: pool 返却と CVMetalTexture の flush（GPU 使用後）。
         // addCompletedHandler は commit より前でなければならない（Metal の実測アサーション）。
-        let imports = planes
+        let imports = planes + previousPlanes
         command.addCompletedHandler { [pool, importer] cb in
             for t in interimTextures { pool.release(t) }
             _ = imports   // CVMetalTexture の参照をここで手放す（texture は cb 完了まで生存済み）
@@ -140,6 +154,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
     // （単一フレームのみで動く中間解。detector + motionAdaptive は同一 issue の次増分）。
 
     private func resolveDeinterlace(req: StageRequest, input: RenderFrameInput,
+                                    previousAvailable: Bool,
                                     timing: inout RenderTiming) -> DeinterlaceMode {
         let requested = (req.parameters as? DeinterlaceParameters)?.mode ?? .auto
         let declared = input.interlace.fieldCount >= 2
@@ -151,8 +166,11 @@ public final class MetalRenderGraph: @unchecked Sendable {
         switch requested {
         case .passthrough: actual = .passthrough
         case .bob: actual = .bob
-        case .edgeDirected, .motionAdaptive, .auto:
-            actual = .edgeDirected   // v1 の safe 側実装（motionAdaptive は detector と共に入る）
+        case .edgeDirected: actual = .edgeDirected
+        case .motionAdaptive, .auto:
+            // 前 frame があれば motion-adaptive（静止部は weave で垂直解像度を保つ）。無ければ
+            // 単一 frame で動く edge-directed（先頭 frame・seek 直後・寸法変更直後）。
+            actual = previousAvailable ? .motionAdaptive : .edgeDirected
         case .inverseTelecine:
             actual = .edgeDirected   // telecine 検出（CadenceAnalyzer）未実装の間の代替
         }
@@ -162,6 +180,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
     private func encodeDeinterlace(mode: DeinterlaceMode, fieldOrder: FieldOrder,
                                   y: any MTLTexture, uv: any MTLTexture,
+                                  prevY: (any MTLTexture)?,
                                   into yOut: inout any MTLTexture, uvOut: inout any MTLTexture,
                                   interim: inout [any MTLTexture],
                                   command: any MTLCommandBuffer) throws {
@@ -185,6 +204,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
         let functionName = switch mode {
         case .bob: "rv_deint_bob_v1"
+        case .motionAdaptive where prevY != nil: "rv_deint_motionAdaptive_v1"
         default: "rv_deint_edgeDirected_v1"
         }
         var constants: MTLFunctionConstantValues?
@@ -211,6 +231,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
         enc.setTexture(uv, index: 1)
         enc.setTexture(outY, index: 2)
         enc.setTexture(outUV, index: 3)
+        if functionName == "rv_deint_motionAdaptive_v1" { enc.setTexture(prevY, index: 4) }
         let threads = MTLSize(width: w, height: h, depth: 1)
         let group = MTLSize(width: 8, height: 8, depth: 1)
         enc.dispatchThreads(threads, threadsPerThreadgroup: group)
