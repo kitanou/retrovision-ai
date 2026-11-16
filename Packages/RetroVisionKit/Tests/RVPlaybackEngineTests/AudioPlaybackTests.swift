@@ -1,3 +1,4 @@
+import AVFAudio
 import CoreMedia
 import Foundation
 import XCTest
@@ -62,7 +63,10 @@ final class AudioPlaybackTests: XCTestCase {
     }
 
     /// AC-3 付き素材を EngineCore で最後まで再生し、音声 clock の drift と underrun を測る。
-    /// 合格条件（device がある環境）: 全帧提示 + drift p95 < 40 ms + underrun < 5。
+    /// 構造的検査（完走・全帧提示・clock 採样の存在・underrun 少）は常に実行する。
+    /// **数値の drift 検査は実時間ペーシングのある装置のときだけ**実行する
+    /// （`audioDeviceRealTimeRatio()` が装置の実測で判定。CI の仮想装置は実行ごとに
+    /// 1.09〜1.5 倍で無料実行し、同一コードで drift p95 が 40→92 ms と揺れる。04 §9）。
     func testAC3PlaybackKeepsDriftSmallAndNoUnderruns() async throws {
         let url = try fixtureURL("ntsc480i-ac3-01.mpg")
         let (outcome, box) = try await playToEnd(url)
@@ -84,20 +88,25 @@ final class AudioPlaybackTests: XCTestCase {
             return
         }
 
-        // —— ここから先は device がある環境の実測検査（04 §5 の目標値）——
-        // 注意: CI のランナーは「実時間ペーシングを持たない仮想装置」で走ることがある
-        // （実測: clock が約 1.09 倍で進む = 装置の無料実行）。その環境での drift は
-        // 設計分布ではなく上限値なので、帯域の判定は 80 ms（04 §5 の drop/repeat 段階の上限）
-        // までとする。実機（内蔵出力）での実測分布は 04 §9（p95 +10.6 ms）。
+        // clock が立っている = 装置 start 成功。Drift 採样と underrun 計は常に存在を見る。
         XCTAssertFalse(outcome.clockDriftMS.isEmpty, "audio clock の drift 採样が無い")
+        XCTAssertLessThan(outcome.audioUnderrunEpisodes, 5,
+                          "underrun 多発: \(outcome.audioUnderrunEpisodes) 回、"
+                          + "合計 \(outcome.audioUnderrunTotalMS) ms")
+
+        let ratio = await audioDeviceRealTimeRatio()
+        print("audio device steady ratio: \(ratio.map { String(format: "%.3f", $0) } ?? "start 失敗")"
+            + " / drift samples=\(outcome.clockDriftMS.count)")
+        guard let ratio, (0.98...1.03).contains(ratio) else {
+            // 仮想装置（実時間ペーシングなし）: drift の値は装置の無料実行の産物で
+            // 設計分布ではない。ここでは数値を主張しない（数値の実測は 04 §9・実機）。
+            return
+        }
         let absoluteDrift = outcome.clockDriftMS.map(abs).sorted()
         let p95Index = max(0, min(absoluteDrift.count - 1,
                                   Int((Double(absoluteDrift.count) * 0.95).rounded(.up)) - 1))
         let p95 = absoluteDrift[p95Index]
-        XCTAssertLessThan(p95, 80, "drift p95 が 80 ms を超えた（04 §5 の drop/repeat 段階へ入る。実測: \(p95) ms）")
-        XCTAssertLessThan(outcome.audioUnderrunEpisodes, 5,
-                          "underrun 多発: \(outcome.audioUnderrunEpisodes) 回、"
-                          + "合計 \(outcome.audioUnderrunTotalMS) ms")
+        XCTAssertLessThan(p95, 40, "実時間装置での drift p95 が 40 ms を超えた（04 §5 の補正段階。実測: \(p95) ms）")
     }
 
     /// 音声なし素材（MPEG-2 単体）は #11 と同じ暫定 pacing で動く（audio 線の不在が無害）。
@@ -145,4 +154,50 @@ private final class PlayerSnapshotBox: @unchecked Sendable {
     var done: Bool { lock.lock(); defer { lock.unlock() }; return sawEnded || sawFailed != nil }
     var failedMessage: String? { lock.lock(); defer { lock.unlock() }; return sawFailed }
     var endedFlag: Bool { lock.lock(); defer { lock.unlock() }; return sawEnded }
+}
+
+// MARK: - 音声装置の実時間ペーシングprobe（環境の自己申告にしない）
+
+/// 0.995..1.02 を pass とする。**実測で較正する**: 内蔵出力では start 直後の 1 s で 0.252、
+/// 追加 2 s 待った後の 1 s 窓では 1.000（装置の起動・スレッド起上に 2〜3 s かかり、定常後は
+/// 実時間どおり）。pass 帯域と測定窓はこの実測どおりにする（推測で狭くしない）。
+private func audioDeviceRealTimeRatio() async -> Double? {
+    let engine = AVAudioEngine()
+    let player = AVAudioPlayerNode()
+    engine.attach(player)
+    guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 48_000,
+                                     channels: 2, interleaved: true) else { return nil }
+    engine.connect(player, to: engine.mainMixerNode, format: format)
+    do {
+        engine.prepare()
+        try engine.start()
+    } catch {
+        return nil
+    }
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(240_000)) else {
+        engine.stop(); return nil
+    }
+    buffer.frameLength = 240_000      // 5 s ぶん（測定窓 + 装置の起動ユルミ）
+    player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+    player.play()
+    func pollRenderedMS() async -> Double {
+        var frames: Double = 0
+        let until = ContinuousClock.now
+        while ContinuousClock.now < until + .milliseconds(1000) {
+            if let node = player.lastRenderTime, let pt = player.playerTime(forNodeTime: node) {
+                frames = max(frames, Double(pt.sampleTime))
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return frames / 48.0
+    }
+    let first = await pollRenderedMS()
+    let warm = await pollRenderedMS()      // 装置が起き上がったかの確認（この窓は捨てる）
+    let second = await pollRenderedMS()
+    player.stop()
+    engine.stop()
+    let ratio = (second - warm) / 1000.0   // 2 s 目以降の 1 s 窓の実時間比
+    print(String(format: "device probe: firstWindow=%.0fms warmWindow→ steadyRatio=%.3f",
+                 first, ratio))
+    return ratio
 }
