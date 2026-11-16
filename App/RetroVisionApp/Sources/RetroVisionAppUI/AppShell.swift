@@ -13,6 +13,10 @@ public struct RetroVisionAppBody: App {
         // アクティベーションポリシーを明示してメニューバーとドックを持つ通常アプリにする。
         NSApplication.shared.setActivationPolicy(.regular)
         _model = State(initialValue: PlayerViewModel(engine: DefaultPlayerEngine()))
+        // 起動時 QA 入口（RV_AUTO_OPEN）。RootView.onAppear では走らせない —
+        // 実測 2026-11-17: 画面ロック中の起動では onAppear 自体が発火しない
+        // （RV_DEBUG_ACTIVITY の登録ログが一行も出ないで窓だけ居た）。
+        _model.wrappedValue.autoOpenFromLaunchEnvironment()
     }
 
     public var body: some Scene {
