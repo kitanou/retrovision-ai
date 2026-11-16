@@ -157,6 +157,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **.ended からの運送（同実測で判明した操作不能バグ）**: PICHI 実 ISO でタイトル終了後、`play` も `seek` も guard に弾かれて何も押せない状態になっていた（UI の position だけ scrub で 0 に動き engine と乖離）。決定: `ended` からの `play` = 古い線を stop → `seek(.zero)` で線を作り直し最初から再生。`ended` からの `seek` = 指定位置で `paused` に落ち着く（自動再生しない）。境界として、seek した 0 と PTS=0 初帧の**二重 0** が position の strictly increasing contract（02 §4・#14）と衝突するため、engine の position 配送は「published 済みと同じ值是黙る」に厳格化（0 地点の初期化イベントは seek/load 側の単一経路が既に送っている）。
 - 検査: window フラグの生成（既定 false → 映像面載せで true、layout 再宣言）、owner 配送 callback、実線 fixture で「終了→再生し直し→全帧提示・position は 0 再出発から strict 増・2 度目の .ended」の e2e。
 - API 気づき: `NSResponder` の Swift 名は `mouseMoved(with:)`。NSWindow の `acceptsMouseMovedEvents` は既定 false（tracking area の無い plain NSView 上のホバーで mouse-moved が生成されない理由）。`NSWindow(contentRect:styleMask:backing:defer:)` は test で使え、`contentView=` 代入で viewDidMoveToWindow が走る（headless で生成契約を検証できた）。
+- 実機 e2e 検証（統合前・分支ビルドを実行し CGEvent/HID 合成入力で測定済み）: 再生→活動→2.5 s でバー自動非表示→pure mouseMoved sweep で再表示（画面検査 + monitor 発火の実測 count）。切り分けのために `RV_DEBUG_ACTIVITY=1` のオプトイン stderr 診断を残す（既定は沈黙。「アプリはログを書かない」方針は不変。binary を直接起動して stderr を取れる形でのみ観測可能）。
 
 
 ## 意思決定の運用
