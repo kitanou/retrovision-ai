@@ -179,7 +179,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 ### 2026-11-17 — 起動時 QA 入口: RV_AUTO_OPEN / RV_DEBUG_POSITION（opt-in env）
 
 - **動機（実測環境の制約）**: 実盤 live 検証をしようとした夜、Mac はロック画面（要パスワード）で GUI 自動化が不能。RV_DEBUG_PSREPAIR / RV_DEBUG_ACTIVITY と同じ opt-in env 约定で、画面を出せない環境からも運送の数値を確認できる入口を作る。
-- **RV_AUTO_OPEN=<path>**: RootView.onAppear から `PlayerViewModel.autoOpenFromLaunchEnvironment()` を呼ぶ。設定時だけ起動時にその URL を open する（未設定では何もしない = 既定起動の不変。first-play 政策などの意味は通常の open と共有 — 政策の重複実装を作らない）。
+- **RV_AUTO_OPEN=<path>**: `RetroVisionAppBody.init` で `PlayerViewModel.autoOpenFromLaunchEnvironment()` を呼ぶ。設定時だけ起動時にその URL を open する（未設定では何もしない = 既定起動の不変。first-play 政策などの意味は通常の open と共有 — 政策の重複実装を作らない）。**実測で配線を差し替え**: 当初 RootView.onAppear に置いたが、画面ロック中の起動では onAppear 自体が発火しない（RV_DEBUG_ACTIVITY の monitor 登録ログが一行も出ず、窓だけ存在した実測）。init は画面状態に依存しない。
 - **RV_DEBUG_POSITION=<any>**: PlayerViewModel の events 経路にだけ乗る stderr 診断（`rvtransport:` 行）。phase / selection は毎回、position は 1 s 粒度（フレーム毎で埋めない）。UI 側ミラーの単一更新経路（#17）の観測を写すだけで、engine の契約は変えない。
 - **検査**: auto-open の発火・未設定 noop（既定起動の意味不変）、QA 入口が first-play 政策（menu 既定選択）を通ること。実盤 live 計測はこの夜は画面ロックのため GUI 側は未実施（朝の解錠待ち）。エンジン側の実盤計測は device-gated 検査と RV_AUTO_OPEN 実行の组合せで実施。
 
