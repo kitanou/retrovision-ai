@@ -491,10 +491,13 @@ final class SegmentPSDemuxerTests: XCTestCase {
     private func timestampField(seconds: Double, dts: Bool = false) -> [UInt8] {
         let pts = UInt64((seconds * 90_000).rounded()) & 0x1_FFFF_FFFF
         let lead: UInt64 = dts ? 0b0001 : 0b0011
-        let field: UInt64 = (lead << 36)
-            | ((pts >> 30) & 0x7) << 33 | (1 << 32)
-            | ((pts >> 15) & 0x7FFF) << 17 | (1 << 16)
-            | ((pts & 0x7FFF) << 1) | 1
+        let f1: UInt64 = lead << 36
+        let f2: UInt64 = ((pts >> 30) & 0x7) << 33
+        let f3: UInt64 = 1 << 32
+        let f4: UInt64 = ((pts >> 15) & 0x7FFF) << 17
+        let f5: UInt64 = 1 << 16
+        let f6: UInt64 = (pts & 0x7FFF) << 1
+        let field: UInt64 = f1 | f2 | f3 | f4 | f5 | f6 | 1
         return [UInt8((field >> 32) & 0xFF), UInt8((field >> 24) & 0xFF),
                 UInt8((field >> 16) & 0xFF), UInt8((field >> 8) & 0xFF), UInt8(field & 0xFF)]
     }
@@ -604,7 +607,12 @@ enum ProgramStreamRepairTests {
                 let at = i + 9   // startcode(4)+len(2)+marker+flags+hdrlen(3 bytes 分) = 9
                 let v: UInt64 = (UInt64(bytes[at]) << 32) | (UInt64(bytes[at + 1]) << 24)
                     | (UInt64(bytes[at + 2]) << 16) | (UInt64(bytes[at + 3]) << 8) | UInt64(bytes[at + 4])
-                let pts = Int64((((v >> 33) & 7) << 30) | (((v >> 17) & 0x7FFF) << 15) | ((v >> 1) & 0x7FFF))
+                // 明示分解（単一の複合式は CI の swift build で型検査時間超過の実測 2026-11-17。
+                // ProgramStreamRepair.timestampValue と同じ canonical 手順の独立実装）。
+                let p3032: UInt64 = (v >> 33) & 7
+                let p1529: UInt64 = (v >> 17) & 0x7FFF
+                let p014: UInt64 = (v >> 1) & 0x7FFF
+                let pts = Int64((p3032 << 30) | (p1529 << 15) | p014)
                 out.append(Double(pts) / 90_000.0)
                 i += 4
                 continue
