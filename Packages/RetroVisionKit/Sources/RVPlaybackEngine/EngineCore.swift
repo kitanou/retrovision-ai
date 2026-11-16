@@ -164,7 +164,17 @@ public actor EngineCore {
                 Task { await self?.handleSessionEvent(event) }
             })
         self.session = session
+        if let videoSink { await session.setVideoSink(videoSink) }
         self.sessionRunning = false
+    }
+    /// 保持する提示サーフェス（OQ-26）。セッション再生成（トラック切替・item 切替）で貼り直す。
+    private var videoSink: (any VideoPresentSink)?
+
+    /// 提示サーフェスの設定（OQ-26 の暫定ハンドオフ）。nil で計測のみ提示に戻す。
+    /// 実際の提示（#5 の Metal）が実装されるまで、UI はこの経路で frame を受け取る。
+    public func setVideoSink(_ sink: (any VideoPresentSink)?) async {
+        videoSink = sink
+        await session?.setVideoSink(sink)
     }
     private typealias Pipeline = (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription,
                                   audioTrack: TrackID?, audioFormat: AudioFormatDescription?)

@@ -44,6 +44,9 @@ public struct PlaybackOutcome: Sendable {
     public var warmupStageMS: [Double] = []
     /// seek 1 回の wall time（preroll 込み。04 §6 の 0.2〜1.5 s 設計に対する実測点、#13）。
     public var seekMS: [Double] = []
+    /// 提示サーフェスへ渡せなかった帧数（OQ-26 の暫定ハンドオフ。in-flight 上限超過）。
+    /// 再生（presented）は止めない — 表示側の取りこぼしの計数。
+    public var displayMissed: Int = 0
     public var errors: [String] = []
 
     public init() {}
@@ -126,6 +129,17 @@ public actor PlaybackSession {
     private var lastPresentHost: HostTime?
     private var lastPresentedPTS: MediaTime?
     private var pauseHost: HostTime?
+
+    // 提示サーフェスへのハンドオフ（OQ-26。#5 の Metal 提示までの暫定経路）。
+    private var videoSink: (any VideoPresentSink)?
+    private var videoInFlight = 0
+    private static let maxVideoInFlight = 3   // 00 §5 の in-flight 上限
+
+    /// nil で計測のみ提示（#11 の動作）に戻る。セッション再生成時（トラック切替等）は
+    /// EngineCore 側が保持している sink を貼り直す。
+    public func setVideoSink(_ sink: (any VideoPresentSink)?) {
+        videoSink = sink
+    }
 
     // 音声線
     private var audioClock: AudioClock?
@@ -578,8 +592,33 @@ public actor PlaybackSession {
         lastPresentHost = now
         lastPresentedPTS = frame.pts
         outcome.stats.total = max(outcome.stats.total, outcome.demuxedSampleCount)
+        deliverToSurface(frame)
         sampleDrift(at: now, presentedPTS: frame.pts)
         report?(.position(frame.pts))
+    }
+
+    /// 提示済み帧を UI のサーフェスへ渡す（OQ-26 の暫定経路。#5 の Metal 提示ではこの
+    /// 経路は使わず、engine が drawable 予約に描く 05 §7 の形になる）。
+    /// in-flight（受領中の帧）が上限を越えたら**渡さない** — 再生は止めない（INV-1）。
+    /// 渡した帧には lease を取る: サーフェスが描き終わるまで资源が生きていることの記録で、
+    /// 01 §4 の lease 違反診断と同じ回路に乗る。
+    private func deliverToSurface(_ frame: DecodedVideoFrame) {
+        guard let sink = videoSink else { return }
+        guard videoInFlight < Self.maxVideoInFlight else {
+            outcome.displayMissed += 1
+            return
+        }
+        videoInFlight += 1
+        let leaseToken = frame.retainForUse(reason: "display")
+        Task { [weak self] in
+            await sink.receive(frame)
+            leaseToken.release()
+            await self?.surfaceHandoffFinished()
+        }
+    }
+
+    private func surfaceHandoffFinished() {
+        videoInFlight = max(0, videoInFlight - 1)
     }
 
     /// drift 采样（04 §5 の符号系: + = 映像が遅れている）。100 ms 間隔で十分（UI 表示・

@@ -117,6 +117,17 @@ public struct AdvancedSettings: Sendable, Hashable {
 
 // MARK: - プロトコル
 
+/// 提示サーフェスへのハンドオフ（OQ-26 の暫定経路。#5 の Metal 提示に差し替えるまでの間、
+/// 提示済み帧を UI 側の実装へ渡す）。契約は 05 §7 の前借りだが、GPU 段を通さないため
+/// 「engine が drawable 予約に描く」ではなく「提示済み帧を渡す」形になる。
+///
+/// - engine は**提示（present）を済らせた帧だけを**渡す（late でも presented は増える設計どおり）。
+/// - サーフェスが遅れても engine は止まらない（INV-1）: in-flight 上限（00 §5 の 3）を越えた
+///   帧は渡さず `PlaybackOutcome.displayMissed` に数える。
+public protocol VideoPresentSink: Sendable {
+    func receive(_ frame: DecodedVideoFrame) async
+}
+
 @MainActor
 public protocol PlayerEngine: AnyObject {
     func load(_ source: any MediaSource, selection: PlaybackSelection) async throws -> MediaStructure
