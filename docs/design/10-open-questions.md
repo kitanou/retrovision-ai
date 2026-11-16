@@ -246,3 +246,9 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査**: ±8 の市松ノイズ領域の振れ幅が半分未満に均され、強い edge の暗側・明側が保たれること、strength 0 は恒等であること（`MetalPipelineTests`）。
 - **未実施**: 実素材での評価（顔・アニメ線画・粒子を塗り潰さないかの主観評価、before/after キャプチャ — 07 §7）、protect / targets の実際の反映（現状は strength のみ）、GPU 時間の実測、UI からの強度操作の配線。
 
+### 2026-11-17 — #5 A1d: CadenceAnalyzer（05 §5.1 の判定ロジック。GPU 非依存）
+
+- **決定**: frame ごとの comb スコア（1 frame 内の 2 field の不一致量。`rv_fieldMatch_sad_v1` の block SAD から host 側が作る）を `CadenceAnalyzer.ingest(combScore:)` に流すと `CadenceDecision { cadence, confidence, telecinePhase, evidence }` が返る。3:2 telecine の周期 `[clean, clean, combed, combed, clean]` に直近 10 frame が完全一致したら `.telecine32`（位相付き、confidence 1.0）。ロック中は予測と 2 frame 連続で食い違ったら抜ける（hysteresis 2 frame。1 frame の食い違いは静止場面の取りこぼしとして許容）。窓が満ちる前（9 frame まで）は telecine を宣言しない（誤検出による 24p 化の回避）。telecine でない場合は縞なし → `.progressive`、8 割以上 → `.interlaced22`、その他 → `.mixed`。根拠は窓のビット列の FNV-1a 64 を `evidence` に残す（09 §5）。
+- **検査**: 5 つの位相すべてで 10 frame 目にロックし位相が合う、全縞あり / 全縞なしの分類、9 frame ではロックしない、1 回の食い違いでは抜けず 2 連続で抜ける、telecine → 全縞ありで interlaced22 に落ち着く、根拠の再現性（`CadenceAnalyzerTests`）。
+- **未実装（A1 の残り）**: comb スコアを GPU の SAD kernel から取り出して analyzer へ流す配線、`.auto` の mode 選択（telecine → inverseTelecine）、inverseTelecine の復元と 2:3 提示、`CadenceDecision` の plan / 診断への記録。OQ-22（60i の film-origin pull-down）の実素材検証（#15）も要る。
+
