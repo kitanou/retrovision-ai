@@ -94,9 +94,17 @@ public actor PlaybackSession {
     }
 
     public enum Event: Sendable {
-        case position(MediaTime)
+        /// 提示済み帧の位置。`seekGeneration` を載せる: 提示時点で session が持っていた seek
+        /// 世代（#13 のガードと同じ値）で、受け取り側は古い線の後出しイベントを区別できる。
+        /// （EngineCore の await で Task が後回しにされると、古い提示が新しい seek 位置より
+        /// 「後」に届きうる。2026-11-16 の CI で実測: 3.0 s の target イベントの後に
+        /// 1.6 s 台の位置が混入した。契約は position の非逆行 — 02 §4）。
+        case position(_ pts: MediaTime, seekGeneration: Int)
         case finished(PlaybackOutcome)
     }
+
+    /// 現在の seek 世代（読み取り専用。EngineCore が位置イベントの新旧を照合する）。
+    public var currentSeekGeneration: Int { generation }
 
     private let demuxer: any Demuxer
     private let decoder: any VideoDecoder
@@ -600,7 +608,7 @@ public actor PlaybackSession {
         outcome.stats.total = max(outcome.stats.total, outcome.demuxedSampleCount)
         deliverToSurface(frame)
         sampleDrift(at: now, presentedPTS: frame.pts)
-        report?(.position(frame.pts))
+        report?(.position(frame.pts, seekGeneration: generation))
     }
 
     /// 提示済み帧を UI のサーフェスへ渡す（OQ-26 の暫定経路。#5 の Metal 提示ではこの

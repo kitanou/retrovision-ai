@@ -29,7 +29,7 @@ private final class EventBox: @unchecked Sendable {
     func append(_ event: PlaybackSession.Event) {
         lock.lock(); defer { lock.unlock() }
         switch event {
-        case .position(let pts): _positions.append(pts)
+        case .position(let pts, _): _positions.append(pts)
         case .finished(let outcome): _outcome = outcome
         }
     }

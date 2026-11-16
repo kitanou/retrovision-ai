@@ -167,6 +167,7 @@ public actor EngineCore {
                 Task { await self?.handleSessionEvent(event, line: line) }
             })
         self.session = session
+        expectedPositionGeneration = await session.currentSeekGeneration   // 新 session: 生成時点の世代から受理
         if let videoSink { await session.setVideoSink(videoSink) }
         if volumeGain != 1.0 { await session.setVolume(volumeGain) }
         self.sessionRunning = false
@@ -229,6 +230,9 @@ public actor EngineCore {
                                              clockDriftMS: 0))
         if let session {
             await session.seek(to: time, tolerance: tolerance)
+            // seek 完了で session の世代が進んだ。ここから先の position イベントはこの世代のみ受理
+            // （次の transition まで同一の actor turn なので、旧世代の後出しは起きない）。
+            expectedPositionGeneration = await session.currentSeekGeneration
         } else if pipeline != nil, activePlan ?? pendingPlan != nil {
             // 実行中のセッションが無い（open 直後等）: seek 位置の状態で作り、warmup まで行う。
             if let pipeline {
@@ -258,6 +262,10 @@ public actor EngineCore {
         await session?.setVolume(volumeGain)
     }
     private var volumeGain = 1.0
+
+    /// 受理する position イベントの seek 世代（session の #13 ガードと同じ値で照合する。
+    /// 古い線の後出しを捨て、position の非逆行を守る — 02 §4、決定ログ #14）。
+    private var expectedPositionGeneration = 0
 
     /// 再生線の generation（#13 のセッション内ガードの engine 側対応。actor の reentrancy で
     /// close/load と in-flight の seek が交差すると、遅れて復帰した seek が phase を復活させる。
@@ -342,7 +350,18 @@ public actor EngineCore {
     private func handleSessionEvent(_ event: PlaybackSession.Event, line: Int) async {
         guard line == lineGeneration else { return }   // 古い線の closer（close/load 済み）
         switch event {
-        case .position(let pts):
+        case .position(let pts, let seekGeneration):
+            // 位置イベントの契約（02 §4。2026-11-16 の CI で実測した逆行の修正 — 決定ログ #14）。
+            // 三重の濾過:
+            //  ① seeking のあいだは全て黙る（UI は target を表示済み。この窓のイベントは
+            //    古い線の後出しか、早期すぎて意味が無い）。
+            //  ② 旧 seek 世代のイベントは捨てる（session の #13 ガードと同じ世代値で照合。
+            //    await で遅延実行された旧提示の Task が新 target の「後」に届く構造を消す）。
+            //  ③ 床ガード: engine が一度出した位置（= 運送操作の target も含む）より
+            //    小さい値は出さない（非逆行を出力点で決定的に保証する）。
+            if case .seeking = phase { return }
+            guard seekGeneration >= expectedPositionGeneration else { return }
+            guard pts.seconds >= position.seconds else { return }
             position = pts
             // イベント洪水を防ぐ（UI 向け 0.25 s 間隔。診断は outcome を見る）。
             if lastPositionEmitSeconds == nil || pts.seconds - (lastPositionEmitSeconds ?? -1) >= 0.25 {

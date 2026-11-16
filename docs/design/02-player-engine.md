@@ -122,6 +122,17 @@ public enum PlayerEvent: Sendable {
 | `statisticsFlushed` | 1 Hz | 診断パネル用。通常 UI は無視できる |
 | `structureChanged` / `tracksChanged` | 開く時・item 変更時のみ | — |
 
+**position の非逆行契約（#2 の CI で実測した逆行の修正。2026-11-16）**: `positionUpdated` は
+engine が一度出した位置から**自発的に逆行しない**（逆行してよいのは seek の target イベントだけ。
+UI のつまみ・時刻表示は逆行すると巻き戻りと区別できない）。engine 実行系は actor なので
+session の提示報告（Task 経由）が await で後回しにされ、古い提示が新しい target より「後」に
+届きうる（実測: seek(3.0 s) の target イベントの後に 1.6 s 台の位置が混入した）。対策は
+engine の受け口での三重の濾過で、session 側の seek 世代（`PlaybackSession.Event.position` の
+`seekGeneration`。#13 のガードと同じ値）を照合する: ①`.seeking` 中は全ての position を黙る
+（UI は target を表示済み）②受理対象より古い seek 世代を捨てる ③受理位置以下を捨てる。
+テスト: `AudioPlaybackTests.testSeekDuringPlaybackResumesWithAudioClockRunning` の
+位置単調増加ループ（この契約の検査そのもの。CI で毎 push 走る）。
+
 ## 5. PlayerSettings（設定モデルの境界）
 
 `PlayerSettings` は**ユーザー設定（永続）と実行中の policy（一時的）を分離**する。
