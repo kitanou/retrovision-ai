@@ -173,7 +173,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 
 - **決定（列の約束）**: `VideoTsChain.isMenu` を追加。`VIDEO_TS.VOB` を `vtsNumber 0`・`isMenu true` のチェーンとして chains 先頭に置く。`VideoTsMediaSource` は `MediaItem(id: ItemID(0), titleNumber: 0)` を同じ経路で作り、UI は titleNumber 0 を「メニュー」と表示（model 変更なし。0 は menu 予約値）。VTS_nn_0.VOB（VTS メニュー）は対象外継続。多重 part VMGM 未対応（観測例なし。OQ 扱いで形式外 name warning に残す）。
 - **決定（選択の構造駆動化）**: `PlayerEngine.load(_:selection:)` の selection を `PlaybackSelection?` に（nil = open 後 structure 先頭 item で engine が解決し selectionChanged を単一経路で流す。tracksChanged より先）。menu の有无に関わらず「Disc を開くと盤が選ぶ順序で始まる」を engine 側ではなく**構造の順序**で表現する。明示指定の既存呼び出しは不変。
-- **決定（first-play 政策は PlayerViewModel。engine に意味を渡さない）**: 構造に titleNumber 0 が在るときだけ自动再生（実機の盤挿入=再生開始）。無い素材は #17 user gate 不変。menu `.ended` → 最初の本体タイトル（titleNumber 最小）へ `select(item:)`+`play()` 自動進行（phaseChanged(.ended) からのみ発火、`menuAdvancePending` ガード、selectionChanged で解除）。
+- **決定（first-play 政策は PlayerViewModel。engine に意味を渡さない）**: 構造に titleNumber 0 が在るときだけ自动再生（実機の盤挿入=再生開始）。無い素材は #17 user gate 不変。menu `.ended` → ~~最初の本体タイトルへ自動進行~~ **2026-11-17 改訂: menu を `play()` で再生し直して繰り返す**（本体へはタイトル一覧から。尺不明・1 秒未満の menu は終端で停止。phaseChanged(.ended) からのみ発火、`menuLoopPending` ガード、`.playing` で解除）。
 - **検査**: navigator（menu 先頭/無し/nn_0 除外）、engine e2e（items [0,1,2]・menu 完走 120/ended）、PlayerViewModelTests（auto-select+auto-play、自動進行 1 回だけ、menu 無しで自动再生しない）。Interactive menu（VMGM PGCI の PU 命令）は未実装 — メニューは video として线性再生するだけ（IFO パース増分とセットの次項。03 §9.7 限界メモ）。
 
 ### 2026-11-17 — 起動時 QA 入口: RV_AUTO_OPEN / RV_DEBUG_POSITION（opt-in env）
