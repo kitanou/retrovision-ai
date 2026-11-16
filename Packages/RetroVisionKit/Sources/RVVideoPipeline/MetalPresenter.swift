@@ -54,6 +54,21 @@ public enum PresentDropReason: String, Sendable { case inFlightLimit, drawableLo
 public final class MetalPresenter: @unchecked Sendable {
     public static let maxInFlight = 3   // 00 §5
 
+    /// 予約時刻の決め方。
+    /// - `.anchoredGrid`: 自前の anchor（CA host ↔ PTS）に沿って vsync グリッドへ予約する（05 §7 の設計形）。
+    /// - `.immediate`: 呼ばれた時点の次の vsync で表示する。engine が音声 clock で既に
+    ///   「提示時刻」を決めて渡してくる構成（PlaybackSession.presentDue）では、こちらを使う —
+    ///   二つ目の時間軸（presenter の anchor）が audio clock と競合するのを避ける。
+    ///   seek で PTS が飛んでも予約が未来へずれない。
+    public enum Timing: Sendable { case anchoredGrid, immediate }
+    public var timing: Timing {
+        get { lock.withLock { _timing } }
+        set { lock.withLock { _timing = newValue } }
+    }
+    private var _timing: Timing = .anchoredGrid
+    /// 最後に描いた入力（窓リサイズ・一時停止中の再描画用。pixel buffer を保持する）。
+    private var lastRendered: (input: RenderFrameInput, plan: RenderPlan, pts: MediaTime)?
+
     private let graph: MetalRenderGraph
     private let lock = NSLock()
     private weak var layer: CAMetalLayer?
@@ -110,9 +125,13 @@ public final class MetalPresenter: @unchecked Sendable {
         }
 
         let nowS = CACurrentMediaTime()
-        let (presentAtS, scheduledS) = scheduledTime(pts: pts, nowS: nowS)
+        let immediate = lock.withLock { _timing == .immediate }
+        let (presentAtS, scheduledS) = immediate ? (nowS, nowS) : scheduledTime(pts: pts, nowS: nowS)
         let frameID = input.frameID ?? FrameID(0)
+        lock.withLock { lastRendered = (input, plan, pts) }
+        let retainedBuffer = input.pixelBuffer   // GPU が読み終える（提示完了）まで復号 buffer を生かす
         drawable.addPresentedHandler { [weak self] drew in
+            _ = retainedBuffer
             let presentedS = drew.presentedTime     // 秒。未提示・スキップは 0
             if presentedS > 0 {
                 let record = PresentRecord(frameID: frameID, pts: pts,
@@ -123,9 +142,20 @@ public final class MetalPresenter: @unchecked Sendable {
             }
             self?.decrement()
         }
-        drawable.present(at: presentAtS)
+        if immediate { drawable.present() } else { drawable.present(at: presentAtS) }
         return .scheduled
     }
+
+    /// 最後に描いた frame を現在の drawable 寸法で描き直す（窓リサイズ・一時停止中の再描画）。
+    /// 描いた frame が無い、layer が無い、in-flight 上限のときは nil。
+    @discardableResult
+    public func redrawLast() -> PresentOutcome? {
+        guard let last = lock.withLock({ lastRendered }) else { return nil }
+        return try? present(last.input, plan: last.plan, pts: last.pts)
+    }
+
+    /// 保持している最後の frame を手放す（close・item 切替。復号 buffer を生かし続けない）。
+    public func clearLast() { lock.withLock { lastRendered = nil } }
 
     /// 提示完了記録の受け口（engine が設定する。nil のままでも提示は続く）。
     public var onPresented: (@Sendable (PresentRecord) -> Void)? {

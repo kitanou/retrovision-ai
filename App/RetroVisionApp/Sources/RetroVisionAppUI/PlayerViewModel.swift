@@ -2,6 +2,7 @@ import AVKit
 import AppKit
 import CoreMedia
 import Foundation
+import QuartzCore
 import Observation
 import RVMediaCore
 import RVMediaSources
@@ -17,6 +18,18 @@ import RVPlaybackEngine
 @MainActor
 protocol VideoSurfaceBinding: AnyObject {
     func attachVideoSink(_ sink: (any VideoPresentSink)?) async
+    /// Metal 提示面（#5）。接続できなければ false（呼び出し側は暫定経路を使う）。
+    func attachMetalSurface(layer: CAMetalLayer,
+                            onAspectResolved: @escaping @Sendable (Double) -> Void) async -> Bool
+    func detachMetalSurface() async
+    func redrawMetalSurface()
+}
+
+extension VideoSurfaceBinding {
+    func attachMetalSurface(layer: CAMetalLayer,
+                            onAspectResolved: @escaping @Sendable (Double) -> Void) async -> Bool { false }
+    func detachMetalSurface() async {}
+    func redrawMetalSurface() {}
 }
 
 extension DefaultPlayerEngine: VideoSurfaceBinding {
@@ -352,6 +365,32 @@ final class PlayerViewModel {
     }
 
     // MARK: - 提示サーフェスの配線（view が layer を作ったときに呼ぶ）
+
+    /// view が作った提示面を engine へ接続する。Metal（既定）は engine が drawable へ描き、
+    /// 比率は engine から通知される。Metal に接続できなければ暫定の sink 経路へ戻る（OQ-26）。
+    func attachSurface(_ layer: VideoSurfaceLayer) {
+        switch layer {
+        case .legacy(let displayLayer):
+            attachSurface(layer: displayLayer)
+        case .metal(let metalLayer):
+            surface = nil
+            let onAspect: @Sendable (Double) -> Void = { [weak self] dar in
+                Task { @MainActor [weak self] in
+                    if self?.displayAspectValue != dar { self?.displayAspectValue = dar }
+                }
+            }
+            Task {
+                let attached = await self.surfaceBinding?.attachMetalSurface(layer: metalLayer,
+                                                                             onAspectResolved: onAspect)
+                if attached != true { logTransport("metal surface unavailable") }
+            }
+        }
+    }
+
+    /// Metal の drawable 寸法が変わったときに最後の frame を描き直す。
+    func redrawSurface() {
+        surfaceBinding?.redrawMetalSurface()
+    }
 
     func attachSurface(layer: AVSampleBufferDisplayLayer) {
         let sink = SurfaceSink(layer: layer) { [weak self] dar in

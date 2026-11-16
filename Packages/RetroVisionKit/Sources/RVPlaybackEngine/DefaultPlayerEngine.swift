@@ -1,5 +1,6 @@
 import Foundation
 import RVMediaCore
+import QuartzCore
 import RVMediaSources
 
 // MARK: - PlayerEngine への適合（02 §2 の「実装クラス」）
@@ -122,5 +123,35 @@ public final class DefaultPlayerEngine: PlayerEngine {
     /// 提示サーフェスの配線（OQ-26 の暫定ハンドオフ）。#5 の Metal 提示では不要になる。
     public func setVideoSink(_ sink: (any VideoPresentSink)?) async {
         await core.setVideoSink(sink)
+    }
+
+    // MARK: Metal 提示面（#5。OQ-26 の暫定経路の置換）
+
+    private var metalPresenter: MetalFramePresenter?
+
+    /// Metal 提示面を接続する。UI は CAMetalLayer を渡すだけで、RVVideoPipeline を知らない（INV-8）。
+    /// Metal デバイスが無い環境では false を返し、呼び出し側は暫定の sink 経路を使う。
+    /// `onAspectResolved` は表示比率（targetDAR）が決まる・変わるたびに呼ばれる。
+    @discardableResult
+    public func attachMetalSurface(layer: CAMetalLayer,
+                                   onAspectResolved: @escaping @Sendable (Double) -> Void) async -> Bool {
+        if metalPresenter == nil { metalPresenter = MetalFramePresenter() }
+        guard let presenter = metalPresenter else { return false }
+        presenter.attachLayer(layer)
+        presenter.setAspectHandler(onAspectResolved)
+        await core.setVideoPresenter(presenter)
+        return true
+    }
+
+    /// Metal 提示面を外す（view 破棄）。presenter 自体は残り、次の attach で再利用される。
+    public func detachMetalSurface() async {
+        metalPresenter?.attachLayer(nil)
+        metalPresenter?.setAspectHandler(nil)
+        await core.setVideoPresenter(nil)
+    }
+
+    /// 最後の frame を現在の drawable 寸法で再描画する（窓リサイズ・一時停止中）。
+    public func redrawMetalSurface() {
+        metalPresenter?.redraw()
     }
 }

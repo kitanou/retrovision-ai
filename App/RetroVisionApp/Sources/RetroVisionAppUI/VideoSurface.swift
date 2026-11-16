@@ -2,11 +2,13 @@ import AVKit
 import CoreMedia
 import CoreVideo
 import Foundation
+import Metal
+import QuartzCore
 import RVMediaCore
 import RVPlaybackEngine
 import SwiftUI
 
-// MARK: - 提示サーフェス（OQ-26 の暫定経路。#5 の Metal 提示に置き換わるまでの間つなぎ）
+// MARK: - 提示サーフェス（#5: 既定は Metal。OQ-26 の暫定経路は RV_LEGACY_PRESENT=1 のフォールバック）
 //
 // 05 §7 の正式経路は engine が CAMetalLayer の drawable 予約に描く形。暫定は
 // 「engine が present を済らせた帧を VideoPresentSink へ渡す」契約で、UI 側は
@@ -77,27 +79,77 @@ final class SurfaceSink: VideoPresentSink {
 
 // MARK: - SwiftUI 側の surface
 
-/// AVSampleBufferDisplayLayer をホストする view。親（PlayerScreenView）が
-/// displayAspectValue で枠の比率を決めるので、layer は枠いっぱいに .resize（引き伸ばさない）。
+/// 提示面の種類。既定は Metal（#5）。`RV_LEGACY_PRESENT` を設定すると暫定の
+/// AVSampleBufferDisplayLayer 経路（OQ-26）に戻せる。Metal デバイスが無い環境も同じく暫定経路。
+enum VideoSurfaceMode {
+    case metal, legacy
+    static var current: VideoSurfaceMode {
+        if ProcessInfo.processInfo.environment["RV_LEGACY_PRESENT"] != nil { return .legacy }
+        return MTLCreateSystemDefaultDevice() == nil ? .legacy : .metal
+    }
+}
+
+/// view がホストする提示面の layer。
+enum VideoSurfaceLayer {
+    case legacy(AVSampleBufferDisplayLayer)
+    case metal(CAMetalLayer)
+}
+
+/// 提示面をホストする view。親（PlayerScreenView）が displayAspectValue で枠の比率を決めるので、
+/// layer は枠いっぱい（引き伸ばさない）。Metal では drawableSize を view の実ピクセル寸法に保つ
+/// （窓リサイズ・全画面・Retina。寸法が変わったら最後の frame を描き直す）。
 final class VideoLayerView: NSView {
+    let mode: VideoSurfaceMode
     let videoLayer = AVSampleBufferDisplayLayer()
+    let metalLayer = CAMetalLayer()
+    /// drawable 寸法が変わった（窓リサイズ・全画面・backing scale 変更）。Metal の再描画用。
+    var onDrawableResized: (@MainActor () -> Void)?
     /// transport バー再表示のための活動配線（#22 の実装補完。nil の間は nobody に等しい）。
     /// local monitor とは独立の配送経路（両方届いても showControls は冪等なので無害）。
     var onControlsActivity: (@MainActor () -> Void)?
 
-    override init(frame frameRect: NSRect) {
+    convenience override init(frame frameRect: NSRect) {
+        self.init(mode: .current, frame: frameRect)
+    }
+
+    init(mode: VideoSurfaceMode = .current, frame frameRect: NSRect = .zero) {
+        self.mode = mode
         super.init(frame: frameRect)
         wantsLayer = true
-        layer = videoLayer
-        videoLayer.videoGravity = .resize
+        switch mode {
+        case .legacy:
+            layer = videoLayer
+            videoLayer.videoGravity = .resize
+        case .metal:
+            metalLayer.device = MTLCreateSystemDefaultDevice()
+            metalLayer.pixelFormat = .bgra8Unorm
+            metalLayer.framebufferOnly = true
+            metalLayer.displaySyncEnabled = true        // 05 §7
+            metalLayer.presentsWithTransaction = false  // UI との同期を待たない
+            metalLayer.maximumDrawableCount = 3         // in-flight 上限（00 §5）と揃える
+            layer = metalLayer
+        }
     }
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
     override func layout() {
         super.layout()
-        videoLayer.frame = bounds
-        videoLayer.contentsScale = window?.backingScaleFactor ?? 1.0
+        let scale = window?.backingScaleFactor ?? 1.0
+        switch mode {
+        case .legacy:
+            videoLayer.frame = bounds
+            videoLayer.contentsScale = scale
+        case .metal:
+            metalLayer.frame = bounds
+            metalLayer.contentsScale = scale
+            let size = CGSize(width: max(1, (bounds.width * scale).rounded()),
+                              height: max(1, (bounds.height * scale).rounded()))
+            if metalLayer.drawableSize != size {
+                metalLayer.drawableSize = size
+                onDrawableResized?()
+            }
+        }
         // fullscreen 遷移などで窓の属性が作り直される経路の保险（setter はフラグ書き換えのみ）。
         window?.acceptsMouseMovedEvents = true
     }
@@ -112,6 +164,7 @@ final class VideoLayerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        needsLayout = true   // backing scale が窓に載って初めて決まる（drawableSize の再計算）
     }
 
     /// 映像面上のマウス移動は owner 配送の受け口でもある（window が mouse-moved を生成した
@@ -124,7 +177,9 @@ final class VideoLayerView: NSView {
 }
 
 struct VideoSurfaceView: NSViewRepresentable {
-    let onLayer: @MainActor (AVSampleBufferDisplayLayer) -> Void
+    let onLayer: @MainActor (VideoSurfaceLayer) -> Void
+    /// Metal の drawable 寸法が変わった（再描画の契機）。
+    var onResize: (@MainActor () -> Void)? = nil
     /// transport バー再表示の活動配線（#22。window の mouse-moved 生成と owner 配送の
     /// 受け口を確保した上で、View 側に「動きをactivityとして扱う」意図を渡す）。
     var onActivity: (@MainActor () -> Void)? = nil
@@ -132,12 +187,17 @@ struct VideoSurfaceView: NSViewRepresentable {
     func makeNSView(context: Context) -> VideoLayerView {
         let view = VideoLayerView()
         view.onControlsActivity = onActivity
-        onLayer(view.videoLayer)
+        view.onDrawableResized = onResize
+        switch view.mode {
+        case .legacy: onLayer(.legacy(view.videoLayer))
+        case .metal: onLayer(.metal(view.metalLayer))
+        }
         return view
     }
 
     func updateNSView(_ nsView: VideoLayerView, context: Context) {
         nsView.onControlsActivity = onActivity
+        nsView.onDrawableResized = onResize
         nsView.needsLayout = true
     }
 }
