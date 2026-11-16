@@ -1,0 +1,265 @@
+import AVKit
+import AppKit
+import CoreMedia
+import Foundation
+import Observation
+import RVMediaCore
+import RVPlaybackEngine
+
+// MARK: - PlayerViewModel（#17「UI 状態とエンジンの対応」の実装点）
+//
+// 指針（#17 設計方針 2）: 表示状態はすべて PlayerStateSnapshot / PlayerEvent から導出し、
+// UI 側に遷移テーブルを持たない。コントロールの有効・無効も phase から computed property で
+// 導出する（#17 の表。PlayerViewModelTests で全 phase を固定する）。
+
+/// 提示サーフェスの配線口（composition root だけが知る。#17 の view tree で
+/// MetalVideoViewRepresentable 相当がここを通す。#5 の Metal 提示では不要になる — OQ-26）。
+@MainActor
+protocol VideoSurfaceBinding: AnyObject {
+    func attachVideoSink(_ sink: (any VideoPresentSink)?) async
+}
+
+extension DefaultPlayerEngine: VideoSurfaceBinding {
+    func attachVideoSink(_ sink: (any VideoPresentSink)?) async {
+        await setVideoSink(sink)
+    }
+}
+
+@MainActor
+@Observable
+final class PlayerViewModel {
+    // engine 由来の現在値（events からのみ更新する — ミラーの単一更新経路）。
+    private(set) var phase: EnginePhase = .empty
+    private(set) var position: MediaTime = .zero
+    private(set) var duration: MediaTime?
+    private(set) var availableTracks: [TrackInfo] = []
+    private(set) var selected: PlaybackSelection?
+    private(set) var quality = QualityPresentation()
+    private(set) var lastError: PlaybackError?
+    /// 表示比率（#17 の「AspectResolution で letterbox / pillarbox」の暫定版。
+    /// 最初の帧の format から AspectResolver で解いて決める。nil = 未知 = 1:1 画素比で仮表示）。
+    private(set) var displayAspectValue: Double?
+
+    // UI ローカルな状態（engine に意味を渡さない）。
+    var volume: Double = 1.0 {
+        didSet { Task { await engine.setVolume(muted ? 0 : volume) } }
+    }
+    var muted: Bool = false {
+        didSet { Task { await engine.setVolume(muted ? 0 : volume) } }
+    }
+    var aspectPolicy: AspectPolicy = .followSource {
+        didSet { Task { await engine.apply(currentSettings()) } }
+    }
+    var timelineScrubbing: Bool = false
+
+    let engine: any PlayerEngine
+    private let surfaceBinding: (any VideoSurfaceBinding)?
+    private var eventTask: Task<Void, Never>?
+    private var surface: SurfaceSink?
+    private var lastOpenedURL: URL?
+
+    init(engine: any PlayerEngine) {
+        self.engine = engine
+        // 既定のサーフェス対応（DefaultPlayerEngine / FakePlayerEngine の両方が適合する）。
+        if let binding = engine as? any VideoSurfaceBinding {
+            self.surfaceBinding = binding
+        } else {
+            self.surfaceBinding = nil
+        }
+        startEventPump()
+    }
+
+    private func startEventPump() {
+        eventTask?.cancel()
+        eventTask = Task { [weak self] in
+            guard let engine = self?.engine else { return }
+            for await event in engine.events() {
+                if Task.isCancelled { break }
+                self?.apply(event)
+            }
+        }
+    }
+
+    private func apply(_ event: PlayerEvent) {
+        switch event {
+        case .phaseChanged(let phase):
+            self.phase = phase
+            if case .failed(let error) = phase { lastError = error }
+            if case .empty = phase { lastError = nil }
+        case .positionUpdated(let position, let duration, _):
+            guard !timelineScrubbing else { return }   // ドラッグ中のつまみはユーザー操作に固定（#17）
+            self.position = position
+            if let duration { self.duration = duration }
+        case .structureChanged(let structure):
+            // 構造から表示材料を採る（item 1 個のファイル素材では duration / trackTable がここに乗る。
+            // DVD の item 一覧は Phase 2 のサイドバー側で扱う）。
+            if let duration = structure.items.first?.duration { self.duration = duration }
+            availableTracks = structure.items.first?.trackTable ?? []
+        case .tracksChanged(let tracks):
+            availableTracks = tracks
+        case .selectionChanged(let selection):
+            selected = selection
+        case .qualityChanged(let presentation):
+            quality = presentation
+        case .enhancementDegraded:
+            break   // Phase 1 は強調化の実働がない（#17 のプレースホルダ方針）。#9 でトースト化する
+        case .warning, .failure:
+            break   // failure は phase .failed として届く（#17 §9: インラインカードは phase 由来）
+        case .mediaRemoved:
+            closeItem()   // ディスク取出しは空状態へ戻す（位置保存は Phase 2・Sandbox）
+        case .statisticsUpdated:
+            break   // 診断 inspector は Phase 5（#9）
+        }
+    }
+
+    // MARK: - 有効・無効（#17 の表。phase から ONLY に導出する）
+    //
+    // 実測された形（EngineCore の実挙動）:
+    // - `.seeking` は transient で、直後に再生中へ戻る（04 §6 の手順 5。UI の transport は
+    //   再生継続のまま、つまみだけ target に固定される #17 §2）。
+    // - `.preparing` は load 中に一瞬通り、UI が購読する前に .ready へ進みうる（warmup を
+    //   load の中に済ませるため #12）。したがって preparing は「操作できない phase」ではなく
+    //   「再生開始だけ可、構造が必要な操作は不可」に緩める（#17 の表からの逸脱として決定ログに記録）。
+
+    var transportEnabled: Bool {
+        switch phase {
+        case .empty, .seeking, .failed: return false
+        case .preparing, .ready, .playing, .paused, .stalled, .ended: return true
+        }
+    }
+    var seekEnabled: Bool {
+        switch phase {
+        case .empty, .preparing, .seeking, .failed: return false
+        case .ready, .playing, .paused, .ended, .stalled: return true
+        }
+    }
+    var stepEnabled: Bool {
+        switch phase {
+        case .ready, .paused, .ended: return true
+        case .empty, .preparing, .playing, .seeking, .stalled, .failed: return false
+        }
+    }
+    var trackSelectionEnabled: Bool {
+        switch phase {
+        case .ready, .playing, .paused, .ended, .stalled: return true
+        case .empty, .preparing, .seeking, .failed: return false
+        }
+    }
+    var isPlaying: Bool {
+        if case .playing = phase { return true }
+        return false
+    }
+    var positionSeconds: Double { position.isValid ? position.seconds : 0 }
+    var durationSeconds: Double { duration?.seconds ?? 0 }
+
+    // MARK: - 操作（#17「呼ぶ」列）
+
+    func open(url: URL) {
+        lastOpenedURL = url
+        lastError = nil
+        Task {
+            do {
+                let selection = PlaybackSelection(item: ItemID(1))
+                _ = try await engine.load(FileMediaSource(url: url), selection: selection)
+                // 開いた直後は再生しない（#17: preparing → ready。transport は user gate）。
+            } catch let error as PlaybackError {
+                lastError = error
+            } catch {
+                lastError = PlaybackError(kind: .internalFailure(String(describing: error)),
+                                          recovery: .needsUserAction(.selectDifferentItem),
+                                          userMessage: "開けませんでした")
+            }
+        }
+    }
+
+    func presentOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        // 型フィルタは掛けない（#3 で VIDEO_TS / ISO まで一つの入口に載せる設計。
+        // 開けない素材は engine が .formatRejected / .unsupportedStructure で返す）。
+        if panel.runModal() == .OK, let url = panel.url {
+            open(url: url)
+        }
+    }
+
+    func retryLastOpened() {
+        if let url = lastOpenedURL { open(url: url) }
+    }
+
+    func playPause() {
+        Task {
+            if isPlaying {
+                await engine.pause()
+            } else {
+                await engine.play()
+            }
+        }
+    }
+
+    func closeItem() {
+        surface?.reset()
+        Task { await engine.close() }
+        position = .zero
+        duration = nil
+        availableTracks = []
+        displayAspectValue = nil
+    }
+
+    /// タイムライン操作（#17 §「UI 状態とエンジンの対応」の row: ドラッグ中はつまみだけ動かし、
+    /// 離した時に .exact で 1 回だけ engine に投げる。ドラッグ中の seek はしない —
+    /// 04 §6 の preroll を無限に繰り返すことになるため）。
+    func beginScrub() { timelineScrubbing = true }
+    func previewScrub(_ seconds: Double) {
+        position = CMTime(seconds: seconds, preferredTimescale: 1_000_000)
+    }
+    func commitScrub() {
+        let target = position
+        timelineScrubbing = false
+        Task { await engine.seek(to: target, tolerance: .exact) }
+    }
+
+    func skip(by seconds: Double) {
+        let base = position.isValid ? position.seconds : 0
+        let target = max(0, min(base + seconds, durationSeconds > 0 ? durationSeconds : base + seconds))
+        Task { await engine.seek(to: CMTime(seconds: target, preferredTimescale: 1_000_000),
+                                 tolerance: .default) }
+    }
+
+    func step(_ direction: StepDirection) {
+        Task { await engine.step(direction) }
+    }
+
+    func selectAudio(_ track: TrackID?) {
+        guard let track else { return }
+        Task { await engine.select(track, for: .audio) }
+    }
+
+    func setFullscreen(_ window: NSWindow?) {
+        window?.toggleFullScreen(nil)
+    }
+
+    // MARK: - 提示サーフェスの配線（view が layer を作ったときに呼ぶ）
+
+    func attachSurface(layer: AVSampleBufferDisplayLayer) {
+        let sink = SurfaceSink(layer: layer) { [weak self] dar in
+            Task { @MainActor [weak self] in
+                if self?.displayAspectValue != dar { self?.displayAspectValue = dar }
+            }
+        }
+        surface = sink
+        Task { await self.surfaceBinding?.attachVideoSink(sink) }
+    }
+
+    func detachSurface(_ sink: SurfaceSink) {
+        if surface === sink {
+            Task { await self.surfaceBinding?.attachVideoSink(nil) }
+        }
+    }
+
+    private func currentSettings() -> PlayerSettings {
+        var settings = PlayerSettings()
+        settings.aspectPolicy = aspectPolicy
+        return settings
+    }
+}

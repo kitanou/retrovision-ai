@@ -21,6 +21,9 @@ jobs:
       - name: Build packages
         working-directory: Packages/RetroVisionKit
         run: swift build --build-tests
+      - name: Build app target
+        working-directory: App/RetroVisionApp
+        run: swift build --build-tests
       - name: Build release
         working-directory: Packages/RetroVisionKit
         run: swift build -c release
@@ -31,6 +34,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test (pure logic + architecture)
         working-directory: Packages/RetroVisionKit
+        run: swift test
+      - name: Test app shell（FakePlayerEngine + 実 engine e2e。09 §2 に同じ方針）
+        working-directory: App/RetroVisionApp
         run: swift test
 
   licenses:

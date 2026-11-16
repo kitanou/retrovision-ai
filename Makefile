@@ -8,12 +8,14 @@ all: check
 build:
 	 swift -version
 	 cd $(PKG) && swift build --build-tests
+	 cd App/RetroVisionApp && swift build --build-tests
 
 release:
 	 cd $(PKG) && swift build -c release
 
 test:
 	 cd $(PKG) && swift test
+	 cd App/RetroVisionApp && swift test
 
 licenses:
 	 python3 Scripts/check-licenses.py
