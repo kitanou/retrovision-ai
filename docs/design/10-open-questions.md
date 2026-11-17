@@ -274,3 +274,12 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定**: 周期が明確に見える実素材が無い間は、field matching（weave 復元）・inverseTelecine・presenter 配線に**進まない**。誤った weave は現状（motion-adaptive）より悪く見えるため。`CadenceAnalyzer` は純粋ロジックのまま残し、画面には接続しない。
 - **次に必要になる設計（未実施）**: ① comb スコアの絶対しきい値は使えない（縞なしの基準が内容で 0.0065〜0.0155 と動く）→ 近傍窓の中央値に対する相対しきい値にする。② GPU の歯指標 kernel（simd 縮約）。③ field 順序は top-first / bottom-first の両方で検査する（実盤は top-first、生成素材は bottom-first）。④ 24p 化（重複 frame を捨て 2:3 で再タイミング）は session の時刻と OQ-10 に触れるため別 PR。field matching だけでは「24p 化」とは言わない。⑤ 標準 3:2 の実素材（#15 の `telecine-32-01`）。
 
+### 2026-11-17 — #5 A1f: 標準 3:2 素材の作り直しと、telecine の検出・weave 復元の実接続
+
+- **素材の作り直し**: `telecine-32-01.mpg` を `telecine=first_field=top:pattern=23`（入力 24000/1001 → 30000/1001、`-r` の再サンプル無し）で生成し直した（`Scripts/gen-fixtures.sh`。この 1 本だけ。manifest の sha を更新）。測定で縞ありが周期内位置 2・3（隣り合う 2 frame）の標準の 3:2 になったことを確認（直前の記録の `pattern=3` 素材は非標準だった）。
+- **`CadenceAnalyzer` の相対しきい値**: `relativeFactor`（既定は絶対値のみ）を追加。縞ありの判定を「直近窓の**下側中央値**の 2.5 倍超（下限は絶対値）」にして、縞なしの基準が内容で動く実素材（0.0065〜0.0155）でも使えるようにした。実素材 PICHI 相当の周期なし入力では telecine を宣言せず、非標準の周期（[縞,無,無,縞,無]）でもロックしない。
+- **weave 復元（`rv_ivtc_weave_v1`）**: 縞あり frame（位置 2・3）は、現 frame の先行 field と前 frame の後続 field を行ごとに織る（top-first: 偶数行=現・奇数行=前、bottom-first: 逆。chroma も同じ規則）。**画素単位の検査**: 4 つの映画コマ A〜D から 5 つの video frame を top-first / bottom-first 両方で作り、全 5 位置で復元結果が元のコマとビット一致（既定の deinterlace では一致しない = 検査が縞を区別できる）。前 frame が無いときは weave せず従来の空間内挿に倒す。
+- **`TelecineMatcher`（判断。画面・GPU 非依存）と presenter 配線**: 縞スコア（CPU の歯指標 `CombMetric`、輝度面の列を間引いて計算）と PTS から、**確信してロックしている間だけ**指示を出す（縞あり位置 → weaveWithPrevious、それ以外 → keepWoven＝weave のまま。ロック前・非 telecine は従来どおり）。PTS が連続でない（seek・落とし frame・menu のループ）と判定と前 frame を捨てる（従来は seek をまたいで前 frame が残っていた点も直る）。`MetalFramePresenter` が interlaced frame ごとに呼ぶ。
+- **実素材での検査（標準 3:2 素材を復号）**: ① 10〜12 frame 目までにロックし、ロック後に外れず、周期内位置が測定と全 frame で一致。② weave の指示は測定で縞ありだった位置にだけ出て、取りこぼしが無い。③ **レンダラーを通した出力の縞を実測**: 復元後は縞なしの基準の 1.5 倍以内（入力の縞ありは基準の 3 倍以上）。
+- **範囲外（明記）**: これは**縞の除去**であって「24p 化」ではない。出力は元の 29.97 のままで、重複 frame（B）は捨てず、2:3 の再タイミングもしていない（session の時刻と OQ-10 に触れるため別 PR）。実盤 PICHI は 3:2 ではないので、**実盤では検証できていない**（#15 の実素材 `telecine-32-01` が必要）。`inverseTelecineTarget: 24p` の期待値は満たしていない。縞スコアは CPU 計算で、release ビルドでの実時間への影響は未計測。
+

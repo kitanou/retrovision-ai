@@ -315,6 +315,37 @@ kernel void rv_deint_motionAdaptive_v1(texture2d<float, access::read>  inY  [[te
     }
 }
 
+// ---------- inverse telecine: field matching（weave 復元。05 §5.1） ----------
+//
+// 3:2 の縞ありフレーム（周期内位置 2・3）は、隣り合う映画コマの field を 1 つずつ持つ。
+// 元のコマは「現 frame の先行 field + 前 frame の後続 field」を行ごとに織る（weave）と復元できる:
+//   top-first:    偶数行（top）= 現 frame、奇数行（bottom）= 前 frame
+//   bottom-first: 奇数行（bottom）= 現 frame、偶数行（top）= 前 frame
+// chroma（4:2:0）も行が field 交互なので同じ規則で織る。この kernel は縞ありと判定された
+// frame にだけ host 側が使う（縞なしの frame は weave のまま = 元から正しい）。
+// topFieldFirst は function constant（bob と共有。PSO は field 順が変わるときだけ作り直す）。
+
+kernel void rv_ivtc_weave_v1(texture2d<float, access::read>  inY   [[texture(0)]],
+                             texture2d<float, access::read>  inUV  [[texture(1)]],
+                             texture2d<float, access::write> outY  [[texture(2)]],
+                             texture2d<float, access::write> outUV [[texture(3)]],
+                             texture2d<float, access::read>  prevY  [[texture(4)]],
+                             texture2d<float, access::read>  prevUV [[texture(5)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint w = outY.get_width();
+    uint h = outY.get_height();
+    // 現 frame から取る行の parity: top-first は偶数行（0）、bottom-first は奇数行（1）。
+    uint curParity = topFieldFirst ? 0u : 1u;
+    if (gid.x < w && gid.y < h) {
+        float v = ((gid.y & 1u) == curParity) ? inY.read(gid).r : prevY.read(gid).r;
+        outY.write(float4(v, 0.0, 0.0, 1.0), gid);
+    }
+    if (gid.x < w / 2u && gid.y < h / 2u) {
+        float4 c = ((gid.y & 1u) == curParity) ? inUV.read(gid) : prevUV.read(gid);
+        outUV.write(c, gid);
+    }
+}
+
 // ---------- field 間 SAD（05 §5.1 detector: 1 枚内の 2 field 差分 = comb 信号） ----------
 // 8x8 block ごとに、相邻走査線（= 2 つの field 同士の対応線）の平均絶対差を算出。
 // 値は正規化 [0,1] のまま（GPU 内完結。判定閾値は host 側の detector が決める — #5 次増分）。

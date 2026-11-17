@@ -32,6 +32,9 @@ NOISE='noise=alls=10:allf=u+p:all_seed=20261115'
 SRC_NTSC='testsrc2=size=720x480:rate=30000/1001:duration=6'
 SRC_PAL='testsrc2=size=720x576:rate=25:duration=6'
 SRC_FILM='testsrc2=size=720x480:rate=24:duration=6'
+# 3:2 telecine の入力は 24000/1001（23.976）。pattern=23 で 30000/1001 に変換され、-r による再サンプルが要らない
+# （再サンプルすると標準の周期が崩れる — 2026-11-17 の実測。decision log 参照）。
+SRC_FILM_NTSC='testsrc2=size=720x480:rate=24000/1001:duration=6'
 
 # DVD 相当の MPEG-2 符号量と形式（7 Mbps 上限・VBV 1.835 Mbit・4:2:0）
 M2=mpeg2video
@@ -70,9 +73,8 @@ gen film24p-01.mpg \
 
 # 5. Telecine（24 → 29.97 の 3:2 pull-down。telecine filter が field 配列を作る）
 gen telecine-32-01.mpg \
-  -f lavfi -i "$SRC_FILM" \
-  -vf "telecine=pattern=3" \
-  -r 30000/1001 \
+  -f lavfi -i "$SRC_FILM_NTSC" \
+  -vf "telecine=first_field=top:pattern=23" \
   -c:v $M2 $M2I $M2DVD $M2SEQ
 
 # 6. H.264 インターレース（field / cadence 情報の保持を確認する素材。OQ-08 用）

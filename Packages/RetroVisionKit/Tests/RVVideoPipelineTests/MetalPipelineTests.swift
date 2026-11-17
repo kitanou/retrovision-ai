@@ -134,7 +134,7 @@ final class MetalPipelineTests: XCTestCase {
         guard gpuGate() else { return }
         let lib = Self.context.library
         for name in ["rv_vs_fullscreen", "rv_colorConvert_v1", "rv_deint_bob_v1",
-                     "rv_deint_edgeDirected_v1", "rv_deint_motionAdaptive_v1", "rv_fieldMatch_sad_v1"] {
+                     "rv_deint_edgeDirected_v1", "rv_deint_motionAdaptive_v1", "rv_ivtc_weave_v1", "rv_fieldMatch_sad_v1"] {
             XCTAssertNotNil(lib.makeFunction(name: name), "shader function 無し: \(name)")
         }
         // 実 PSO 生成（colorConvert は bgra8 の render pipeline、deint/detector は compute）
@@ -391,6 +391,108 @@ final class MetalPipelineTests: XCTestCase {
         let movingGap = abs(Int(moving[6][10].b) - Int(moving[4][10].b))
         XCTAssertGreaterThan(stillGap, 20, "静止は chroma を weave（偶数行と奇数行の色が違うまま）")
         XCTAssertLessThan(movingGap, 6, "動きは偶数行の chroma から補間（奇数行も偶数行と同じ色になる）")
+    }
+
+    // MARK: - 5e. inverse telecine の weave 復元（画素単位で元の映画コマと一致）
+
+    /// 映画コマ k（0=A,1=B,2=C,3=D）の行 r の輝度 / chroma（コマごと・行ごとに違う値にして、織り間違いが画素に出る）。
+    private func filmLuma(_ k: Int, row: Int) -> UInt8 { UInt8(40 + k * 30 + row) }
+    private func filmChroma(_ k: Int, row: Int) -> (cb: UInt8, cr: UInt8) {
+        (UInt8(100 + k * 12 + row), UInt8(150 - k * 12 - row))
+    }
+
+    /// 偶数行（top field）を映画コマ `top` から、奇数行（bottom field）を `bottom` から取った interlaced frame。
+    private func videoFrame(top: Int, bottom: Int, w: Int, h: Int) throws -> CVPixelBuffer {
+        try makeNV12(width: w, height: h,
+                     luma: { row in [UInt8](repeating: self.filmLuma(row % 2 == 0 ? top : bottom, row: row), count: w) },
+                     chroma: { row in
+            let c = self.filmChroma(row % 2 == 0 ? top : bottom, row: row)
+            return (0..<(w / 2)).flatMap { _ in [c.cb, c.cr] }
+        })
+    }
+
+    private func render(_ pb: CVPixelBuffer, previous: CVPixelBuffer?, order: FieldOrder,
+                        fieldMatch: RenderFrameInput.FieldMatchRequest, w: Int, h: Int) throws
+        -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        var input = progressiveInput(pb, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: order, cadence: .telecine32,
+                                        fieldSource: .formatDescription)
+        input.previousPixelBuffer = previous
+        input.fieldMatch = fieldMatch
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(10), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .auto)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        switch fieldMatch {
+        case .weaveWithPrevious: XCTAssertEqual(timing.deinterlaceApplied, .inverseTelecine)
+        case .keepWoven: XCTAssertEqual(timing.deinterlaceApplied, .passthrough)
+        case .none: break
+        }
+        drainGPU()
+        return readBack(target)
+    }
+
+    private func assertEqualImages(_ a: [[(r: UInt8, g: UInt8, b: UInt8)]], _ b: [[(r: UInt8, g: UInt8, b: UInt8)]],
+                                   _ message: String, file: StaticString = #filePath, line: UInt = #line) {
+        var mismatches = 0
+        for y in 0..<a.count { for x in 0..<a[y].count where a[y][x] != b[y][x] { mismatches += 1 } }
+        XCTAssertEqual(mismatches, 0, message, file: file, line: line)
+    }
+
+    func testInverseTelecineWeaveReconstructsFilmFramesInBothFieldOrders() throws {
+        guard gpuGate() else { return }
+        let w = 32, h = 32
+        // 映画コマ A,B,C,D = 0,1,2,3。video frame（top, bottom）は field 順ごとに 3:2 の配置が違う。
+        //   top-first:    f0=(A,A) f1=(B,B) f2=(B,C) f3=(C,D) f4=(D,D)
+        //   bottom-first: f0=(A,A) f1=(B,B) f2=(C,B) f3=(D,C) f4=(D,D)   （(top, bottom) の書き方）
+        let layouts: [(order: FieldOrder, frames: [(top: Int, bottom: Int)])] = [
+            (.topFirst, [(0, 0), (1, 1), (1, 2), (2, 3), (3, 3)]),
+            (.bottomFirst, [(0, 0), (1, 1), (2, 1), (3, 2), (3, 3)]),
+        ]
+        // 各 phase で復元されるべき映画コマ: f0→A, f1→B, f2→B（重複）, f3→C, f4→D。
+        let expectedFilm = [0, 1, 1, 2, 3]
+        for layout in layouts {
+            let video = try layout.frames.map { try videoFrame(top: $0.top, bottom: $0.bottom, w: w, h: h) }
+            for phase in 0..<5 {
+                let expectedBuffer = try videoFrame(top: expectedFilm[phase], bottom: expectedFilm[phase], w: w, h: h)
+                let expected = try render(expectedBuffer, previous: nil, order: layout.order,
+                                          fieldMatch: .keepWoven, w: w, h: h)
+                let combed = (phase == 2 || phase == 3)
+                let actual = try render(video[phase], previous: phase > 0 ? video[phase - 1] : nil, order: layout.order,
+                                        fieldMatch: combed ? .weaveWithPrevious : .keepWoven, w: w, h: h)
+                assertEqualImages(actual, expected, "\(layout.order) phase \(phase): 復元結果が映画コマ \(expectedFilm[phase]) と一致しない")
+                if combed {
+                    // 指示なし（既定の deinterlace）では復元されない = テストが縞ありを区別できている。
+                    let plain = try render(video[phase], previous: video[phase - 1], order: layout.order,
+                                           fieldMatch: .none, w: w, h: h)
+                    var differs = false
+                    for y in 0..<h { for x in 0..<w where plain[y][x] != expected[y][x] { differs = true } }
+                    XCTAssertTrue(differs, "\(layout.order) phase \(phase): 既定の処理でも一致してしまう（検査が縞を区別していない）")
+                }
+            }
+        }
+    }
+
+    func testWeaveRequestWithoutPreviousFrameFallsBackToSpatialDeinterlace() throws {
+        guard gpuGate() else { return }
+        let w = 32, h = 32
+        let combed = try videoFrame(top: 1, bottom: 2, w: w, h: h)
+        var input = progressiveInput(combed, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .telecine32,
+                                        fieldSource: .formatDescription)
+        input.fieldMatch = .weaveWithPrevious      // 前 frame が無い（seek 直後など）
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(11), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .auto)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        XCTAssertEqual(timing.deinterlaceApplied, .edgeDirected, "前 frame が無いときは weave せず従来の空間内挿に倒す")
     }
 
     // MARK: - 5c. highQuality スケール（拡大時は bicubic。エッジが bilinear より鋭い）

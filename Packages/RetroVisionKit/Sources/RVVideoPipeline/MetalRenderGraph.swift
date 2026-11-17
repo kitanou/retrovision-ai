@@ -26,11 +26,24 @@ public struct RenderFrameInput: @unchecked Sendable {
     public var frameID: FrameID?
     /// 直前に提示した frame（motion-adaptive の動き検出用。無い・寸法違いなら edge-directed に倒す）。
     public var previousPixelBuffer: CVPixelBuffer?
+    /// telecine の field matching の指示（`CadenceAnalyzer` が確信してロックしたときだけ呼び出し側が入れる）。
+    /// 既定の `.none` は従来どおり（plan の deinterlace mode に従う）。
+    public var fieldMatch: FieldMatchRequest = .none
+
+    public enum FieldMatchRequest: Sendable, Hashable {
+        case none
+        /// 縞あり frame: 現 frame の先行 field + 前 frame の後続 field を織って元の映画コマを復元する。
+        /// 前 frame が無い・寸法違いのときは従来の deinterlace に倒す。
+        case weaveWithPrevious
+        /// 縞なし frame（telecine の周期内で元から progressive）: deinterlace せず weave のまま使う。
+        case keepWoven
+    }
 
     public init(pixelBuffer: CVPixelBuffer, color: ColorInfo, interlace: InterlaceInfo,
                 aspect: AspectResolution, frameID: FrameID? = nil,
-                previousPixelBuffer: CVPixelBuffer? = nil) {
+                previousPixelBuffer: CVPixelBuffer? = nil, fieldMatch: FieldMatchRequest = .none) {
         self.previousPixelBuffer = previousPixelBuffer
+        self.fieldMatch = fieldMatch
         self.pixelBuffer = pixelBuffer
         self.color = color
         self.interlace = interlace
@@ -95,6 +108,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
             previousPlanes = p
         }
         let prevYTex: (any MTLTexture)? = previousPlanes.first?.texture
+        let prevUVTex: (any MTLTexture)? = previousPlanes.count > 1 ? previousPlanes[1].texture : nil
 
         // 2. deinterlace（plan に段があり、source が interlaced のときだけ実行）
         var interimTextures: [any MTLTexture] = []
@@ -102,7 +116,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
             let mode = resolveDeinterlace(req: req, input: input, previousAvailable: prevYTex != nil,
                                           timing: &timing)
             try encodeDeinterlace(mode: mode, fieldOrder: input.interlace.fieldOrder,
-                                 y: yTex, uv: uvTex, prevY: prevYTex,
+                                 y: yTex, uv: uvTex, prevY: prevYTex, prevUV: prevUVTex,
                                  into: &yTex, uvOut: &uvTex, interim: &interimTextures, command: command)
         }
 
@@ -175,6 +189,16 @@ public final class MetalRenderGraph: @unchecked Sendable {
             timing.deinterlaceApplied = .passthrough
             return .passthrough
         }
+        // telecine の field matching（呼び出し側が確信してロックしたときだけ来る）。
+        switch input.fieldMatch {
+        case .weaveWithPrevious where previousAvailable:
+            timing.deinterlaceApplied = .inverseTelecine
+            return .inverseTelecine
+        case .keepWoven:
+            timing.deinterlaceApplied = .passthrough
+            return .passthrough
+        default: break
+        }
         let actual: DeinterlaceMode
         switch requested {
         case .passthrough: actual = .passthrough
@@ -185,7 +209,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
             // 単一 frame で動く edge-directed（先頭 frame・seek 直後・寸法変更直後）。
             actual = previousAvailable ? .motionAdaptive : .edgeDirected
         case .inverseTelecine:
-            actual = .edgeDirected   // telecine 検出（CadenceAnalyzer）未実装の間の代替
+            actual = .edgeDirected   // plan が inverseTelecine を要求しても、field matching の指示が無ければ空間内挿
         }
         timing.deinterlaceApplied = actual
         return actual
@@ -193,7 +217,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
     private func encodeDeinterlace(mode: DeinterlaceMode, fieldOrder: FieldOrder,
                                   y: any MTLTexture, uv: any MTLTexture,
-                                  prevY: (any MTLTexture)?,
+                                  prevY: (any MTLTexture)?, prevUV: (any MTLTexture)?,
                                   into yOut: inout any MTLTexture, uvOut: inout any MTLTexture,
                                   interim: inout [any MTLTexture],
                                   command: any MTLCommandBuffer) throws {
@@ -217,12 +241,13 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
         let functionName = switch mode {
         case .bob: "rv_deint_bob_v1"
+        case .inverseTelecine where prevY != nil && prevUV != nil: "rv_ivtc_weave_v1"
         case .motionAdaptive where prevY != nil: "rv_deint_motionAdaptive_v1"
         default: "rv_deint_edgeDirected_v1"
         }
         var constants: MTLFunctionConstantValues?
         var variant = ""
-        if functionName == "rv_deint_bob_v1" {
+        if functionName == "rv_deint_bob_v1" || functionName == "rv_ivtc_weave_v1" {
             // field 順序を function constant で渡す（bottom-first 素材は上 field が奇数列 —
             // 04 §3 の PCE 実測。PSO 再作成は field 順序が変わるときだけ）。
             let cv = MTLFunctionConstantValues()
@@ -245,6 +270,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
         enc.setTexture(outY, index: 2)
         enc.setTexture(outUV, index: 3)
         if functionName == "rv_deint_motionAdaptive_v1" { enc.setTexture(prevY, index: 4) }
+        if functionName == "rv_ivtc_weave_v1" { enc.setTexture(prevY, index: 4); enc.setTexture(prevUV, index: 5) }
         let threads = MTLSize(width: w, height: h, depth: 1)
         let group = MTLSize(width: 8, height: 8, depth: 1)
         enc.dispatchThreads(threads, threadsPerThreadgroup: group)
