@@ -2,7 +2,9 @@ import CoreVideo
 import Foundation
 import Metal
 import QuartzCore
+import RVEnhancement
 import RVMediaCore
+import RVMLRuntime
 import RVVideoPipeline
 
 // MARK: - 提示の出口（05 §7 / OQ-26 の置換）
@@ -37,6 +39,7 @@ struct LegacySinkPresenter: VideoFramePresenter {
 /// Metal 提示（RVVideoPipeline）を engine の presenter 契約に載せる。
 /// CAMetalLayer は UI が供給する（RVVideoPipeline も engine も AppKit を知らない）。
 public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable {
+    private let graph: MetalRenderGraph
     private let presenter: MetalPresenter
     private let lock = NSLock()
     private var lastAspect: AspectRatio?
@@ -48,9 +51,60 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     public init?() {
         guard let context = try? MetalRenderContext(),
               let graph = try? MetalRenderGraph(context: context) else { return nil }
+        self.graph = graph
         presenter = MetalPresenter(graph: graph)
         presenter.timing = .immediate   // 提示時刻は engine（音声 clock）が決める
     }
+
+    // MARK: AI 段（06 §3。tier が lightML 以上で plan に superResolution 段があるときだけ使う）
+    //
+    // 再生を止めない（INV-1）ための方針:
+    //  - 推論は同時に 1 つだけ。実行中なら、その間の frame は待たず非強調のまま提示する
+    //    （待たせて frame を捨てるより、強調を諦めて提示する方を選ぶ — 06 §7）。
+    //  - 失敗（breaker open・shape 不一致・期限超過・描画失敗・未 load）も、その frame を非強調で提示する。
+    //  - 期限は frame の表示長（予算）。超えた結果は捨てる（古い画像を保持するとフリーズに見える）。
+
+    public struct EnhancementStatistics: Sendable, Hashable {
+        /// AI 段を通して提示した frame 数。
+        public var enhanced = 0
+        /// 推論が実行中だったため非強調で提示した frame 数。
+        public var skippedBusy = 0
+        /// AI 段が失敗して非強調で提示した frame 数。
+        public var fellBack = 0
+        public var lastError: String?
+    }
+
+    private var enhancer: MLEnhancementStage?
+    private var enhancementInFlight = false
+    private var enhancementStatistics = EnhancementStatistics()
+    /// 推論の期限（ms）。nil なら frame の表示長（29.97 fps で約 33 ms）。
+    public var enhancementBudgetMS: Double? {
+        get { lock.withLock { _enhancementBudgetMS } }
+        set { lock.withLock { _enhancementBudgetMS = newValue } }
+    }
+    private var _enhancementBudgetMS: Double?
+
+    public var statistics: EnhancementStatistics { lock.withLock { enhancementStatistics } }
+
+    /// AI 段を設定する。render graph は presenter のものを共有する（同じ command queue・texture cache）。
+    public func setEnhancement(runtime: any ModelRuntimeProtocol, model: ModelID, tiling: MLEnhancementStage.Tiling) {
+        lock.withLock {
+            enhancer = MLEnhancementStage(graph: graph, runtime: runtime, model: model, tiling: tiling)
+            enhancementStatistics = EnhancementStatistics()
+        }
+    }
+
+    public func clearEnhancement() { lock.withLock { enhancer = nil } }
+
+    /// 推論を 1 つだけ走らせるための取得。取れなければ false（その frame は非強調で提示する）。
+    private func claimEnhancement() -> Bool {
+        lock.withLock {
+            if enhancementInFlight { enhancementStatistics.skippedBusy += 1; return false }
+            enhancementInFlight = true
+            return true
+        }
+    }
+    private func releaseEnhancement() { lock.withLock { enhancementInFlight = false } }
 
     public func attachLayer(_ layer: CAMetalLayer?) {
         presenter.attachLayer(layer)
@@ -82,6 +136,31 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
         let input = RenderFrameInput(pixelBuffer: frame.pixelBuffer, color: frame.format.color,
                                      interlace: frame.format.interlace, aspect: plan.output.aspect,
                                      frameID: frame.id, previousPixelBuffer: previous)
+        // AI 段: tier が lightML 以上で、plan の superResolution 段が設定済みのモデルを指すときだけ。
+        let stage = lock.withLock { enhancer }
+        if let stage, plan.tier >= .lightML,
+           let request = plan.stage(of: .superResolution)?.parameters as? SuperResolutionParameters,
+           request.model == stage.model, claimEnhancement() {
+            defer { releaseEnhancement() }
+            do {
+                let budget = enhancementBudgetMS ?? max(frame.duration.seconds * 1_000, 1)
+                let rgb = try await stage.enhance(input, plan: plan, frameID: frame.id,
+                                                  deadline: HostTime.now().advancing(ms: budget))
+                let outcome = try presenter.presentEnhanced(rgb, aspect: plan.output.aspect, pts: frame.pts,
+                                                            frameID: frame.id)
+                lock.withLock { enhancementStatistics.enhanced += 1 }
+                switch outcome {
+                case .scheduled: return .delivered
+                case .dropped: return .dropped
+                }
+            } catch {
+                // 失敗は frame を非強調のまま提示する（下の通常経路へ）。再生・音声は止めない。
+                lock.withLock {
+                    enhancementStatistics.fellBack += 1
+                    enhancementStatistics.lastError = String(describing: error)
+                }
+            }
+        }
         do {
             switch try presenter.present(input, plan: plan, pts: frame.pts) {
             case .scheduled: return .delivered

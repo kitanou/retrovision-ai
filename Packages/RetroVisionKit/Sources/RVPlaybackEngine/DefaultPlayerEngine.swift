@@ -1,6 +1,8 @@
 import Foundation
 import RVMediaCore
+import RVMLRuntime
 import QuartzCore
+import RVEnhancement
 import RVMediaSources
 
 // MARK: - PlayerEngine への適合（02 §2 の「実装クラス」）
@@ -137,6 +139,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
                                    onAspectResolved: @escaping @Sendable (Double) -> Void) async -> Bool {
         if metalPresenter == nil { metalPresenter = MetalFramePresenter() }
         guard let presenter = metalPresenter else { return false }
+        if let pending = pendingEnhancement { presenter.setEnhancement(runtime: pending.runtime, model: pending.model, tiling: pending.tiling) }
         presenter.attachLayer(layer)
         presenter.setAspectHandler(onAspectResolved)
         await core.setVideoPresenter(presenter)
@@ -153,5 +156,40 @@ public final class DefaultPlayerEngine: PlayerEngine {
     /// 最後の frame を現在の drawable 寸法で再描画する（窓リサイズ・一時停止中）。
     public func redrawMetalSurface() {
         metalPresenter?.redraw()
+    }
+
+    // MARK: AI 強調（06・07。#6 / #7 の統合）
+
+    private var pendingEnhancement: (runtime: any ModelRuntimeProtocol, model: ModelID, tiling: MLEnhancementStage.Tiling)?
+
+    /// AI 段を有効にする。モデルを load し、presenter に AI 段を設定し、エンジンにモデル実行層を接続する
+    /// （plan に superResolution 段が入り、breaker / memory pressure が適応制御の信号になる）。
+    /// 実際に使われるのは、設定の tier が lightML 以上で、適応制御が tier を許す間だけ。
+    /// load に失敗したら false（AI 段は有効にならず、再生は従来どおり）。
+    /// タイルはモデルの入力寸法、重なりは 16 px（入力寸法の半分未満に収める）、倍率は manifest の scaleFactor。
+    @discardableResult
+    public func attachEnhancement(runtime: any ModelRuntimeProtocol, model: ModelManifest) async -> Bool {
+        do { try await runtime.load(model.modelID) } catch { return false }
+        let tiling = MLEnhancementStage.Tiling(
+            tileWidth: model.input.width, tileHeight: model.input.height,
+            overlap: min(16, max(0, min(model.input.width, model.input.height) / 2 - 1)),
+            scale: max(1, model.scaleFactor))
+        pendingEnhancement = (runtime, model.modelID, tiling)
+        metalPresenter?.setEnhancement(runtime: runtime, model: model.modelID, tiling: tiling)
+        await core.setModelRuntime(runtime, models: [model.modelID], manifests: [model])
+        return true
+    }
+
+    /// AI 段を無効にする（モデルを unload し、実行層を切り離す）。
+    public func detachEnhancement() async {
+        if let pending = pendingEnhancement { await pending.runtime.unload(pending.model) }
+        pendingEnhancement = nil
+        metalPresenter?.clearEnhancement()
+        await core.setModelRuntime(nil)
+    }
+
+    /// AI 段の統計（強調して提示した frame 数・非強調に倒した数など）。診断・テスト用。
+    public func enhancementStatistics() -> MetalFramePresenter.EnhancementStatistics? {
+        metalPresenter?.statistics
     }
 }

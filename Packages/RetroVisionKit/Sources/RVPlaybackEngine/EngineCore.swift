@@ -411,6 +411,7 @@ public actor EngineCore {
     // モデル実行層（A2）。無ければ breaker は常に closed、memory pressure も unload する対象が無い。
     private var modelRuntime: (any ModelRuntimeProtocol)?
     private var trackedModels: [ModelID] = []
+    private var availableManifests: [ModelManifest] = []
     private var memoryPressure: ControlSignals.MemoryPressureLevel = .normal
     private var memorySource: (any DispatchSourceMemoryPressure)?
     /// 直近に適用した tier（降格 / 昇格の判別用。nil の間は最初の setTier で基準だけを置く）。
@@ -418,9 +419,13 @@ public actor EngineCore {
 
     /// モデル実行層を接続する。`models` は breaker を監視し、memory pressure で unload する対象。
     /// nil で切り離し（memory pressure の監視も止める）。
-    public func setModelRuntime(_ runtime: (any ModelRuntimeProtocol)?, models: [ModelID] = []) {
+    public func setModelRuntime(_ runtime: (any ModelRuntimeProtocol)?, models: [ModelID] = [],
+                                manifests: [ModelManifest] = []) {
         modelRuntime = runtime
         trackedModels = runtime == nil ? [] : models
+        // plan 生成が参照できるモデル（06 §2。manifest が無ければ SR / 学習ベースの段は入らない）。
+        availableManifests = runtime == nil ? [] : manifests
+        try? rebuildPlan()
         memorySource?.cancel()
         memorySource = nil
         memoryPressure = .normal
@@ -584,6 +589,9 @@ public actor EngineCore {
         guard line == lineGeneration else { return }   // 古い線の closer（close/load 済み）
         switch event {
         case .position(let pts, let seekGeneration):
+            // frame 境界での plan 切り替え（INV-3）。設定変更・適応制御で作られた pending plan は、
+            // 次に提示された frame の位置イベントで昇格する（その場では差し替えない）。
+            if pendingPlan != nil, phase == .playing { await promotePendingPlan() }
             await evaluateAdaptiveWindowIfDue()
             // 位置イベントの契約（02 §4。2026-11-16 の CI で実測した逆行の修正 — 決定ログ #14）。
             // 三重の濾過:
@@ -639,7 +647,8 @@ public actor EngineCore {
         let stages = StageGraphBuilder.stageRequests(for: .init(
             userPolicy: settings.enhancement,
             activeTier: controller.state.activeTier,
-            deinterlace: settings.deinterlaceMode))
+            deinterlace: settings.deinterlaceMode,
+            availableModels: availableManifests))
         let output = OutputContract(displayPixels: format.codedSize, aspect: aspect)
         let plan = RenderPlan(id: PlanID(planCounter), tier: controller.state.activeTier,
                               stages: stages, output: output)
