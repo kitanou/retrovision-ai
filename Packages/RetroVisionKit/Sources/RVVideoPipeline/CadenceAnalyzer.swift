@@ -31,15 +31,33 @@ public struct CadenceAnalyzer: Sendable {
     private static let pattern: [Bool] = [false, false, true, true, false]   // true = combed
 
     public let combThreshold: Double
+    /// 非 nil なら、縞ありの判定を「直近窓の中央値の `relativeFactor` 倍を超える」相対しきい値にする
+    /// （縞なしの基準値が内容で 0.0065〜0.0155 と動くため、絶対値だけでは実素材に使えない — 実測）。
+    /// 絶対値の `combThreshold` は下限として残す（平坦な画面の揺らぎを縞と見なさない）。
+    public let relativeFactor: Double?
     private var window: [Bool] = []
+    private var recentScores: [Double] = []
     private var lockedPhase: Int?            // 次に来る frame の周期内位置（telecine ロック中のみ）
     private var consecutiveMismatches = 0
 
-    public init(combThreshold: Double = 0.02) { self.combThreshold = combThreshold }
+    public init(combThreshold: Double = 0.02, relativeFactor: Double? = nil) {
+        self.combThreshold = combThreshold
+        self.relativeFactor = relativeFactor
+    }
 
     /// 1 frame 分の comb スコアを取り込み、現在の判定を返す。
     public mutating func ingest(combScore: Double) -> CadenceDecision {
-        let combed = combScore > combThreshold
+        recentScores.append(combScore)
+        if recentScores.count > Self.windowSize { recentScores.removeFirst(recentScores.count - Self.windowSize) }
+        let combed: Bool
+        if let relativeFactor {
+            // telecine の縞ありは 5 frame に 2（< 半数）なので、窓の中央値は縞なしの水準になる。
+            let sorted = recentScores.sorted()
+            let median = sorted[(sorted.count - 1) / 2]   // 下側の中央値（窓が浅い間も縞あり値を拾わない）
+            combed = combScore > max(combThreshold, relativeFactor * median)
+        } else {
+            combed = combScore > combThreshold
+        }
         window.append(combed)
         if window.count > Self.windowSize { window.removeFirst(window.count - Self.windowSize) }
 

@@ -289,3 +289,34 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査（実際の Metal + Core ML、headless の `CAMetalLayer`）**: AI 段を通して提示される（`enhanced == 1`）、tier が足りない / SR 段が無いと強調しない、モデル未 load は frame を落とさず非強調で提示（`delivered`、`fellBack == 1`、エラーが残る）、期限切れの結果は捨てて非強調で提示、推論が 250 ms かかる間に来た 2 枚目は待たずに提示（`skippedBusy == 1`）、plan は実行層の接続中だけ SR 段を持つ、load できないモデルでは `attachEnhancement` が false。
 - **未実装 / 未検証**: ① 実時間での実測: タイルの切り出し・合成が CPU の参照実装で、29.97 fps の予算に入るかは未計測（遅ければ「同時に 1 つ」により強調される frame が間引かれ、強調と非強調が交互になって見える。滑らかさの評価と、遅いモデルは tier を下げる判断は G3）。② **実画面での確認はしていない**（headless の layer で提示まで通ることのみ）。③ アプリ（App）からの有効化の入口（`attachEnhancement` を呼ぶ UI / 設定）は未配線。④ 実モデル（Real-ESRGAN 等）の変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。⑤ 学習ベースのノイズ除去（`denoise` の learned 実装）は同じ枠組みで追加できるが未実装。
 
+### 2026-11-17 — #5 A1b 修正: 実盤 ISO での点線状アーティファクト（動き検出の拡張と chroma の動き適応）
+
+- **発見（実盤 `PICHI_PICHI_PITCH1.ISO`、menu 11 秒）**: ユーザー提供の実 DVD の ISO を実アプリ窓（Metal 既定）で再生すると、動きの速い金属リングの輪郭に点線状の縞が出た（合成素材では出ていなかった）。
+- **原因と対処**: ① 動き指標が 1 画素ごとに weave / 空間内挿を切り替えていた → 左右 1 画素と上下の保持行まで広げた 3x3 の最大にして判定を空間的に連続させ、しきい値を `smoothstep(0.02, 0.07)` に下げた。② 4:2:0 の chroma はインターレースでは行が field 交互なのに、weave のまま素通しにしていたため、動く輪郭で色が交互にずれた（chroma upsampling error）→ 動く画素の chroma は、輝度で保持した field（偶数行）の chroma から補間する（静止画素は従来どおり weave）。
+- **確認**: 修正前後の実アプリ窓で同じ区間の輪郭を比較し、点線が消えたことを目視確認。`MetalPipelineTests` に chroma が動く画素でのみ補間されること（静止は weave のまま）を追加。
+- **G2 判定ではない**: 実素材 1 本・菜単 menu の 11 秒での目視確認で、combing の客観検査・present 間隔・GPU 時間は未実施。#15 の 7 本は未充足。
+
+### 2026-11-17 — QA 入口 RV_AUTO_TITLE（起動時に本体タイトルを選んで再生）と実盤 ISO の本体確認
+
+- **決定**: `RV_AUTO_OPEN` と同じ opt-in env 約定で、`RV_AUTO_TITLE=<n>` があれば open 後にその `titleNumber` の本体タイトルへ `select` + `play` する（menu の first-play 政策とは独立。画面を操作せずに実盤の本体を検証するため）。
+- **実測（`PICHI_PICHI_PITCH1.ISO`）**: VIDEO_TS は VMGM menu（約 13 MB、11 s）+ VTS_01（menu 235 KB + 本体 VOB 4 本 ≈ 3.6 GB、約 50 分 11 秒）。`RV_AUTO_TITLE=1` で本体が Metal 既定で再生され、実時間比 ≈ 1.0（位置が 1 s ごとに進む）。複数 VOB は連結して 1 タイトルとして扱われた（#25 の修復写しが働いた）。
+- **未決（静止ロゴの輪郭の点々）**: 本体冒頭（PONY CANYON のロゴ）の文字輪郭に細かい点々が見える。静止に近い場面なので motion-adaptive の weave 側で、動き由来ではない。MPEG-2 の mosquito noise（輪郭周りの圧縮ノイズ）の可能性が高いが、**同じ瞬間を暫定経路と比較できていない**（再生位置と実時間が実行ごとにずれて同じ場面を撮れない）。確定には、seek 位置を指定できる QA 入口（例: `RV_AUTO_SEEK`）で同じ位置を撮る、または Metal の最終出力を CPU に読み戻して差分を取る必要がある。A3 の非 AI ノイズ除去（metalGuided）は mosquito noise を狙う処理だが、UI から強度を操作する配線がまだ無く、実盤での効果は未確認。
+
+### 2026-11-17 — #5 A1e: 縞（comb）指標の実測と、field matching に進まない判断
+
+- **測定道具**: `CombMeasurementTests`（`RVDecodeTests`）。環境変数 `RV_MEASURE_PATH`（任意で `RV_MEASURE_SKIP` / `RV_MEASURE_FRAMES`）を指定したときだけ、復号した frame ごとに「歯」指標（`(y−上)` と `(y−下)` が同符号で輝度 12 階調超となる画素の割合）、隣接行 SAD、PCE のフラグ（`progressive_frame` / `repeat_first_field` / `top_field_first`）を表示する。未設定なら何もしない（CI では走らない）。
+- **指標の妥当性**: 歯指標は合成の縞あり frame（≈0.045）と縞なし（≈0.008）を 5 倍以上に分ける。既存の `rv_fieldMatch_sad_v1`（隣接行 SAD）は縦方向の細部でも反応するため、実素材では縞の指標として弱い見込み（歯指標の方が頑健）。
+- **`telecine-32-01.mpg`（生成素材）は標準の 3:2 ではない**: 縞ありは 5 frame に 2 回だが**隣り合わず**（周期 [縞,無,無,縞,無]、冒頭は 3 frame 周期）。生成コマンドの `telecine=pattern=3` を 30000/1001 へ落とした結果とみられる。標準の 3:2（A A / B B B / C C / D D D）は縞ありが連続 2 frame（周期 [無,無,縞,縞,無]）になるはずで、`CadenceAnalyzer` の想定と合わない。この素材では analyzer はロックしない（安全側）。標準 3:2 の素材は `telecine=pattern=23` で作り直す必要がある（未実施）。
+- **実盤（`PICHI_PICHI_PITCH1.ISO` 本編 VTS_01_1.VOB、約 50 s と 166 s の各 25 frame）に 3:2 は無い**: 歯指標は一定（≈0.0065 / ≈0.0155）で 5 frame 周期の山が無く、PCE は全 frame `prog=0 rff=0 tff=1`（**top field 先**。生成素材の bottom-first とは逆）。この素材では telecine 検出経路は一度も働かず、field matching は実盤で検証できない。
+- **決定**: 周期が明確に見える実素材が無い間は、field matching（weave 復元）・inverseTelecine・presenter 配線に**進まない**。誤った weave は現状（motion-adaptive）より悪く見えるため。`CadenceAnalyzer` は純粋ロジックのまま残し、画面には接続しない。
+- **次に必要になる設計（未実施）**: ① comb スコアの絶対しきい値は使えない（縞なしの基準が内容で 0.0065〜0.0155 と動く）→ 近傍窓の中央値に対する相対しきい値にする。② GPU の歯指標 kernel（simd 縮約）。③ field 順序は top-first / bottom-first の両方で検査する（実盤は top-first、生成素材は bottom-first）。④ 24p 化（重複 frame を捨て 2:3 で再タイミング）は session の時刻と OQ-10 に触れるため別 PR。field matching だけでは「24p 化」とは言わない。⑤ 標準 3:2 の実素材（#15 の `telecine-32-01`）。
+
+### 2026-11-17 — #5 A1f: 標準 3:2 素材の作り直しと、telecine の検出・weave 復元の実接続
+
+- **素材の作り直し**: `telecine-32-01.mpg` を `telecine=first_field=top:pattern=23`（入力 24000/1001 → 30000/1001、`-r` の再サンプル無し）で生成し直した（`Scripts/gen-fixtures.sh`。この 1 本だけ。manifest の sha を更新）。測定で縞ありが周期内位置 2・3（隣り合う 2 frame）の標準の 3:2 になったことを確認（直前の記録の `pattern=3` 素材は非標準だった）。
+- **`CadenceAnalyzer` の相対しきい値**: `relativeFactor`（既定は絶対値のみ）を追加。縞ありの判定を「直近窓の**下側中央値**の 2.5 倍超（下限は絶対値）」にして、縞なしの基準が内容で動く実素材（0.0065〜0.0155）でも使えるようにした。実素材 PICHI 相当の周期なし入力では telecine を宣言せず、非標準の周期（[縞,無,無,縞,無]）でもロックしない。
+- **weave 復元（`rv_ivtc_weave_v1`）**: 縞あり frame（位置 2・3）は、現 frame の先行 field と前 frame の後続 field を行ごとに織る（top-first: 偶数行=現・奇数行=前、bottom-first: 逆。chroma も同じ規則）。**画素単位の検査**: 4 つの映画コマ A〜D から 5 つの video frame を top-first / bottom-first 両方で作り、全 5 位置で復元結果が元のコマとビット一致（既定の deinterlace では一致しない = 検査が縞を区別できる）。前 frame が無いときは weave せず従来の空間内挿に倒す。
+- **`TelecineMatcher`（判断。画面・GPU 非依存）と presenter 配線**: 縞スコア（CPU の歯指標 `CombMetric`、輝度面の列を間引いて計算）と PTS から、**確信してロックしている間だけ**指示を出す（縞あり位置 → weaveWithPrevious、それ以外 → keepWoven＝weave のまま。ロック前・非 telecine は従来どおり）。PTS が連続でない（seek・落とし frame・menu のループ）と判定と前 frame を捨てる（従来は seek をまたいで前 frame が残っていた点も直る）。`MetalFramePresenter` が interlaced frame ごとに呼ぶ。
+- **実素材での検査（標準 3:2 素材を復号）**: ① 10〜12 frame 目までにロックし、ロック後に外れず、周期内位置が測定と全 frame で一致。② weave の指示は測定で縞ありだった位置にだけ出て、取りこぼしが無い。③ **レンダラーを通した出力の縞を実測**: 復元後は縞なしの基準の 1.5 倍以内（入力の縞ありは基準の 3 倍以上）。
+- **範囲外（明記）**: これは**縞の除去**であって「24p 化」ではない。出力は元の 29.97 のままで、重複 frame（B）は捨てず、2:3 の再タイミングもしていない（session の時刻と OQ-10 に触れるため別 PR）。実盤 PICHI は 3:2 ではないので、**実盤では検証できていない**（#15 の実素材 `telecine-32-01` が必要）。`inverseTelecineTarget: 24p` の期待値は満たしていない。縞スコアは CPU 計算で、release ビルドでの実時間への影響は未計測。
+

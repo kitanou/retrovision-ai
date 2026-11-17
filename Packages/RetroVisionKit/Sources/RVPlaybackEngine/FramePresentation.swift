@@ -45,6 +45,8 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     private var lastAspect: AspectRatio?
     /// 直前に渡した frame の pixel buffer（motion-adaptive の動き検出用）。
     private var previousBuffer: CVPixelBuffer?
+    /// telecine の field matching の判断（確信してロックしている間だけ動く）。
+    private var matcher = TelecineMatcher()
     private var onAspectResolved: (@Sendable (Double) -> Void)?
 
     /// Metal デバイスが無い環境では nil（呼び出し側は暫定経路へ戻す）。
@@ -110,7 +112,7 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
         presenter.attachLayer(layer)
         if layer == nil {
             presenter.clearLast()
-            lock.withLock { previousBuffer = nil }
+            lock.withLock { previousBuffer = nil; matcher.reset() }
         }
     }
 
@@ -128,14 +130,25 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     public func present(_ frame: DecodedVideoFrame, plan: RenderPlan?) async -> FrameDeliveryOutcome {
         guard let plan else { return .dropped }
         notifyAspect(plan.output.aspect.targetDAR)
-        let previous = lock.withLock { () -> CVPixelBuffer? in
-            let p = previousBuffer
+        // telecine の判断: interlaced 素材だけ縞スコアを測る（progressive では不要）。
+        let interlaced = frame.format.interlace.fieldCount >= 2
+        let score = interlaced ? CombMetric.toothScore(frame.pixelBuffer) : 0
+        let (previous, fieldMatch) = lock.withLock { () -> (CVPixelBuffer?, RenderFrameInput.FieldMatchRequest) in
+            var request = RenderFrameInput.FieldMatchRequest.none
+            var continuous = true
+            if interlaced {
+                let r = matcher.match(score: score, pts: frame.pts.seconds, duration: frame.duration.seconds)
+                request = r.request
+                continuous = r.previousIsContinuous
+            }
+            // PTS が連続でなければ前 frame は無関係（seek・menu のループ・落とし frame）: 渡さない。
+            let p = continuous ? previousBuffer : nil
             previousBuffer = frame.pixelBuffer
-            return p
+            return (p, request)
         }
         let input = RenderFrameInput(pixelBuffer: frame.pixelBuffer, color: frame.format.color,
                                      interlace: frame.format.interlace, aspect: plan.output.aspect,
-                                     frameID: frame.id, previousPixelBuffer: previous)
+                                     frameID: frame.id, previousPixelBuffer: previous, fieldMatch: fieldMatch)
         // AI 段: tier が lightML 以上で、plan の superResolution 段が設定済みのモデルを指すときだけ。
         let stage = lock.withLock { enhancer }
         if let stage, plan.tier >= .lightML,
