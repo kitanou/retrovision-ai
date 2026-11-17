@@ -13,6 +13,8 @@ import RVMediaCore
 /// 1 タイトル = 1 VOB チェーン（VTS_nn_1.VOB .. VTS_nn_k.VOB、順序付き）。
 /// menu チェーン = VMGM（VIDEO_TS.VOB。03 §5 のメニュー増分）: vtsNumber 0、isMenu true。
 /// 列挙側はこれを常に先頭に置く（first-play 政策は PlayerViewModel。#17 系）。
+/// タイトルメニュー（VTS_nn_0.VOB。実盤の「本当のメニュー」。静止画 1 枚 + ボタンの字幕）も
+/// menu チェーン: vtsNumber = nn（> 0）、isMenu true。VMGM の直後、タイトル本体の前に並ぶ。
 public struct VideoTsChain: Sendable, Hashable {
     /// VTS_01 → 1。ファイル名の数字から取る。menu は 0（titleNumber 0 と同じ約束）。
     public let vtsNumber: Int
@@ -32,8 +34,15 @@ public struct VideoTsChain: Sendable, Hashable {
 
     /// warning 文面などに使う表示名（実体名で出す — 「VTS_00」のような機械名にしない）。
     public var label: String {
-        isMenu ? "VMGM menu (VIDEO_TS.VOB)" : "VTS_\(String(format: "%02d", vtsNumber))"
+        if isMenu {
+            return vtsNumber == 0 ? "VMGM menu (VIDEO_TS.VOB)"
+                : "VTS_\(String(format: "%02d", vtsNumber)) menu (VTS_\(String(format: "%02d", vtsNumber))_0.VOB)"
+        }
+        return "VTS_\(String(format: "%02d", vtsNumber))"
     }
+
+    /// タイトルメニュー（VTS_nn_0.VOB）か。VMGM（vtsNumber 0）は含まない。
+    public var isTitleMenu: Bool { isMenu && vtsNumber > 0 }
 }
 
 public enum VideoTsNavigator {
@@ -95,12 +104,20 @@ public enum VideoTsNavigator {
         }
 
         var chains: [VideoTsChain] = []
+        var titleMenus: [VideoTsChain] = []
         for vts in grouped.keys.sorted() {
             // VTS_00_* は VMGM が書く実例が無い（0 は menu 側で使う数字）。列挙しない。
             if vts == 0 { continue }
             let items = grouped[vts]!
-            // VTS_nn_0.VOB はメニュー用（title 0）でタイトル本体ではない（実 DVD 配置）。
-            // 列からは除外し、part 0 のみの VTS は menu-only として静かに skip する（正常形）。
+            // VTS_nn_0.VOB はタイトルメニュー（実盤の「本当のメニュー」: 静止画 + ボタンの字幕）。
+            // タイトル本体の列には入れず、menu チェーンとして別に持つ。0 バイト（fixture・破損）は
+            // 再生できないので持たない。ボタンの操作（IFO・NAV・字幕）は未実装 — 静止画を表示するだけ。
+            if let menuVOB = items.first(where: { $0.ext == "VOB" && $0.part == 0 }),
+               let size = try? menuVOB.url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 {
+                let menuHasIfo = items.contains { $0.ext == "IFO" && $0.part == 0 }
+                titleMenus.append(VideoTsChain(vtsNumber: vts, partURLs: [menuVOB.url],
+                                               hasIfo: menuHasIfo, isMenu: true))
+            }
             let vobs = items.filter { $0.ext == "VOB" && $0.part >= 1 }
                 .sorted { $0.part < $1.part }
             guard !vobs.isEmpty else { continue }
@@ -138,6 +155,8 @@ public enum VideoTsNavigator {
 
         // VMGM menu chain（VIDEO_TS.VOB）は常に先頭（titleNumber 0 / ItemID(0) の約束。
         // 実盤の first-play 入口は menu — 再生開始の政策自体は PlayerViewModel が持つ）。
+        // 並び: VMGM → タイトルメニュー（vts 昇順）→ タイトル本体（vts 昇順）。
+        chains.insert(contentsOf: titleMenus, at: 0)
         if !menuVOBs.isEmpty {
             chains.insert(VideoTsChain(vtsNumber: 0, partURLs: menuVOBs.sorted { $0.path < $1.path },
                                        hasIfo: menuHasIfo, isMenu: true),

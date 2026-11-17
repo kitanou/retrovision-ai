@@ -254,8 +254,9 @@ struct PlayerScreenView: View {
                     set: { if let item = $0 { model.selectTitle(item) } }
                 )) {
                     ForEach(model.availableTitles) { item in
-                        // menu（VMGM）は titleNumber 0 の約束（VideoTsNavigator）。UI 名は「メニュー」。
-                        Text(item.titleNumber == 0 ? "メニュー"
+                        // menu は titleNumber 0 の約束（VideoTsNavigator）。VMGM（映像）は「メニュー」、
+                        // タイトルメニュー（VTS_nn_0.VOB。静止画）は「タイトルメニュー」。
+                        Text(item.titleNumber == 0 ? (item.stillImage ? "タイトルメニュー" : "メニュー")
                              : "タイトル \(item.titleNumber.map(String.init) ?? "\(item.id.rawValue)")")
                             .tag(Optional(item.id))
                     }

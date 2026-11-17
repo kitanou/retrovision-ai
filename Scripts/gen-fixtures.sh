@@ -77,6 +77,13 @@ gen telecine-32-01.mpg \
   -vf "telecine=first_field=top:pattern=23" \
   -c:v $M2 $M2I $M2DVD $M2SEQ
 
+# 5b. メニュー静止画（DVD のタイトルメニュー VTS_nn_0.VOB 相当。DVD 形式の program stream に I picture 1 枚）。
+#     実測（2026-11-17）: AVFoundation はこの形（1 枚だけの PS）から sample を渡さず、長さも不定になる。
+#     自前の StillPSDemuxer（RVDecode）が映像 ES を取り出して VideoToolbox へ渡す。
+gen menu-still-01.vob \
+  -f lavfi -i "testsrc2=size=720x480:rate=30000/1001:duration=1" \
+  -frames:v 1 -c:v $M2 $M2DVD -f dvd
+
 # 6. H.264 インターレース（field / cadence 情報の保持を確認する素材。OQ-08 用）
 #    実測（docs/experiments/EXP-001）: yuv422p（High 4:2:2）にすると VideoToolbox が
 #    handler で -8969 を返して復号できなかった。テスト素材としては VideoToolbox が

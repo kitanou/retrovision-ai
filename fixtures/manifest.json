@@ -469,6 +469,32 @@
         "frameRate": "30000/1001",
         "audio": "dts 48000Hz 2ch（AVFoundation はこのトラックを列挙しない。EXP-002 §5b 実測）"
       }
+    },
+    {
+      "id": "menu-still-generated",
+      "status": "generated",
+      "kind": "generatedFile",
+      "sha256": "4dfe42d49cd7bdc4a3f2a61efce12d02e27f16c9885e7affdcd59bfe1ef2a745",
+      "seconds": 0,
+      "properties": [
+        "generated",
+        "mpeg2",
+        "dvdMenuStill",
+        "720x480",
+        "onePicture"
+      ],
+      "license": "self-generated（lavfi 合成源。第三者権利なし）",
+      "path": "fixtures/generated/menu-still-01.vob",
+      "generator": {
+        "recipe": "Scripts/gen-fixtures.sh",
+        "measuredWith": "ffmpeg 9.0.2 / macOS 27.2.1 / arm64",
+        "regenerate": "sh Scripts/gen-fixtures.sh（素材は Git に載せ、再生成結果の bit 一致は保証しない）"
+      },
+      "expectations": {
+        "codedSize": "720x480",
+        "pictureCount": 1,
+        "avFoundationReadable": false
+      }
     }
   ]
 }
