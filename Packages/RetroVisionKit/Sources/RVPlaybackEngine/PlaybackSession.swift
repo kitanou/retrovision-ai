@@ -2,6 +2,7 @@ import CoreMedia
 import Foundation
 import RVMediaCore
 import RVDecode
+import RVVideoPipeline
 
 // MARK: - 再生セッション（02 §2 の実行系・#11/#10 の再生線）
 //
@@ -138,15 +139,25 @@ public actor PlaybackSession {
     private var lastPresentedPTS: MediaTime?
     private var pauseHost: HostTime?
 
-    // 提示サーフェスへのハンドオフ（OQ-26。#5 の Metal 提示までの暫定経路）。
-    private var videoSink: (any VideoPresentSink)?
+    // 提示面への受け渡し（#5。Metal presenter か、暫定の VideoPresentSink を包んだもの）。
+    private var videoPresenter: (any VideoFramePresenter)?
+    /// 昇格済みの描画計画（EngineCore が frame 境界で差し替える。presenter はこれを読むだけ）。
+    private var renderPlan: RenderPlan?
     private var videoInFlight = 0
     private static let maxVideoInFlight = 3   // 00 §5 の in-flight 上限
 
     /// nil で計測のみ提示（#11 の動作）に戻る。セッション再生成時（トラック切替等）は
     /// EngineCore 側が保持している sink を貼り直す。
     public func setVideoSink(_ sink: (any VideoPresentSink)?) {
-        videoSink = sink
+        videoPresenter = sink.map { LegacySinkPresenter(sink: $0) }
+    }
+
+    public func setVideoPresenter(_ presenter: (any VideoFramePresenter)?) {
+        videoPresenter = presenter
+    }
+
+    public func setRenderPlan(_ plan: RenderPlan?) {
+        renderPlan = plan
     }
 
     /// 音量（#17 の音量操作 → EngineCore 経由の転送先）。音声線が無いときは no-op
@@ -617,22 +628,24 @@ public actor PlaybackSession {
     /// 渡した帧には lease を取る: サーフェスが描き終わるまで资源が生きていることの記録で、
     /// 01 §4 の lease 違反診断と同じ回路に乗る。
     private func deliverToSurface(_ frame: DecodedVideoFrame) {
-        guard let sink = videoSink else { return }
+        guard let presenter = videoPresenter else { return }
         guard videoInFlight < Self.maxVideoInFlight else {
             outcome.displayMissed += 1
             return
         }
         videoInFlight += 1
         let leaseToken = frame.retainForUse(reason: "display")
+        let plan = renderPlan   // この frame に適用する計画（差し替えは frame 境界のみ）
         Task { [weak self] in
-            await sink.receive(frame)
+            let result = await presenter.present(frame, plan: plan)
             leaseToken.release()
-            await self?.surfaceHandoffFinished()
+            await self?.surfaceHandoffFinished(result)
         }
     }
 
-    private func surfaceHandoffFinished() {
+    private func surfaceHandoffFinished(_ result: FrameDeliveryOutcome) {
         videoInFlight = max(0, videoInFlight - 1)
+        if result == .dropped { outcome.displayMissed += 1 }   // 提示面が捨てた frame（Metal の drawable 喪失等）
     }
 
     /// drift 采样（04 §5 の符号系: + = 映像が遅れている）。100 ms 間隔で十分（UI 表示・

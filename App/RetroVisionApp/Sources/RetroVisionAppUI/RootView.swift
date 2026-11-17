@@ -100,16 +100,17 @@ struct PlayerScreenView: View {
 
     @ViewBuilder
     private var videoSurface: some View {
-        let attach: @MainActor (AVSampleBufferDisplayLayer) -> Void = { layer in
-            model.attachSurface(layer: layer)
+        let attach: @MainActor (VideoSurfaceLayer) -> Void = { layer in
+            model.attachSurface(layer)
         }
+        let redraw: @MainActor () -> Void = { model.redrawSurface() }
         if let aspect = model.displayAspectValue, aspect > 0 {
-            VideoSurfaceView(onLayer: attach, onActivity: { showControls() })
+            VideoSurfaceView(onLayer: attach, onResize: redraw, onActivity: { showControls() })
                 .aspectRatio(aspect, contentMode: .fit)
         } else {
             // 比率未解決のあいまは枠いっぱいに仮表示（最初の帧で解決され、直ちに枠が変わる。
             // unknown を 4:3 に倒さない — #17 の方針 4・01 §2 と同じ「推測で既定にしない」）。
-            VideoSurfaceView(onLayer: attach, onActivity: { showControls() })
+            VideoSurfaceView(onLayer: attach, onResize: redraw, onActivity: { showControls() })
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }

@@ -205,7 +205,7 @@ public actor EngineCore {
             await seek(to: .zero, tolerance: .exact)
         }
         guard phase == .ready || phase == .paused || phase == .stalled(reason: .mediaSlow) else { return }
-        promotePendingPlan()
+        await promotePendingPlan()
         transition(to: .playing)
         // 再生線がある場合は実際にフレームを回す。ない場合（DVD 等・Phase 2）は状態機械のみ。
         // load で作って warmup 済みのセッション（#12）は run 開始だけ。実行中のものは resume。
@@ -239,7 +239,9 @@ public actor EngineCore {
             })
         self.session = session
         expectedPositionGeneration = await session.currentSeekGeneration   // 新 session: 生成時点の世代から受理
-        if let videoSink { await session.setVideoSink(videoSink) }
+        if let videoPresenter { await session.setVideoPresenter(videoPresenter) }
+        else if let videoSink { await session.setVideoSink(videoSink) }
+        await session.setRenderPlan(activePlan)
         if volumeGain != 1.0 { await session.setVolume(volumeGain) }
         self.sessionRunning = false
     }
@@ -250,7 +252,16 @@ public actor EngineCore {
     /// 実際の提示（#5 の Metal）が実装されるまで、UI はこの経路で frame を受け取る。
     public func setVideoSink(_ sink: (any VideoPresentSink)?) async {
         videoSink = sink
+        videoPresenter = nil
         await session?.setVideoSink(sink)
+    }
+
+    /// 提示面（presenter）の設定。Metal 提示はこちら（sink より優先）。nil で sink 経路へ戻す。
+    private var videoPresenter: (any VideoFramePresenter)?
+    public func setVideoPresenter(_ presenter: (any VideoFramePresenter)?) async {
+        videoPresenter = presenter
+        if let presenter { await session?.setVideoPresenter(presenter) }
+        else { await session?.setVideoSink(videoSink) }
     }
     private typealias Pipeline = (demuxer: any Demuxer, track: TrackID, format: VideoFormatDescription,
                                   audioTrack: TrackID?, audioFormat: AudioFormatDescription?)
@@ -519,9 +530,10 @@ public actor EngineCore {
         pendingPlan = plan
     }
 
-    private func promotePendingPlan() {
-        guard let pendingPlan else { return }
-        activePlan = pendingPlan
-        self.pendingPlan = nil
+    private func promotePendingPlan() async {
+        guard let promoted = pendingPlan else { return }
+        activePlan = promoted
+        pendingPlan = nil
+        await session?.setRenderPlan(promoted)   // frame 境界で差し替わる（session が次の提示から読む）
     }
 }

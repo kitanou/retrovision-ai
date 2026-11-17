@@ -139,7 +139,7 @@ drawable.addPresentedHandler { drew in
 - `presentsWithTransaction = false`（UI との同期を待たない）。
 - in-flight は最大 3（00 §5）。`MTLDrawable` の保留数が上限に達している場合、新規エンコードを待たずに**その frame を drop** して present 側を進める（INV-1 の一環: 音声は待たない）。
 
-**暫定提示経路（OQ-26・#2 で実装済み、#5 で置換）**。Metal 提示が載るまでは、engine は
+**暫定提示経路（OQ-26・#2 で実装、2026-11-17 に #5 A1a で Metal 提示へ置換済み。`RV_LEGACY_PRESENT=1` のフォールバックとして残る。契約は 10 の決定ログ 2026-11-17 を参照）**。以下は置換前の記述: Metal 提示が載るまでは、engine は
 present を済らせた帧を `VideoPresentSink`（async receive）で UI 側の実装に渡す。UI 側は
 AVSampleBufferDisplayLayer に enqueue するだけ（スケーリング・deint は通さない — 画質でなく
 UI の回路と比率の正しさを見る経路）。in-flight 上限 3 は同じ値で、渡せなかった帧は

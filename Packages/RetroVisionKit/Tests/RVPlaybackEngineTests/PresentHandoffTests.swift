@@ -5,6 +5,7 @@ import XCTest
 @testable import RVPlaybackEngine
 import RVMediaCore
 import RVMediaSources
+import RVVideoPipeline
 
 // MARK: - 提示サーフェスへのハンドオフ（OQ-26 の暫定経路。#2 の映像表示への橋渡し）
 //
@@ -42,6 +43,20 @@ private actor BlockingSink: VideoPresentSink {
         await withUnsafeContinuation { (c: UnsafeContinuation<Never, Never>) in }
     }
     var arrived: Int { receivedCount }
+}
+
+/// 偶数番目の帧を捨てる presenter（Metal の drawable 喪失・in-flight 超過の模型）。
+/// 渡された plan も記録する（engine が昇格済みの plan を presenter へ渡すことの検査）。
+private actor DroppingPresenter: VideoFramePresenter {
+    private var count = 0
+    private var plans: [RenderPlan?] = []
+    func present(_ frame: DecodedVideoFrame, plan: RenderPlan?) async -> FrameDeliveryOutcome {
+        count += 1
+        plans.append(plan)
+        return count % 2 == 0 ? .dropped : .delivered
+    }
+    var seen: Int { count }
+    var receivedPlanIDs: [PlanID?] { plans.map { $0?.id } }
 }
 
 final class PresentHandoffTests: XCTestCase {
@@ -197,5 +212,35 @@ final class PresentHandoffTests: XCTestCase {
         XCTAssertTrue(didFinish)
         XCTAssertEqual(outcome.stats.presented, 12)
         XCTAssertEqual(outcome.displayMissed, 0, "sink なしでは displayMissed も動かない")
+    }
+
+    // MARK: - 4. presenter が捨てた帧も displayMissed に数える（Metal 提示の保存則）
+
+    func testPresenterDropsAreCountedAsDisplayMissedAndPlanIsPassed() async throws {
+        let url = try fixtureURL("truncated-01-cut.mpg")
+        let demuxer = AVFoundationDemuxer(url: url)
+        let stream = try await demuxer.probe()
+        let (track, format) = try videoTrack(of: stream)
+
+        let time = DeterministicTimeSource(startMS: 10_000)
+        let session = await makeSession(demuxer: demuxer, track: track, format: format,
+                                       time: time, sink: nil)
+        let presenter = DroppingPresenter()
+        await session.setVideoPresenter(presenter)
+        let aspect = AspectResolution(targetDAR: AspectRatio(w: 4, h: 3),
+                                      cleanAperture: PixelRect(x: 0, y: 0, width: 720, height: 480),
+                                      source: .dvdAspectFlag)
+        let output = OutputContract(displayPixels: PixelSize(width: 720, height: 480), aspect: aspect)
+        await session.setRenderPlan(.metalBaseline(id: PlanID(7), output: output))
+        await driveToEnd(session, time: time, maxIterations: 5_000)
+
+        let delivered = await waitUntil({ await presenter.seen == 12 })
+        XCTAssertTrue(delivered, "presenter に全フレームが届かない")
+        let missedSettled = await waitUntil({ await session.outcomeSnapshot().displayMissed == 6 })
+        let outcome = await session.outcomeSnapshot()
+        XCTAssertEqual(outcome.stats.presented, 12)
+        XCTAssertTrue(missedSettled, "presenter の drop が displayMissed に載らない: \(outcome.displayMissed)")
+        let ids = await presenter.receivedPlanIDs
+        XCTAssertTrue(ids.allSatisfy { $0 == PlanID(7) }, "昇格済みの plan が presenter に渡らない")
     }
 }

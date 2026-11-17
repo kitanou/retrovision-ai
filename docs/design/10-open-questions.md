@@ -36,7 +36,7 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 | OQ-23 | seek 再開直後にも zero-sample buffer（`hasSampleData == false`）が現れるか（F5 の再発条件） | **決定済み（下記決定ログ・#13）**: 出る。cold read でも seek 再開直後でも 0 長 sample が現れることを実測で確認（各 2 件）。demux 縁の間引きは両経路で必須。`gatedEmptySampleCount` で診断を残す | 実測（04 §6・§9）: cold 180 sample 中 2 件 / seek(3.0s) 後 96 sample 中 2 件。decode 段に届いた件数は 0（-12902 ゼロ） | G1 | 完了 |
 | OQ-24 | ビルド成果物の署名方針（unsigned の SPM debug binary が一部環境で SIGKILL=exit 137。CI と配布の関係） | ビルド後 ad-hoc 署名（`codesign --force --sign -`）。Makefile/CI で実施 | 配布形態の要件（hardened runtime・entitlements） | G4 | Phase 4 |
 | OQ-25 | H.264 interlaced 素材の field 順序の情報源（F11 で全て消える）— detector の検証素材をどう用意するか | H.264 は detector 経路で受け入れる。順序の ground truth は生成時情報で持つ | h264 fixture での検出精度比較（生成時に正解既知） | G2 | Phase 2 |
-| OQ-26 | #5（Metal 提示）が載るまでの映像提示の形（#2 が先、#5 が後の順序に対する間つなぎ） | **暫定既定で実装済み（下記決定ログ #14）**: engine は present 済み帧を `VideoPresentSink` で UI に渡す（in-flight 3、超過は `displayMissed` に計上）。UI 側は AVSampleBufferDisplayLayer に enqueue のみ。比率は帧の format から AspectResolver で解決 | 実装・回帰固定（PresentHandoffTests の保存則 / SurfaceAspectTests の 4:3 / アプリ e2e）。#5 の Metal 提示で置換されるまで暫定 | G2 | 完了（#5 で置換前提） |
+| OQ-26 | #5（Metal 提示）が載るまでの映像提示の形（#2 が先、#5 が後の順序に対する間つなぎ） | **暫定既定で実装済み（下記決定ログ #14）**: engine は present 済み帧を `VideoPresentSink` で UI に渡す（in-flight 3、超過は `displayMissed` に計上）。UI 側は AVSampleBufferDisplayLayer に enqueue のみ。比率は帧の format から AspectResolver で解決 | 実装・回帰固定（PresentHandoffTests の保存則 / SurfaceAspectTests の 4:3 / アプリ e2e）。**2026-11-17: #5 A1a で Metal 提示（既定）に置換済み**。暫定経路は `RV_LEGACY_PRESENT=1` のフォールバックとして残す | G2 | 完了（Metal 既定。フォールバックは実画面での Metal 検証が済むまで残す） |
 
 ## 決定ログ
 
@@ -209,3 +209,13 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - OQ-07 の前半（モデル変換環境。G3 の評価が始められない）
 - OQ-16（実素材フィクスチャ。G2 の判定が実素材なしにはできない）
 - OQ-19（音声経路。G1 の受入基準にクロックの実測が必要）
+
+### 2026-11-17 — #5 A1a: Metal 提示を実再生経路へ接続（OQ-26 の置換）
+
+- **決定（契約）**: engine の出口を `VideoFramePresenter.present(_:plan:) -> FrameDeliveryOutcome`（`.delivered` / `.dropped`）にした。提示時刻の権威は engine（音声 clock）のまま。`PlaybackSession.deliverToSurface` は detached Task で presenter を呼び（再生・音声を止めない — INV-1）、in-flight 上限 3 と lease は従来どおり。presenter が `.dropped` を返したら `displayMissed` に数える（保存則 presented = delivered + displayMissed を維持。`PresentHandoffTests` に presenter drop の検査を追加）。
+- **決定（互換）**: 既存の `VideoPresentSink` は `LegacySinkPresenter`（常に delivered）で包み、`setVideoSink` は無変更。UI は `RV_LEGACY_PRESENT=1`（または Metal デバイス無し）で暫定経路を使える。
+- **決定（時間軸）**: `MetalPresenter.timing = .immediate`（呼ばれた時点の次の vsync）。presenter 自前の anchor（`.anchoredGrid`）は audio clock と別の時間軸になり、seek で PTS が飛ぶと予約が未来へずれるため engine 経路では使わない。`.anchoredGrid` は残す（`PresentScheduleTests` は不変）。復号 buffer は presented handler まで保持（GPU が読み終えるまで生かす）。
+- **決定（plan）**: EngineCore が昇格済み plan（`activePlan`）を session へ渡す（`play()` の昇格時と session 生成時）。presenter は plan を読むだけ。
+- **決定（UI 境界）**: App は `CAMetalLayer` を `DefaultPlayerEngine.attachMetalSurface(layer:onAspectResolved:)` へ渡すだけで、RVVideoPipeline を import しない（INV-8。`ImportBoundaryAppTests` 不変）。drawableSize は view が実ピクセル寸法に保ち、変更時に `redrawMetalSurface()` で最後の frame を描き直す。表示比率は plan の `aspect.targetDAR` から通知する（view の枠が DAR、graph の letterbox は同じ DAR なので二重補正にならない）。
+- **実測（2026-11-17、`dvd-video-ts-01` の menu を実アプリ窓で撮影し暫定経路と比較）**: 向き・色の並び・4:3 枠は暫定経路と一致。Metal 側は cleanAperture（704/720）を反映してカラーバーが約 2% 横に広がる（05 §6 の設計どおり。暫定経路は無視）。
+- **既知の差（次の増分）**: インターレース素材の静止した細部（焼き込み timecode）が、`.auto` → edgeDirected の縮退で崩れて見える（暫定経路は weave のままで鮮明）。detector と motionAdaptive（A1b）で解消する。present 間隔・GPU 時間の実測（G2）は未実施で、実素材（#15）も要る。
