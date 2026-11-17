@@ -265,3 +265,12 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **実測（`PICHI_PICHI_PITCH1.ISO`）**: VIDEO_TS は VMGM menu（約 13 MB、11 s）+ VTS_01（menu 235 KB + 本体 VOB 4 本 ≈ 3.6 GB、約 50 分 11 秒）。`RV_AUTO_TITLE=1` で本体が Metal 既定で再生され、実時間比 ≈ 1.0（位置が 1 s ごとに進む）。複数 VOB は連結して 1 タイトルとして扱われた（#25 の修復写しが働いた）。
 - **未決（静止ロゴの輪郭の点々）**: 本体冒頭（PONY CANYON のロゴ）の文字輪郭に細かい点々が見える。静止に近い場面なので motion-adaptive の weave 側で、動き由来ではない。MPEG-2 の mosquito noise（輪郭周りの圧縮ノイズ）の可能性が高いが、**同じ瞬間を暫定経路と比較できていない**（再生位置と実時間が実行ごとにずれて同じ場面を撮れない）。確定には、seek 位置を指定できる QA 入口（例: `RV_AUTO_SEEK`）で同じ位置を撮る、または Metal の最終出力を CPU に読み戻して差分を取る必要がある。A3 の非 AI ノイズ除去（metalGuided）は mosquito noise を狙う処理だが、UI から強度を操作する配線がまだ無く、実盤での効果は未確認。
 
+### 2026-11-17 — #5 A1e: 縞（comb）指標の実測と、field matching に進まない判断
+
+- **測定道具**: `CombMeasurementTests`（`RVDecodeTests`）。環境変数 `RV_MEASURE_PATH`（任意で `RV_MEASURE_SKIP` / `RV_MEASURE_FRAMES`）を指定したときだけ、復号した frame ごとに「歯」指標（`(y−上)` と `(y−下)` が同符号で輝度 12 階調超となる画素の割合）、隣接行 SAD、PCE のフラグ（`progressive_frame` / `repeat_first_field` / `top_field_first`）を表示する。未設定なら何もしない（CI では走らない）。
+- **指標の妥当性**: 歯指標は合成の縞あり frame（≈0.045）と縞なし（≈0.008）を 5 倍以上に分ける。既存の `rv_fieldMatch_sad_v1`（隣接行 SAD）は縦方向の細部でも反応するため、実素材では縞の指標として弱い見込み（歯指標の方が頑健）。
+- **`telecine-32-01.mpg`（生成素材）は標準の 3:2 ではない**: 縞ありは 5 frame に 2 回だが**隣り合わず**（周期 [縞,無,無,縞,無]、冒頭は 3 frame 周期）。生成コマンドの `telecine=pattern=3` を 30000/1001 へ落とした結果とみられる。標準の 3:2（A A / B B B / C C / D D D）は縞ありが連続 2 frame（周期 [無,無,縞,縞,無]）になるはずで、`CadenceAnalyzer` の想定と合わない。この素材では analyzer はロックしない（安全側）。標準 3:2 の素材は `telecine=pattern=23` で作り直す必要がある（未実施）。
+- **実盤（`PICHI_PICHI_PITCH1.ISO` 本編 VTS_01_1.VOB、約 50 s と 166 s の各 25 frame）に 3:2 は無い**: 歯指標は一定（≈0.0065 / ≈0.0155）で 5 frame 周期の山が無く、PCE は全 frame `prog=0 rff=0 tff=1`（**top field 先**。生成素材の bottom-first とは逆）。この素材では telecine 検出経路は一度も働かず、field matching は実盤で検証できない。
+- **決定**: 周期が明確に見える実素材が無い間は、field matching（weave 復元）・inverseTelecine・presenter 配線に**進まない**。誤った weave は現状（motion-adaptive）より悪く見えるため。`CadenceAnalyzer` は純粋ロジックのまま残し、画面には接続しない。
+- **次に必要になる設計（未実施）**: ① comb スコアの絶対しきい値は使えない（縞なしの基準が内容で 0.0065〜0.0155 と動く）→ 近傍窓の中央値に対する相対しきい値にする。② GPU の歯指標 kernel（simd 縮約）。③ field 順序は top-first / bottom-first の両方で検査する（実盤は top-first、生成素材は bottom-first）。④ 24p 化（重複 frame を捨て 2:3 で再タイミング）は session の時刻と OQ-10 に触れるため別 PR。field matching だけでは「24p 化」とは言わない。⑤ 標準 3:2 の実素材（#15 の `telecine-32-01`）。
+
