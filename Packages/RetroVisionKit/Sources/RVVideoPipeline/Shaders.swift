@@ -63,6 +63,17 @@ fragment float4 rv_colorConvert_v1(const VSOut in [[stage_in]],
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
 }
 
+// ---------- RGB texture の提示（AI 段の後の最終 scale。letterbox は destRect） ----------
+
+fragment float4 rv_rgbPresent_v1(const VSOut in [[stage_in]],
+                                 constant float4& destRect [[buffer(0)]],
+                                 texture2d<float> rgb [[texture(0)]],
+                                 sampler s [[sampler(0)]]) {
+    float2 q = (in.uv - destRect.xy) / destRect.zw;
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return float4(0.0, 0.0, 0.0, 1.0); }
+    return float4(rgb.sample(s, q).rgb, 1.0);
+}
+
 // ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
 //
 // 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。

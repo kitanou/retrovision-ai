@@ -168,7 +168,9 @@ public enum TiledInference {
 
     private static func makePixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
         var pb: CVPixelBuffer?
-        let attrs: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
+        // Metal 互換（出力を texture として取り込める — RVVideoPipeline の RGBBridge）。
+        let attrs: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                                    kCVPixelBufferMetalCompatibilityKey as String: true]
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
                                   attrs as CFDictionary, &pb) == kCVReturnSuccess, let pb else {
             throw PlaybackError.model(.runtimeFailure, message: "pixel buffer を確保できません")

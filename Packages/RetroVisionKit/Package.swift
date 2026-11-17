@@ -77,6 +77,8 @@ let package = Package(
         .testTarget(name: "RVMediaSourcesTests", dependencies: ["RVMediaSources", "RVMediaCore"]),
         .testTarget(name: "RVDiagnosticsTests", dependencies: ["RVDiagnostics"]),
         .testTarget(name: "RVMLRuntimeTests", dependencies: ["RVMLRuntime", "RVMediaCore"]),
+        .testTarget(name: "RVEnhancementTests",
+                    dependencies: ["RVEnhancement", "RVVideoPipeline", "RVMLRuntime", "RVMediaCore"]),
         .testTarget(name: "RVVideoPipelineTests", dependencies: ["RVVideoPipeline"]),
         .testTarget(
             name: "RVDecodeTests",

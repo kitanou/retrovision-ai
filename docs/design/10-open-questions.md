@@ -274,3 +274,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査**: 信号の写像、breaker の open で tier が metalOnly に下がる（half-open では下がらない）、memory pressure で unload と tier 降下、実行層が無ければ breaker は常に closed で unload もしない、thermal serious の上限と理由の通知、昇格を降格として通知しない。**本物の Core ML 実行層**（tiny model を NV12 の入力で 3 回失敗させて実際に breaker を open）で、エンジンの tier が下がるところまでの通し検査。
 - **未接続（意図的）**: ① present jitter: `.immediate` の提示では「予約時刻との差」が提示までの待ち時間になり、基準値（8 ms）を超えて誤作動するため接続しない（指標の再定義が先）。② endToEnd の p95: PTS から実提示までの対応付けは `MetalPresenter.onPresented` の集計が要る。③ 実際の AI 段（超解像・学習ベースのノイズ除去）が plan に入る構成での挙動（現状は AI 段が無いので tier が上がっても段は増えない）。④ 品質インジケータ UI、負荷注入テスト、ベンチマークレポート。
 
+### 2026-11-17 — #6 A2: Metal ↔ Core ML の橋渡しと AI 段（方針 A）
+
+- **決定（橋渡し、方針 A — 06 §4）**: BGRA8 の IOSurface 付き・Metal 互換の `CVPixelBuffer` と、その同じ領域を指す `MTLTexture`（`RGBFrameBuffer`。`CVMetalTextureCache` から renderTarget + shaderRead + shaderWrite で取り込む）を橋にする。Metal が描画先として書いた buffer を、そのまま Core ML に image 入力として渡し（コピー無しで GPU と Core ML が同じ領域を見る）、Core ML の出力 buffer を texture として取り込み直す。`MetalRenderGraph` に `makeRGBBuffer` / `importRGB` / `renderToRGB`（deinterlace + 色変換を取り込み域の寸法いっぱいに描く。拡縮・letterbox 無し）/ `presentRGB`（目標比率で letterbox して target へ。`rv_rgbPresent_v1`）を追加した。
+- **決定（AI 段）**: `MLEnhancementStage`（RVEnhancement。RVVideoPipeline と RVMLRuntime の両方に依存できる層）が、① 入力を RGB buffer へ描く（GPU の完了を待つ）→ ② `TiledInference` でタイル分割推論 → ③ 出力を texture として返す。失敗（未 load・breaker open・shape 不一致・期限超過・描画失敗）はすべて型付きの `PlaybackError`。呼び出し側はその frame を非強調のまま提示する（INV-1）。この段は再生時刻を持たない。
+- **検査（実際の Metal + Core ML）**: 反転モデル（tiny）で、Metal の描画 → Core ML（32x32 のタイル・overlap 8 で 64x64 を分割）→ Metal の提示を通した出力が、通常の描画の 255 − x に全画素で一致（継ぎ目を含む。±4）。未 load のモデルは `notCompiled`、タイルより小さい frame は `shapeMismatch`。
+- **未実装（A2 / A3 の残り）**: ① `MetalFramePresenter` / `PlaybackSession` への AI 段の組み込み（tier が lightML 以上のとき enhance → presentRGB に切り替える。いまは plan に AI 段が入っても描画に使われない）。② タイル切り出し・合成の GPU 化（いまは CPU の参照実装。実時間の予算は未計測）。③ 実モデル（Real-ESRGAN 等）の変換・同梱・compute units の実測（OQ-07 / OQ-11 とライセンス確認が先）。④ 超解像の倍率（scale 2）で出力寸法が変わるときの presentRGB の検査（コードは対応、検査は scale 1 のみ）。
+

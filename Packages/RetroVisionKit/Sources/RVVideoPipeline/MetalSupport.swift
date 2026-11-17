@@ -154,6 +154,8 @@ public final class PixelBufferImporter: @unchecked Sendable {
     private let context: MetalRenderContext
     private var cache: CVMetalTextureCache?
     private let lock = NSLock()
+    /// BGRA 取り込み（RGBBridge）が使う同じ cache。
+    var textureCache: CVMetalTextureCache? { lock.withLock { cache } }
 
     public init(context: MetalRenderContext) throws {
         self.context = context
