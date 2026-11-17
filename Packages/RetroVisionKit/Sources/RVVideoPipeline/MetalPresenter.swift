@@ -67,7 +67,8 @@ public final class MetalPresenter: @unchecked Sendable {
     }
     private var _timing: Timing = .anchoredGrid
     /// 最後に描いた入力（窓リサイズ・一時停止中の再描画用。pixel buffer を保持する）。
-    private var lastRendered: (input: RenderFrameInput, plan: RenderPlan, pts: MediaTime)?
+    private var lastDraw: (draw: @Sendable (any MTLTexture) throws -> Void, retain: AnyObject,
+                           pts: MediaTime, frameID: FrameID)?
 
     private let graph: MetalRenderGraph
     private let lock = NSLock()
@@ -102,6 +103,23 @@ public final class MetalPresenter: @unchecked Sendable {
     /// engine 側の drop 計数に載せる（保存則: delivered = scheduled + dropped — 05 §7）。
     public func present(_ input: RenderFrameInput, plan: RenderPlan, pts: MediaTime) throws
         -> PresentOutcome {
+        let retained = input.pixelBuffer   // GPU が読み終える（提示完了）まで復号 buffer を生かす
+        return try submit(pts: pts, frameID: input.frameID ?? FrameID(0), retain: retained) { [graph] texture in
+            _ = try graph.render(input, plan: plan, to: texture)
+        }
+    }
+
+    /// AI 段を通した RGB buffer を、目標比率で letterbox して drawable へ描いて present 予約する。
+    public func presentEnhanced(_ rgb: RGBFrameBuffer, aspect: AspectResolution, pts: MediaTime,
+                                frameID: FrameID) throws -> PresentOutcome {
+        try submit(pts: pts, frameID: frameID, retain: rgb) { [graph] texture in
+            try graph.presentRGB(rgb, aspect: aspect, to: texture)
+        }
+    }
+
+    /// drawable の確保・描画・present 予約・presented 記録の共通部分。`draw` が drawable の texture へ描く。
+    private func submit(pts: MediaTime, frameID: FrameID, retain: AnyObject,
+                        draw: @escaping @Sendable (any MTLTexture) throws -> Void) throws -> PresentOutcome {
         let layer = lock.withLock { self.layer }
         guard let layer else { return .dropped(reason: .drawableLost) }
         let inFlightNow = lock.withLock { () -> Int in
@@ -118,7 +136,7 @@ public final class MetalPresenter: @unchecked Sendable {
         }
 
         do {
-            _ = try graph.render(input, plan: plan, to: drawable.texture)
+            try draw(drawable.texture)
         } catch {
             lock.withLock { inFlight = max(0, inFlight - 1) }   // drawable は deinit でプールへ戻る
             throw error
@@ -127,11 +145,9 @@ public final class MetalPresenter: @unchecked Sendable {
         let nowS = CACurrentMediaTime()
         let immediate = lock.withLock { _timing == .immediate }
         let (presentAtS, scheduledS) = immediate ? (nowS, nowS) : scheduledTime(pts: pts, nowS: nowS)
-        let frameID = input.frameID ?? FrameID(0)
-        lock.withLock { lastRendered = (input, plan, pts) }
-        let retainedBuffer = input.pixelBuffer   // GPU が読み終える（提示完了）まで復号 buffer を生かす
+        lock.withLock { lastDraw = (draw, retain, pts, frameID) }
         drawable.addPresentedHandler { [weak self] drew in
-            _ = retainedBuffer
+            _ = retain
             let presentedS = drew.presentedTime     // 秒。未提示・スキップは 0
             if presentedS > 0 {
                 let record = PresentRecord(frameID: frameID, pts: pts,
@@ -147,15 +163,16 @@ public final class MetalPresenter: @unchecked Sendable {
     }
 
     /// 最後に描いた frame を現在の drawable 寸法で描き直す（窓リサイズ・一時停止中の再描画）。
-    /// 描いた frame が無い、layer が無い、in-flight 上限のときは nil。
+    /// AI 段を通した frame も同じ描き方で再描画する。描いた frame が無い、layer が無い、
+    /// in-flight 上限のときは nil。
     @discardableResult
     public func redrawLast() -> PresentOutcome? {
-        guard let last = lock.withLock({ lastRendered }) else { return nil }
-        return try? present(last.input, plan: last.plan, pts: last.pts)
+        guard let last = lock.withLock({ lastDraw }) else { return nil }
+        return try? submit(pts: last.pts, frameID: last.frameID, retain: last.retain, draw: last.draw)
     }
 
     /// 保持している最後の frame を手放す（close・item 切替。復号 buffer を生かし続けない）。
-    public func clearLast() { lock.withLock { lastRendered = nil } }
+    public func clearLast() { lock.withLock { lastDraw = nil } }
 
     /// 提示完了記録の受け口（engine が設定する。nil のままでも提示は続く）。
     public var onPresented: (@Sendable (PresentRecord) -> Void)? {

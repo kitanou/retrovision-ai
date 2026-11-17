@@ -4,6 +4,7 @@ import RVDecode
 import RVEnhancement
 import RVMediaCore
 import RVMediaSources
+import RVMLRuntime
 import RVVideoPipeline
 
 // MARK: - EngineCore（02 §2 の実体）
@@ -238,6 +239,7 @@ public actor EngineCore {
                 Task { await self?.handleSessionEvent(event, line: line) }
             })
         self.session = session
+        adaptiveWindowStart = nil   // 新 session は累積 stats が 0 から始まる（窓を取り直す）
         expectedPositionGeneration = await session.currentSeekGeneration   // 新 session: 生成時点の世代から受理
         if let videoPresenter { await session.setVideoPresenter(videoPresenter) }
         else if let videoSink { await session.setVideoSink(videoSink) }
@@ -399,18 +401,156 @@ public actor EngineCore {
         }
     }
 
+    // MARK: 適応制御の窓評価（08 §3・§4。信号の生成と controller への配線）
+    //
+    // 位置イベント（提示のたび）を契機に、窓（既定 2 s）が満ちたときだけ評価する。専用タイマーを
+    // 持たない（再生線と同じ流れの中で完結し、止まっている間は評価しない）。窓の FrameStats は
+    // session の累積値の差分。thermal は ProcessInfo、memory pressure / breaker / present jitter は
+    // 供給元（A2 の runtime、MetalPresenter.onPresented）が載るまで既定値（normal / false / 0）。
+
+    // モデル実行層（A2）。無ければ breaker は常に closed、memory pressure も unload する対象が無い。
+    private var modelRuntime: (any ModelRuntimeProtocol)?
+    private var trackedModels: [ModelID] = []
+    private var availableManifests: [ModelManifest] = []
+    private var memoryPressure: ControlSignals.MemoryPressureLevel = .normal
+    private var memorySource: (any DispatchSourceMemoryPressure)?
+    /// 直近に適用した tier（降格 / 昇格の判別用。nil の間は最初の setTier で基準だけを置く）。
+    private var lastAppliedTier: QualityTier?
+
+    /// モデル実行層を接続する。`models` は breaker を監視し、memory pressure で unload する対象。
+    /// nil で切り離し（memory pressure の監視も止める）。
+    public func setModelRuntime(_ runtime: (any ModelRuntimeProtocol)?, models: [ModelID] = [],
+                                manifests: [ModelManifest] = []) {
+        modelRuntime = runtime
+        trackedModels = runtime == nil ? [] : models
+        // plan 生成が参照できるモデル（06 §2。manifest が無ければ SR / 学習ベースの段は入らない）。
+        availableManifests = runtime == nil ? [] : manifests
+        try? rebuildPlan()
+        memorySource?.cancel()
+        memorySource = nil
+        memoryPressure = .normal
+        guard runtime != nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical, .normal],
+                                                              queue: DispatchQueue.global(qos: .utility))
+        source.setEventHandler { [weak self, weak source] in
+            guard let event = source?.data else { return }
+            let level: ControlSignals.MemoryPressureLevel =
+                event.contains(.critical) ? .critical : (event.contains(.warning) ? .warn : .normal)
+            Task { await self?.setMemoryPressure(level) }
+        }
+        source.resume()
+        memorySource = source
+    }
+
+    func setMemoryPressure(_ level: ControlSignals.MemoryPressureLevel) { memoryPressure = level }
+
+    /// 追跡中のモデルのどれかの breaker が open か（half-open は試行中なので open 扱いにしない）。
+    private func anyModelBreakerOpen() async -> Bool {
+        guard let modelRuntime else { return false }
+        for id in trackedModels where await modelRuntime.health(of: id).breakerState == .open { return true }
+        return false
+    }
+
+    /// 窓の統計と各供給元から ControlSignals を作る（純粋。テストで写像を固定する）。
+    static func makeSignals(window: FrameStats, windowMS: Double, thermal: ThermalState,
+                            memory: ControlSignals.MemoryPressureLevel, breakerOpen: Bool) -> ControlSignals {
+        ControlSignals(summary: DiagnosticsSummary(windowMS: windowMS, frames: window), thermal: thermal,
+                       memoryPressureLevel: memory, modelBreakerOpen: breakerOpen)
+    }
+
+    /// 1 窓分を評価して action を適用する。`evaluateAdaptiveWindowIfDue` の中身（session に依存しない）。
+    func evaluateWindow(window: FrameStats, elapsedMS: Double, nowMS: Double,
+                        thermal: ThermalState) async -> [ControlAction] {
+        let signals = Self.makeSignals(window: window, windowMS: elapsedMS, thermal: thermal,
+                                       memory: memoryPressure, breakerOpen: await anyModelBreakerOpen())
+        if lastAppliedTier == nil { lastAppliedTier = controller.state.activeTier }   // 評価前の tier を基準にする
+        let actions = controller.evaluate(signals: signals, atMS: nowMS)
+        // UI に伝える理由: 何が原因で降格したか（優先: breaker > memory > thermal > 負荷）。
+        let reason: DegradeReason = signals.modelBreakerOpen ? .modelFailure
+            : (signals.memoryPressureLevel != .normal ? .memory
+               : ((thermal == .serious || thermal == .critical) ? .thermal : .loadHigh))
+        if !actions.isEmpty { await applyControlActions(actions, reason: reason) }
+        return actions
+    }
+
+    /// テスト用の接点（controller の状態の読み書き）。
+    func adaptiveState() -> AdaptivePolicyEngine.State { controller.state }
+    func seedAdaptiveState(_ state: AdaptivePolicyEngine.State) { controller.state = state }
+
+    private var adaptiveWindowStart: ContinuousClock.Instant?
+    private var adaptiveLastStats = FrameStats()
+
+    /// 累積 stats の窓差分（session 再生成などで累積が戻った場合は負にせず 0 に丸める）。
+    static func windowedStats(previous: FrameStats, current: FrameStats) -> FrameStats {
+        func delta(_ now: Int, _ before: Int) -> Int { max(0, now - before) }
+        var reasons: [DropReason: Int] = [:]
+        for (reason, count) in current.dropReasons {
+            let d = delta(count, previous.dropReasons[reason] ?? 0)
+            if d > 0 { reasons[reason] = d }
+        }
+        let presented = delta(current.presented, previous.presented)
+        let dropped = delta(current.dropped, previous.dropped)
+        return FrameStats(total: presented + dropped, presented: presented, dropped: dropped,
+                          late: delta(current.late, previous.late),
+                          enhancementSkipped: delta(current.enhancementSkipped, previous.enhancementSkipped),
+                          dropReasons: reasons)
+    }
+
+    static func thermalState(from state: ProcessInfo.ThermalState) -> ThermalState {
+        switch state {
+        case .nominal: .nominal
+        case .fair: .fair
+        case .serious: .serious
+        case .critical: .critical
+        @unknown default: .nominal
+        }
+    }
+
+    private func evaluateAdaptiveWindowIfDue(thermal: ThermalState = EngineCore.thermalState(from: ProcessInfo.processInfo.thermalState)) async {
+        guard phase == .playing, let session else { return }
+        let now = ContinuousClock.now
+        if let start = adaptiveWindowStart,
+           adaptiveClockMS(now) - adaptiveClockMS(start) < controller.config.windowMS {
+            return   // 窓が満ちるまで session に触れない（提示のたびの呼び出しを安くする）
+        }
+        let current = await session.outcomeSnapshot().stats
+        guard let start = adaptiveWindowStart else {
+            adaptiveWindowStart = now
+            adaptiveLastStats = current
+            return
+        }
+        let elapsedMS = adaptiveClockMS(now) - adaptiveClockMS(start)
+        let window = Self.windowedStats(previous: adaptiveLastStats, current: current)
+        adaptiveWindowStart = now
+        adaptiveLastStats = current
+        guard window.total > 0 else { return }
+        _ = await evaluateWindow(window: window, elapsedMS: elapsedMS, nowMS: adaptiveClockMS(now), thermal: thermal)
+    }
+
+    private let adaptiveClockOrigin = ContinuousClock.now
+    private func adaptiveClockMS(_ instant: ContinuousClock.Instant) -> Double {
+        let d = instant - adaptiveClockOrigin
+        return Double(d.components.seconds) * 1_000 + Double(d.components.attoseconds) / 1e15
+    }
+
     /// 適応制御から届いた action を適用する（08 §5）。plan の作り直しは frame 境界で行う。
-    public func applyControlActions(_ actions: [ControlAction]) {
+    public func applyControlActions(_ actions: [ControlAction], reason: DegradeReason = .loadHigh) async {
         for action in actions {
             switch action {
-            case .setTier:
-                break // controller 側で state は更新済み
+            case .setTier(let tier):
+                // controller 側で state は更新済み。**降格のときだけ**理由を UI へ（昇格は通知しない）。
+                if let previous = lastAppliedTier, tier < previous { noteDegradation(reason) }
+                lastAppliedTier = tier
             case .bypassStage(let stage):
-                noteDegradation(.loadHigh)
+                noteDegradation(reason)
                 _ = stage
+            case .unloadModel:
+                // memory pressure: 追跡中のモデルを unload して memory を戻す（06 §6。再生は止めない）。
+                if let modelRuntime { for id in trackedModels { await modelRuntime.unload(id) } }
+                noteDegradation(.memory)
             case .disableTemporalBlend, .useLighterModelVariant, .reduceInferenceScale,
-                 .enhanceEveryNFrames, .setInFlightLimit, .unloadModel:
-                noteDegradation(.loadHigh)
+                 .enhanceEveryNFrames, .setInFlightLimit:
+                noteDegradation(reason)
             }
         }
         try? rebuildPlan()
@@ -449,6 +589,10 @@ public actor EngineCore {
         guard line == lineGeneration else { return }   // 古い線の closer（close/load 済み）
         switch event {
         case .position(let pts, let seekGeneration):
+            // frame 境界での plan 切り替え（INV-3）。設定変更・適応制御で作られた pending plan は、
+            // 次に提示された frame の位置イベントで昇格する（その場では差し替えない）。
+            if pendingPlan != nil, phase == .playing { await promotePendingPlan() }
+            await evaluateAdaptiveWindowIfDue()
             // 位置イベントの契約（02 §4。2026-11-16 の CI で実測した逆行の修正 — 決定ログ #14）。
             // 三重の濾過:
             //  ① seeking のあいだは全て黙る（UI は target を表示済み。この窓のイベントは
@@ -503,7 +647,8 @@ public actor EngineCore {
         let stages = StageGraphBuilder.stageRequests(for: .init(
             userPolicy: settings.enhancement,
             activeTier: controller.state.activeTier,
-            deinterlace: settings.deinterlaceMode))
+            deinterlace: settings.deinterlaceMode,
+            availableModels: availableManifests))
         let output = OutputContract(displayPixels: format.codedSize, aspect: aspect)
         let plan = RenderPlan(id: PlanID(planCounter), tier: controller.state.activeTier,
                               stages: stages, output: output)

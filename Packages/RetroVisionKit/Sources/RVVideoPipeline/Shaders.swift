@@ -63,6 +63,120 @@ fragment float4 rv_colorConvert_v1(const VSOut in [[stage_in]],
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
 }
 
+// ---------- RGB texture の提示（AI 段の後の最終 scale。letterbox は destRect） ----------
+
+fragment float4 rv_rgbPresent_v1(const VSOut in [[stage_in]],
+                                 constant float4& destRect [[buffer(0)]],
+                                 texture2d<float> rgb [[texture(0)]],
+                                 sampler s [[sampler(0)]]) {
+    float2 q = (in.uv - destRect.xy) / destRect.zw;
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return float4(0.0, 0.0, 0.0, 1.0); }
+    return float4(rgb.sample(s, q).rgb, 1.0);
+}
+
+// ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
+//
+// 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。
+// chroma は 4:2:0 で元々低解像なので linear のまま（bicubic にしても見た目が変わらず tap だけ増える）。
+// overshoot は clamp(0,1) で抑える。縮小時は host 側が linear を選ぶ（bicubic は折り返しを強めるため）。
+
+static float4 rv_catmullRomWeights(float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return float4(-0.5 * t3 + t2 - 0.5 * t,
+                  1.5 * t3 - 2.5 * t2 + 1.0,
+                  -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+                  0.5 * t3 - 0.5 * t2);
+}
+
+fragment float4 rv_colorConvert_bicubic_v1(const VSOut in [[stage_in]],
+                                           constant ColorParams& p [[buffer(0)]],
+                                           texture2d<float> yTex [[texture(0)]],
+                                           texture2d<float> uvTex [[texture(1)]],
+                                           sampler s [[sampler(0)]]) {
+    float2 q = (in.uv - p.destRect.xy) / p.destRect.zw;
+    float2 suv = p.sourceRect.xy + q * p.sourceRect.zw;
+    float2 size = float2(yTex.get_width(), yTex.get_height());
+    float2 pos = suv * size - 0.5;
+    float2 base = floor(pos);
+    float2 f = pos - base;
+    float4 wx = rv_catmullRomWeights(f.x);
+    float4 wy = rv_catmullRomWeights(f.y);
+    int2 maxC = int2(size) - 1;
+    float acc = 0.0;
+    for (int j = 0; j < 4; j++) {
+        float row = 0.0;
+        for (int i = 0; i < 4; i++) {
+            int2 c = clamp(int2(base) + int2(i - 1, j - 1), int2(0), maxC);
+            row += wx[i] * yTex.read(uint2(c)).r;
+        }
+        acc += wy[j] * row;
+    }
+    float y = clamp(acc, 0.0, 1.0);
+    float2 cbcr = uvTex.sample(s, suv).rg;
+    float3 ycb = float3(y, cbcr.x, cbcr.y);
+    float3 rgb;
+    rgb.r = dot(float3(p.m[0], p.m[1], p.m[2]), ycb) + p.b[0];
+    rgb.g = dot(float3(p.m[3], p.m[4], p.m[5]), ycb) + p.b[1];
+    rgb.b = dot(float3(p.m[6], p.m[7], p.m[8]), ycb) + p.b[2];
+    return float4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+
+// ---------- denoise: metalGuided（非 AI。エッジ保存の空間フィルタ。07 §3） ----------
+//
+// 輝度: 5x5 の bilateral（空間重み × 値差の重み）。値差の sigma を strength で決めるので、
+// 強い edge（字幕・線画・顔の輪郭）は値差が大きく平均に入らず保たれ、ブロックノイズ・粒子の
+// ような小振幅の揺らぎだけが均される。strength 0 は恒等。
+// 色: 3x3 の bilateral（chroma noise・色の滲み。小振幅のみ均す）。
+// 時間方向（temporal blend）は前 *出力* が要るため v1 には入れない（ghost を避ける）。
+
+kernel void rv_denoise_metalGuided_v1(texture2d<float, access::read>  inY  [[texture(0)]],
+                                      texture2d<float, access::read>  inUV [[texture(1)]],
+                                      texture2d<float, access::write> outY [[texture(2)]],
+                                      texture2d<float, access::write> outUV [[texture(3)]],
+                                      constant float& strength [[buffer(0)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    int w = int(outY.get_width());
+    int h = int(outY.get_height());
+    int x = int(gid.x), y = int(gid.y);
+    if (x < w && y < h) {
+        float c = inY.read(gid).r;
+        float sigmaR = mix(0.01, 0.12, strength);   // 値差の許容（輝度 [0,1]）。強いほど大きい振幅まで均す
+        float acc = 0.0, wsum = 0.0;
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int sx = clamp(x + dx, 0, w - 1), sy = clamp(y + dy, 0, h - 1);
+                float v = inY.read(uint2(sx, sy)).r;
+                float ds = float(dx * dx + dy * dy);
+                float dv = v - c;
+                float wgt = exp(-ds / 4.5) * exp(-(dv * dv) / (2.0 * sigmaR * sigmaR));
+                acc += wgt * v;
+                wsum += wgt;
+            }
+        }
+        outY.write(float4(acc / max(wsum, 1e-6), 0.0, 0.0, 1.0), gid);
+    }
+    int cw = int(outUV.get_width());
+    int ch = int(outUV.get_height());
+    if (x < cw && y < ch) {
+        float2 c = inUV.read(gid).rg;
+        float sigmaC = mix(0.01, 0.12, strength);
+        float2 acc = float2(0.0);
+        float wsum = 0.0;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int sx = clamp(x + dx, 0, cw - 1), sy = clamp(y + dy, 0, ch - 1);
+                float2 v = inUV.read(uint2(sx, sy)).rg;
+                float2 d = v - c;
+                float wgt = exp(-float(dx * dx + dy * dy) / 2.0) * exp(-dot(d, d) / (2.0 * sigmaC * sigmaC));
+                acc += wgt * v;
+                wsum += wgt;
+            }
+        }
+        float2 o = acc / max(wsum, 1e-6);
+        outUV.write(float4(o.x, o.y, 0.0, 1.0), gid);
+    }
+}
+
 // ---------- deinterlace: bob（safe 側。各 field を full height へ） ----------
 // 入力: r8(Y, WxH), rg8(UV, W/2 x H/2)（weave 済み: 走査線が field 交互）。
 // 出力: 同じ寸法の progressive Y/UV。topFieldFirst=true: 符号列 0 = 上 field。
@@ -130,6 +244,116 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
     }
     if (gid.x < w / 2u && gid.y < h / 2u) {
         outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+    }
+}
+
+// ---------- deinterlace: motion-adaptive（時間 + 空間。05 §5.2 の既定。前 frame が要る） ----------
+//
+// 偶数行は保持（edge-directed と同じ）。奇数行（他 field の線）は画素ごとに動きを測り、
+//   - 静止: 現 frame の他 field の線をそのまま使う（weave。垂直解像度を保つ — 静止した
+//     細い文字・字幕・縞が edge-directed の内挿で崩れない）
+//   - 動き: edge-directed の空間内挿（comb を出さない）
+// を連続的に混ぜる。動きの指標は「前 frame との同位置の差」を、補間行 y とその上下の
+// 保持行 y±1 の 3 点の最大で取る（同 parity 同士の比較なので、field 間の時間差で
+// 静止物を動きと誤判定しない）。しきい値は輝度 [0,1] 正規化値（video range の
+// 約 7〜23 階調）。前 frame が無い / 寸法が違うときは host 側が edge-directed に倒す。
+
+// 動き指標（輝度。前 frame との同位置差を、左右 1 画素・上下の保持行まで広げた 3x3 の最大）。
+// 1 画素ごとに weave / 空間内挿が切り替わると、動く edge に点線状の縞が出る（実盤 ISO で確認）。
+static float rv_motionAt(texture2d<float, access::read> inY,
+                         texture2d<float, access::read> prevY, int x, int y, int W, int H) {
+    int yu = max(y - 1, 0), yd = min(y + 1, H);
+    float motion = 0.0;
+    for (int dx = -1; dx <= 1; dx++) {
+        uint sx = uint(clamp(x + dx, 0, W));
+        motion = max(motion, fabs(inY.read(uint2(sx, uint(y))).r - prevY.read(uint2(sx, uint(y))).r));
+        motion = max(motion, fabs(inY.read(uint2(sx, uint(yu))).r - prevY.read(uint2(sx, uint(yu))).r));
+        motion = max(motion, fabs(inY.read(uint2(sx, uint(yd))).r - prevY.read(uint2(sx, uint(yd))).r));
+    }
+    return motion;
+}
+
+kernel void rv_deint_motionAdaptive_v1(texture2d<float, access::read>  inY  [[texture(0)]],
+                                       texture2d<float, access::read>  inUV [[texture(1)]],
+                                       texture2d<float, access::write> outY [[texture(2)]],
+                                       texture2d<float, access::write> outUV [[texture(3)]],
+                                       texture2d<float, access::read>  prevY [[texture(4)]],
+                                       uint2 gid [[thread_position_in_grid]]) {
+    int w = int(outY.get_width());
+    int h = int(outY.get_height());
+    int W = w - 1, H = h - 1;
+    int x = int(gid.x), y = int(gid.y);
+    if (x < w && y < h) {
+        bool keepRow = (y & 1) == 0;
+        if (keepRow) {
+            outY.write(inY.read(gid), gid);
+        } else {
+            int yu = max(y - 1, 0), yd = min(y + 1, H);
+            // 空間内挿（edge-directed と同じ）
+            int bestA = 0;
+            float bestCost = 1e30;
+            for (int a = -4; a <= 4; a++) {
+                float vu = inY.read(uint2(clamp(x + a, 0, W), yu)).r;
+                float vd = inY.read(uint2(clamp(x - a, 0, W), yd)).r;
+                float cost = fabs(vu - vd);
+                if (cost < bestCost) { bestCost = cost; bestA = a; }
+            }
+            float spatial = (inY.read(uint2(clamp(x + bestA, 0, W), yu)).r
+                             + inY.read(uint2(clamp(x - bestA, 0, W), yd)).r) * 0.5;
+            float weave = inY.read(gid).r;
+            float k = smoothstep(0.02, 0.07, rv_motionAt(inY, prevY, x, y, W, H));
+            outY.write(float4(mix(weave, spatial, k), 0.0, 0.0, 1.0), gid);
+        }
+    }
+    // 色（4:2:0）。インターレースでは chroma の行も field 交互（偶数行 = 上 field）なので、
+    // 動く画素の色を weave すると別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る
+    // （chroma upsampling error）。動く画素は、輝度で保持した field（偶数行）の chroma だけから
+    // 補間する。静止画素は従来どおり。
+    int cw = int(outUV.get_width());
+    int ch = int(outUV.get_height());
+    if (x < cw && y < ch) {
+        float2 weaveC = inUV.read(gid).rg;
+        float2 outC = weaveC;
+        if ((y & 1) == 1) {
+            float2 up = inUV.read(uint2(x, uint(max(y - 1, 0)))).rg;
+            float2 down = inUV.read(uint2(x, uint(min(y + 1, ch - 1)))).rg;
+            float2 spatialC = (up + down) * 0.5;
+            // 対応する輝度位置（2x, 2y の周辺）の動きを使う。
+            float k = smoothstep(0.02, 0.07, rv_motionAt(inY, prevY, min(2 * x, W), min(2 * y, H), W, H));
+            outC = mix(weaveC, spatialC, k);
+        }
+        outUV.write(float4(outC.x, outC.y, 0.0, 1.0), gid);
+    }
+}
+
+// ---------- inverse telecine: field matching（weave 復元。05 §5.1） ----------
+//
+// 3:2 の縞ありフレーム（周期内位置 2・3）は、隣り合う映画コマの field を 1 つずつ持つ。
+// 元のコマは「現 frame の先行 field + 前 frame の後続 field」を行ごとに織る（weave）と復元できる:
+//   top-first:    偶数行（top）= 現 frame、奇数行（bottom）= 前 frame
+//   bottom-first: 奇数行（bottom）= 現 frame、偶数行（top）= 前 frame
+// chroma（4:2:0）も行が field 交互なので同じ規則で織る。この kernel は縞ありと判定された
+// frame にだけ host 側が使う（縞なしの frame は weave のまま = 元から正しい）。
+// topFieldFirst は function constant（bob と共有。PSO は field 順が変わるときだけ作り直す）。
+
+kernel void rv_ivtc_weave_v1(texture2d<float, access::read>  inY   [[texture(0)]],
+                             texture2d<float, access::read>  inUV  [[texture(1)]],
+                             texture2d<float, access::write> outY  [[texture(2)]],
+                             texture2d<float, access::write> outUV [[texture(3)]],
+                             texture2d<float, access::read>  prevY  [[texture(4)]],
+                             texture2d<float, access::read>  prevUV [[texture(5)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint w = outY.get_width();
+    uint h = outY.get_height();
+    // 現 frame から取る行の parity: top-first は偶数行（0）、bottom-first は奇数行（1）。
+    uint curParity = topFieldFirst ? 0u : 1u;
+    if (gid.x < w && gid.y < h) {
+        float v = ((gid.y & 1u) == curParity) ? inY.read(gid).r : prevY.read(gid).r;
+        outY.write(float4(v, 0.0, 0.0, 1.0), gid);
+    }
+    if (gid.x < w / 2u && gid.y < h / 2u) {
+        float4 c = ((gid.y & 1u) == curParity) ? inUV.read(gid) : prevUV.read(gid);
+        outUV.write(c, gid);
     }
 }
 

@@ -185,3 +185,9 @@ public enum StageGraphBuilder {
             .min { a, b in a.expectedLatencyMS.p95 < b.expectedLatencyMS.p95 }
     }
 }
+
+/// graph（RVVideoPipeline）へ渡す値。metalGuided 実装のときだけ強さを返す（learned は ML 段）。
+extension DenoiseParameters: LumaChromaDenoiseRequest {
+    public var metalDenoiseStrength: Double? { implementation == .metalGuided ? strength : nil }
+}
+

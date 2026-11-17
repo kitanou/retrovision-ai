@@ -219,3 +219,104 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定（UI 境界）**: App は `CAMetalLayer` を `DefaultPlayerEngine.attachMetalSurface(layer:onAspectResolved:)` へ渡すだけで、RVVideoPipeline を import しない（INV-8。`ImportBoundaryAppTests` 不変）。drawableSize は view が実ピクセル寸法に保ち、変更時に `redrawMetalSurface()` で最後の frame を描き直す。表示比率は plan の `aspect.targetDAR` から通知する（view の枠が DAR、graph の letterbox は同じ DAR なので二重補正にならない）。
 - **実測（2026-11-17、`dvd-video-ts-01` の menu を実アプリ窓で撮影し暫定経路と比較）**: 向き・色の並び・4:3 枠は暫定経路と一致。Metal 側は cleanAperture（704/720）を反映してカラーバーが約 2% 横に広がる（05 §6 の設計どおり。暫定経路は無視）。
 - **既知の差（次の増分）**: インターレース素材の静止した細部（焼き込み timecode）が、`.auto` → edgeDirected の縮退で崩れて見える（暫定経路は weave のままで鮮明）。detector と motionAdaptive（A1b）で解消する。present 間隔・GPU 時間の実測（G2）は未実施で、実素材（#15）も要る。
+
+### 2026-11-17 — #5 A1b: motion-adaptive デインターレース（前 frame 入力）
+
+- **決定**: `DeinterlaceMode.auto` / `.motionAdaptive` は、前 frame があれば `rv_deint_motionAdaptive_v1`、無ければ（先頭 frame・寸法変更直後）従来の edge-directed に倒す。`RenderFrameInput.previousPixelBuffer` を追加（同寸法・NV12 のときだけ取り込む）。`MetalFramePresenter` が直前に渡した frame の pixel buffer を保持して渡す。seek 直後は前 frame が無関係でも、その 1 frame は動き側（空間内挿）に倒れるだけで破綻しない。
+- **アルゴリズム**: 偶数行は保持。奇数行は「前 frame との同位置差」（補間行と上下の保持行の 3 点の最大。同 parity 同士）から `smoothstep(0.03, 0.10, motion)` で weave と空間内挿を混ぜる。静止部は垂直解像度を保ち、動き部は comb を出さない。chroma は源のまま（従来どおり）。
+- **実測（実アプリ窓、`dvd-video-ts-01` の menu）**: edge-directed 固定では焼き込み timecode の静止桁が崩れていたが、motion-adaptive では静止桁が鮮明になり、毎 frame 変わる桁だけが空間内挿になる（想定どおり）。
+- **未実装（A1b の残り）**: detector（FieldMatch / CadenceAnalyzer と判定根拠の記録）、inverseTelecine（24p 化）、`ScaleFilter.highQuality` の kernel、OQ-10（表示同期方式）。G2 判定（combing の客観検査・GPU 時間）は実素材（#15）が要るため未実施。
+
+### 2026-11-17 — #9 A4: 適応制御ループの配線（監査で未接続を確認 → 接続）
+
+- **監査（実コード確認）**: `AdaptivePolicyEngine.evaluate` はテストからしか呼ばれず、`EngineCore.applyControlActions` の呼び出し元も無く、`AdaptiveController`（actor）は生成されていなかった。実再生では信号が作られず、制御は一度も動いていなかった。
+- **決定**: `EngineCore` が位置イベント（提示のたび）を契機に、窓（`controller.config.windowMS` = 2 s）が満ちたときだけ評価する。専用タイマーは持たない。窓の `FrameStats` は session の累積 stats の差分（`windowedStats`。session 再生成で累積が戻っても負にせず 0 に丸め、新 session では窓を取り直す）。thermal は `ProcessInfo.thermalState` を写像。窓が満ちるまで session に触れない（提示のたびの呼び出しを安く保つ）。evaluate の action は `applyControlActions` へ。
+- **未接続の信号（既定値のまま）**: memory pressure（normal）、modelBreakerOpen（false。A2 の runtime と `ModelHealthTracker` が載るまで）、presentJitterMS（0。`MetalPresenter.onPresented` の集計が載るまで）、endToEnd の p95（0）。このため現状 AI 段が無い構成では tier は metalOnly のままで、action は実質発火しない。ベンチマークレポート・品質インジケータ UI・負荷注入テストも未実装。
+
+### 2026-11-17 — #5 A1c: highQuality スケール（bicubic。拡大時のみ）
+
+- **決定**: `ScaleFilter.highQuality`（plan の既定）は、**拡大時**（出力側の画素数 > 取り込み域 × 1.01）だけ `rv_colorConvert_bicubic_v1`（輝度 4x4 tap の Catmull-Rom、overshoot は clamp(0,1)）を使い、縮小・等倍は従来の linear。chroma は 4:2:0 で元々低解像なので linear のまま。bicubic は縮小時に折り返しを強めるため使わない。
+- **検査**: 16→64 の階段エッジで遷移幅が bilinear より狭いこと、16→8 の縮小では filter に関わらず同一出力、平坦部が保たれること（`MetalPipelineTests`）。
+- **未実施**: 実素材での画質評価（リンギングの主観評価・Lanczos 等との比較は 07 の評価に置く）、GPU 時間の実測（G2）。
+
+### 2026-11-17 — #8 A3: 非 AI（metalGuided）ノイズ除去を graph に実装
+
+- **決定**: `MetalRenderGraph` が plan の `.denoise` 段を実行する（deinterlace の後・colorConvert の前）。強さは `LumaChromaDenoiseRequest.metalDenoiseStrength`（RVVideoPipeline 側の最小契約。`DenoiseParameters` が metalGuided のときだけ適合値を返す — RVVideoPipeline は RVEnhancement に依存できないため）。learned 実装（ML 段）は nil で、この段は実行しない。強さ 0 は段を実行せず恒等。
+- **アルゴリズム**: 輝度は 5x5 の bilateral（空間重み × 値差重み。値差の sigma は `mix(0.01, 0.12, strength)`、輝度 [0,1] 正規化）、色は 3x3 の bilateral。強い edge（字幕・線画・顔の輪郭）は値差が sigma の数倍で平均に入らず保たれ、小振幅の揺らぎ（ブロック・粒子・色ノイズ）だけが均される。temporal blend は前 *出力* が要るため v1 に入れない（ghost 回避）。
+- **検査**: ±8 の市松ノイズ領域の振れ幅が半分未満に均され、強い edge の暗側・明側が保たれること、strength 0 は恒等であること（`MetalPipelineTests`）。
+- **未実施**: 実素材での評価（顔・アニメ線画・粒子を塗り潰さないかの主観評価、before/after キャプチャ — 07 §7）、protect / targets の実際の反映（現状は strength のみ）、GPU 時間の実測、UI からの強度操作の配線。
+
+### 2026-11-17 — #5 A1d: CadenceAnalyzer（05 §5.1 の判定ロジック。GPU 非依存）
+
+- **決定**: frame ごとの comb スコア（1 frame 内の 2 field の不一致量。`rv_fieldMatch_sad_v1` の block SAD から host 側が作る）を `CadenceAnalyzer.ingest(combScore:)` に流すと `CadenceDecision { cadence, confidence, telecinePhase, evidence }` が返る。3:2 telecine の周期 `[clean, clean, combed, combed, clean]` に直近 10 frame が完全一致したら `.telecine32`（位相付き、confidence 1.0）。ロック中は予測と 2 frame 連続で食い違ったら抜ける（hysteresis 2 frame。1 frame の食い違いは静止場面の取りこぼしとして許容）。窓が満ちる前（9 frame まで）は telecine を宣言しない（誤検出による 24p 化の回避）。telecine でない場合は縞なし → `.progressive`、8 割以上 → `.interlaced22`、その他 → `.mixed`。根拠は窓のビット列の FNV-1a 64 を `evidence` に残す（09 §5）。
+- **検査**: 5 つの位相すべてで 10 frame 目にロックし位相が合う、全縞あり / 全縞なしの分類、9 frame ではロックしない、1 回の食い違いでは抜けず 2 連続で抜ける、telecine → 全縞ありで interlaced22 に落ち着く、根拠の再現性（`CadenceAnalyzerTests`）。
+- **未実装（A1 の残り）**: comb スコアを GPU の SAD kernel から取り出して analyzer へ流す配線、`.auto` の mode 選択（telecine → inverseTelecine）、inverseTelecine の復元と 2:3 提示、`CadenceDecision` の plan / 診断への記録。OQ-22（60i の film-origin pull-down）の実素材検証（#15）も要る。
+
+### 2026-11-17 — #6 A2: Core ML 実行層（load / predict / tiny model ハーネス）
+
+- **許可**: `coremltools` の取得はユーザーの許可を得て、プロジェクトの `.venv-tools`（`.gitignore` 済み）の仮想環境にだけ入れた（coremltools 9.0 + numpy）。重み・外部モデルは取得していない。
+- **決定（実装）**: `CoreMLModelRuntime`（actor）が `ModelRuntimeProtocol` を実装する。`<modelsDirectory>/<name>/model.json`（`ModelManifest`）+ コンパイル済み `.mlmodelc` を discover / load し、方針 A（06 §4）で `CVPixelBuffer` を image 特徴として渡して出力も pixel buffer で受ける。`predict` は `InferenceFrame`（Sendable の箱）で入出力する。失敗はすべて `PlaybackError.model(...)` の値で返す: 未 load → `notCompiled`、寸法違い → `shapeMismatch`（モデルの不調ではないので breaker に数えない）、期限超過 → `deadlineExceeded`（結果を捨てる。breaker に数えない）、推論例外 → `runtimeFailure`（breaker に加算）、breaker open → `disabledByBreaker`。`measuredOn` / `expectedLatencyMS` の無いモデルは既定で load を拒否する（G3 の運用ルール。契約検査用の tiny model だけ `requireMeasurement: false`）。`ModelHealthTracker`（前の増分）が p50/p95・失敗率・breaker を保持する。
+- **tiny model**: `Scripts/make-tiny-model.py` が 32x32 BGR を 255-x に反転するモデルを生成する（約 20 KB の `.mlmodelc` と `model.json` を `Tests/RVMLRuntimeTests/Models/tiny-invert-v1` に置く）。coremltools 9.0 では MIL program 直書きの出力 `ImageType` 指定が反映されず multiArray になるため、spec を編集して出力を BGR の画像にしている。
+- **検査（実際の Core ML 推論）**: discover、load → predict（画素値 245/155/55 を確認）→ unload、未計測モデルの拒否、shape 不一致が breaker に数えられない、期限超過が breaker に数えられない、連続失敗で breaker が open して以降は投入されない（`CoreMLModelRuntimeTests`）。
+- **未実装（A2 の残り）**: Metal ↔ テンソルの橋渡し（`tensor_to_texture` kernel・方針 B）と変換コストの分離計測、tile 分割 + overlap blend、memory pressure 連動の unload、`EngineCore` への接続（breaker の open を `ControlSignals.modelBreakerOpen` へ）、実モデルでの compute units 実測（G3）。実モデル（Real-ESRGAN 等）の変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。
+
+### 2026-11-17 — #6 A2: タイル分割推論（06 §5。16 px オーバーラップ + feather 合成）
+
+- **決定**: `TilePlan`（純粋な計画）が、モデルの入力寸法のタイルで frame を覆う。軸ごとに stride = tile − overlap（既定 overlap 16 px）で並べ、最後のタイルは frame の端に揃える。frame がタイルより小さい・重なりがタイル以上・倍率が不正なら nil（呼び出し側はより小さいモデル variant を選ぶか推論しない — 08 §5）。合成は重なりを線形に混ぜる feather で、**重みは出力画素ごとに正規化**するので合計は常に 1（恒等モデルなら入力が厳密に復元される）。超解像の倍率（scale）は出力タイルの配置と重みの幅に反映する。
+- **`TiledInference.run`**: BGRA の `CVPixelBuffer` を CPU でタイルに切り出し、`ModelRuntimeProtocol.predict` を**直列に**投入し（in-flight ≤ 2 の枠内 — 06 §7）、出力を合成して 1 枚の pixel buffer にする。どのタイルが失敗しても全体を失敗として返す（部分的に強調された frame は出さない。呼び出し側はその frame を非強調のまま提示 — INV-1）。入力寸法が計画と違えば、どのタイルも走らせずに `shapeMismatch`。
+- **検査**: 計画の被覆・端揃え・重なり、無効な計画の拒否、**正規化による恒等復元**（scale 1 と 2）、継ぎ目が階段にならない（単調・最大の段差が小）。**実際の Core ML 推論**（tiny model、80x64 を 32x32 のタイル・overlap 8 で）で、継ぎ目を含む全画素が全体の反転（255−x）と一致（±3）。タイルの失敗が全体の失敗になること。
+- **未実装（A2 の残り）**: Metal の texture ↔ Core ML の入出力（`tensor_to_texture`・方針 B。いまは CPU の BGRA 経由の参照実装）、タイル合成の Metal kernel 化（`blend`）、描画手順に RGB の中間 texture を挟む graph の作り替え、`EngineCore` への接続（breaker の open を `ControlSignals.modelBreakerOpen` へ）、メモリ逼迫での unload、実モデルでの計算ユニットの実測（G3）。実モデルの変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。
+
+### 2026-11-17 — #9 A4: 適応制御の信号接続（breaker / memory pressure / thermal / 降格理由）
+
+- **決定（接続）**: `EngineCore.setModelRuntime(_:models:)` でモデル実行層（`ModelRuntimeProtocol`）と追跡するモデルを接続する。窓（2 s）ごとの評価（`evaluateWindow`。session に依存せず単体で検査できる）が、次の信号を `ControlSignals` に載せる: ① **breaker**: 追跡中のモデルのどれかの `health.breakerState == .open`（half-open は試行中なので open 扱いにしない）→ `modelBreakerOpen`（controller が tier の上限を metalOnly にする）。② **memory pressure**: `DispatchSourceMemoryPressure`（warning / critical / normal。実行層を接続している間だけ監視）→ `memoryPressureLevel`。③ **thermal**: `ProcessInfo`（前の増分）。④ 窓の `FrameStats` の差分（前の増分）。
+- **決定（action の適用）**: `applyControlActions` は async になり、`.unloadModel`（memory pressure）で追跡中のモデルを実際に `unload` する。降格の理由を UI へ流す（`enhancementDegraded`: breaker → `modelFailure`、memory pressure → `memory`、thermal → `thermal`、それ以外 → `loadHigh`）。**降格のときだけ**通知し、昇格（`.setTier` が上がる方向）は通知しない。
+- **検査**: 信号の写像、breaker の open で tier が metalOnly に下がる（half-open では下がらない）、memory pressure で unload と tier 降下、実行層が無ければ breaker は常に closed で unload もしない、thermal serious の上限と理由の通知、昇格を降格として通知しない。**本物の Core ML 実行層**（tiny model を NV12 の入力で 3 回失敗させて実際に breaker を open）で、エンジンの tier が下がるところまでの通し検査。
+- **未接続（意図的）**: ① present jitter: `.immediate` の提示では「予約時刻との差」が提示までの待ち時間になり、基準値（8 ms）を超えて誤作動するため接続しない（指標の再定義が先）。② endToEnd の p95: PTS から実提示までの対応付けは `MetalPresenter.onPresented` の集計が要る。③ 実際の AI 段（超解像・学習ベースのノイズ除去）が plan に入る構成での挙動（現状は AI 段が無いので tier が上がっても段は増えない）。④ 品質インジケータ UI、負荷注入テスト、ベンチマークレポート。
+
+### 2026-11-17 — #6 A2: Metal ↔ Core ML の橋渡しと AI 段（方針 A）
+
+- **決定（橋渡し、方針 A — 06 §4）**: BGRA8 の IOSurface 付き・Metal 互換の `CVPixelBuffer` と、その同じ領域を指す `MTLTexture`（`RGBFrameBuffer`。`CVMetalTextureCache` から renderTarget + shaderRead + shaderWrite で取り込む）を橋にする。Metal が描画先として書いた buffer を、そのまま Core ML に image 入力として渡し（コピー無しで GPU と Core ML が同じ領域を見る）、Core ML の出力 buffer を texture として取り込み直す。`MetalRenderGraph` に `makeRGBBuffer` / `importRGB` / `renderToRGB`（deinterlace + 色変換を取り込み域の寸法いっぱいに描く。拡縮・letterbox 無し）/ `presentRGB`（目標比率で letterbox して target へ。`rv_rgbPresent_v1`）を追加した。
+- **決定（AI 段）**: `MLEnhancementStage`（RVEnhancement。RVVideoPipeline と RVMLRuntime の両方に依存できる層）が、① 入力を RGB buffer へ描く（GPU の完了を待つ）→ ② `TiledInference` でタイル分割推論 → ③ 出力を texture として返す。失敗（未 load・breaker open・shape 不一致・期限超過・描画失敗）はすべて型付きの `PlaybackError`。呼び出し側はその frame を非強調のまま提示する（INV-1）。この段は再生時刻を持たない。
+- **検査（実際の Metal + Core ML）**: 反転モデル（tiny）で、Metal の描画 → Core ML（32x32 のタイル・overlap 8 で 64x64 を分割）→ Metal の提示を通した出力が、通常の描画の 255 − x に全画素で一致（継ぎ目を含む。±4）。未 load のモデルは `notCompiled`、タイルより小さい frame は `shapeMismatch`。
+- **未実装（A2 / A3 の残り）**: ① `MetalFramePresenter` / `PlaybackSession` への AI 段の組み込み（tier が lightML 以上のとき enhance → presentRGB に切り替える。いまは plan に AI 段が入っても描画に使われない）。② タイル切り出し・合成の GPU 化（いまは CPU の参照実装。実時間の予算は未計測）。③ 実モデル（Real-ESRGAN 等）の変換・同梱・compute units の実測（OQ-07 / OQ-11 とライセンス確認が先）。④ 超解像の倍率（scale 2）で出力寸法が変わるときの presentRGB の検査（コードは対応、検査は scale 1 のみ）。
+
+### 2026-11-17 — #6 / #7: AI 段の再生経路への組み込み
+
+- **決定（有効化）**: `DefaultPlayerEngine.attachEnhancement(runtime:model:)` がモデルを load し（失敗なら false で AI 段は有効にならない）、presenter に AI 段を設定し、エンジンにモデル実行層を接続する（plan が manifest を参照でき、breaker / memory pressure が適応制御の信号になる）。`detachEnhancement()` で unload して切り離す。タイルはモデルの入力寸法、overlap は 16 px（入力寸法の半分未満に収める）、倍率は manifest の `scaleFactor`。plan に `superResolution` 段が入るのは、実行層が接続され、`measuredOn` のあるモデルが `selectModel` に選ばれ、tier が lightML 以上のとき（INV-2）。
+- **決定（提示）**: `MetalFramePresenter` は、tier が lightML 以上で plan の `superResolution` 段が設定済みのモデルを指すときだけ AI 段を通す。再生を止めない（INV-1）ための方針: ① **推論は同時に 1 つだけ**。実行中は待たず、その frame を非強調のまま提示する（`skippedBusy`）。② **失敗**（breaker open・未 load・shape 不一致・描画失敗）も、frame を**落とさず非強調で提示**する（`fellBack`）。③ **期限**は frame の表示長（`enhancementBudgetMS` で変更可）。超えた結果は捨てて非強調で提示する。④ 強調して提示できた数は `enhanced`。`MetalPresenter` に `presentEnhanced`（AI 段の RGB buffer を letterbox して drawable へ）を追加し、drawable の確保・presented 記録・再描画（窓リサイズ時）は通常経路と共通。
+- **決定（frame 境界での plan 切り替え — INV-3）**: これまで pending plan は `play()` でしか昇格しなかったため、再生中の設定変更・適応制御による tier の上げ下げが描画に反映されなかった（A4 で接続した信号の結果も効かなかった）。**次に提示された frame の位置イベントで pending plan を昇格する**ようにした（その場では差し替えない。既存の「設定変更で active plan が即座に変わらない」検査は維持）。
+- **検査（実際の Metal + Core ML、headless の `CAMetalLayer`）**: AI 段を通して提示される（`enhanced == 1`）、tier が足りない / SR 段が無いと強調しない、モデル未 load は frame を落とさず非強調で提示（`delivered`、`fellBack == 1`、エラーが残る）、期限切れの結果は捨てて非強調で提示、推論が 250 ms かかる間に来た 2 枚目は待たずに提示（`skippedBusy == 1`）、plan は実行層の接続中だけ SR 段を持つ、load できないモデルでは `attachEnhancement` が false。
+- **未実装 / 未検証**: ① 実時間での実測: タイルの切り出し・合成が CPU の参照実装で、29.97 fps の予算に入るかは未計測（遅ければ「同時に 1 つ」により強調される frame が間引かれ、強調と非強調が交互になって見える。滑らかさの評価と、遅いモデルは tier を下げる判断は G3）。② **実画面での確認はしていない**（headless の layer で提示まで通ることのみ）。③ アプリ（App）からの有効化の入口（`attachEnhancement` を呼ぶ UI / 設定）は未配線。④ 実モデル（Real-ESRGAN 等）の変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。⑤ 学習ベースのノイズ除去（`denoise` の learned 実装）は同じ枠組みで追加できるが未実装。
+
+### 2026-11-17 — #5 A1b 修正: 実盤 ISO での点線状アーティファクト（動き検出の拡張と chroma の動き適応）
+
+- **発見（実盤 `PICHI_PICHI_PITCH1.ISO`、menu 11 秒）**: ユーザー提供の実 DVD の ISO を実アプリ窓（Metal 既定）で再生すると、動きの速い金属リングの輪郭に点線状の縞が出た（合成素材では出ていなかった）。
+- **原因と対処**: ① 動き指標が 1 画素ごとに weave / 空間内挿を切り替えていた → 左右 1 画素と上下の保持行まで広げた 3x3 の最大にして判定を空間的に連続させ、しきい値を `smoothstep(0.02, 0.07)` に下げた。② 4:2:0 の chroma はインターレースでは行が field 交互なのに、weave のまま素通しにしていたため、動く輪郭で色が交互にずれた（chroma upsampling error）→ 動く画素の chroma は、輝度で保持した field（偶数行）の chroma から補間する（静止画素は従来どおり weave）。
+- **確認**: 修正前後の実アプリ窓で同じ区間の輪郭を比較し、点線が消えたことを目視確認。`MetalPipelineTests` に chroma が動く画素でのみ補間されること（静止は weave のまま）を追加。
+- **G2 判定ではない**: 実素材 1 本・菜単 menu の 11 秒での目視確認で、combing の客観検査・present 間隔・GPU 時間は未実施。#15 の 7 本は未充足。
+
+### 2026-11-17 — QA 入口 RV_AUTO_TITLE（起動時に本体タイトルを選んで再生）と実盤 ISO の本体確認
+
+- **決定**: `RV_AUTO_OPEN` と同じ opt-in env 約定で、`RV_AUTO_TITLE=<n>` があれば open 後にその `titleNumber` の本体タイトルへ `select` + `play` する（menu の first-play 政策とは独立。画面を操作せずに実盤の本体を検証するため）。
+- **実測（`PICHI_PICHI_PITCH1.ISO`）**: VIDEO_TS は VMGM menu（約 13 MB、11 s）+ VTS_01（menu 235 KB + 本体 VOB 4 本 ≈ 3.6 GB、約 50 分 11 秒）。`RV_AUTO_TITLE=1` で本体が Metal 既定で再生され、実時間比 ≈ 1.0（位置が 1 s ごとに進む）。複数 VOB は連結して 1 タイトルとして扱われた（#25 の修復写しが働いた）。
+- **未決（静止ロゴの輪郭の点々）**: 本体冒頭（PONY CANYON のロゴ）の文字輪郭に細かい点々が見える。静止に近い場面なので motion-adaptive の weave 側で、動き由来ではない。MPEG-2 の mosquito noise（輪郭周りの圧縮ノイズ）の可能性が高いが、**同じ瞬間を暫定経路と比較できていない**（再生位置と実時間が実行ごとにずれて同じ場面を撮れない）。確定には、seek 位置を指定できる QA 入口（例: `RV_AUTO_SEEK`）で同じ位置を撮る、または Metal の最終出力を CPU に読み戻して差分を取る必要がある。A3 の非 AI ノイズ除去（metalGuided）は mosquito noise を狙う処理だが、UI から強度を操作する配線がまだ無く、実盤での効果は未確認。
+
+### 2026-11-17 — #5 A1e: 縞（comb）指標の実測と、field matching に進まない判断
+
+- **測定道具**: `CombMeasurementTests`（`RVDecodeTests`）。環境変数 `RV_MEASURE_PATH`（任意で `RV_MEASURE_SKIP` / `RV_MEASURE_FRAMES`）を指定したときだけ、復号した frame ごとに「歯」指標（`(y−上)` と `(y−下)` が同符号で輝度 12 階調超となる画素の割合）、隣接行 SAD、PCE のフラグ（`progressive_frame` / `repeat_first_field` / `top_field_first`）を表示する。未設定なら何もしない（CI では走らない）。
+- **指標の妥当性**: 歯指標は合成の縞あり frame（≈0.045）と縞なし（≈0.008）を 5 倍以上に分ける。既存の `rv_fieldMatch_sad_v1`（隣接行 SAD）は縦方向の細部でも反応するため、実素材では縞の指標として弱い見込み（歯指標の方が頑健）。
+- **`telecine-32-01.mpg`（生成素材）は標準の 3:2 ではない**: 縞ありは 5 frame に 2 回だが**隣り合わず**（周期 [縞,無,無,縞,無]、冒頭は 3 frame 周期）。生成コマンドの `telecine=pattern=3` を 30000/1001 へ落とした結果とみられる。標準の 3:2（A A / B B B / C C / D D D）は縞ありが連続 2 frame（周期 [無,無,縞,縞,無]）になるはずで、`CadenceAnalyzer` の想定と合わない。この素材では analyzer はロックしない（安全側）。標準 3:2 の素材は `telecine=pattern=23` で作り直す必要がある（未実施）。
+- **実盤（`PICHI_PICHI_PITCH1.ISO` 本編 VTS_01_1.VOB、約 50 s と 166 s の各 25 frame）に 3:2 は無い**: 歯指標は一定（≈0.0065 / ≈0.0155）で 5 frame 周期の山が無く、PCE は全 frame `prog=0 rff=0 tff=1`（**top field 先**。生成素材の bottom-first とは逆）。この素材では telecine 検出経路は一度も働かず、field matching は実盤で検証できない。
+- **決定**: 周期が明確に見える実素材が無い間は、field matching（weave 復元）・inverseTelecine・presenter 配線に**進まない**。誤った weave は現状（motion-adaptive）より悪く見えるため。`CadenceAnalyzer` は純粋ロジックのまま残し、画面には接続しない。
+- **次に必要になる設計（未実施）**: ① comb スコアの絶対しきい値は使えない（縞なしの基準が内容で 0.0065〜0.0155 と動く）→ 近傍窓の中央値に対する相対しきい値にする。② GPU の歯指標 kernel（simd 縮約）。③ field 順序は top-first / bottom-first の両方で検査する（実盤は top-first、生成素材は bottom-first）。④ 24p 化（重複 frame を捨て 2:3 で再タイミング）は session の時刻と OQ-10 に触れるため別 PR。field matching だけでは「24p 化」とは言わない。⑤ 標準 3:2 の実素材（#15 の `telecine-32-01`）。
+
+### 2026-11-17 — #5 A1f: 標準 3:2 素材の作り直しと、telecine の検出・weave 復元の実接続
+
+- **素材の作り直し**: `telecine-32-01.mpg` を `telecine=first_field=top:pattern=23`（入力 24000/1001 → 30000/1001、`-r` の再サンプル無し）で生成し直した（`Scripts/gen-fixtures.sh`。この 1 本だけ。manifest の sha を更新）。測定で縞ありが周期内位置 2・3（隣り合う 2 frame）の標準の 3:2 になったことを確認（直前の記録の `pattern=3` 素材は非標準だった）。
+- **`CadenceAnalyzer` の相対しきい値**: `relativeFactor`（既定は絶対値のみ）を追加。縞ありの判定を「直近窓の**下側中央値**の 2.5 倍超（下限は絶対値）」にして、縞なしの基準が内容で動く実素材（0.0065〜0.0155）でも使えるようにした。実素材 PICHI 相当の周期なし入力では telecine を宣言せず、非標準の周期（[縞,無,無,縞,無]）でもロックしない。
+- **weave 復元（`rv_ivtc_weave_v1`）**: 縞あり frame（位置 2・3）は、現 frame の先行 field と前 frame の後続 field を行ごとに織る（top-first: 偶数行=現・奇数行=前、bottom-first: 逆。chroma も同じ規則）。**画素単位の検査**: 4 つの映画コマ A〜D から 5 つの video frame を top-first / bottom-first 両方で作り、全 5 位置で復元結果が元のコマとビット一致（既定の deinterlace では一致しない = 検査が縞を区別できる）。前 frame が無いときは weave せず従来の空間内挿に倒す。
+- **`TelecineMatcher`（判断。画面・GPU 非依存）と presenter 配線**: 縞スコア（CPU の歯指標 `CombMetric`、輝度面の列を間引いて計算）と PTS から、**確信してロックしている間だけ**指示を出す（縞あり位置 → weaveWithPrevious、それ以外 → keepWoven＝weave のまま。ロック前・非 telecine は従来どおり）。PTS が連続でない（seek・落とし frame・menu のループ）と判定と前 frame を捨てる（従来は seek をまたいで前 frame が残っていた点も直る）。`MetalFramePresenter` が interlaced frame ごとに呼ぶ。
+- **実素材での検査（標準 3:2 素材を復号）**: ① 10〜12 frame 目までにロックし、ロック後に外れず、周期内位置が測定と全 frame で一致。② weave の指示は測定で縞ありだった位置にだけ出て、取りこぼしが無い。③ **レンダラーを通した出力の縞を実測**: 復元後は縞なしの基準の 1.5 倍以内（入力の縞ありは基準の 3 倍以上）。
+- **範囲外（明記）**: これは**縞の除去**であって「24p 化」ではない。出力は元の 29.97 のままで、重複 frame（B）は捨てず、2:3 の再タイミングもしていない（session の時刻と OQ-10 に触れるため別 PR）。実盤 PICHI は 3:2 ではないので、**実盤では検証できていない**（#15 の実素材 `telecine-32-01` が必要）。`inverseTelecineTarget: 24p` の期待値は満たしていない。縞スコアは CPU 計算で、release ビルドでの実時間への影響は未計測。
+

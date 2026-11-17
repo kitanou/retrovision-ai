@@ -134,7 +134,7 @@ final class MetalPipelineTests: XCTestCase {
         guard gpuGate() else { return }
         let lib = Self.context.library
         for name in ["rv_vs_fullscreen", "rv_colorConvert_v1", "rv_deint_bob_v1",
-                     "rv_deint_edgeDirected_v1", "rv_fieldMatch_sad_v1"] {
+                     "rv_deint_edgeDirected_v1", "rv_deint_motionAdaptive_v1", "rv_ivtc_weave_v1", "rv_fieldMatch_sad_v1"] {
             XCTAssertNotNil(lib.makeFunction(name: name), "shader function 無し: \(name)")
         }
         // 実 PSO 生成（colorConvert は bgra8 の render pipeline、deint/detector は compute）
@@ -302,6 +302,281 @@ final class MetalPipelineTests: XCTestCase {
             XCTAssertGreaterThan(Int(px[r][2 * r - 1].r), 150, "保持行 行\(r) の白側が汚染")
             XCTAssertLessThan(Int(px[r][2 * r + 1].r), 90, "保持行 行\(r) の黒側が汚染")
         }
+    }
+
+    // MARK: - 5b. motion-adaptive（静止は weave、動きは空間内挿。前 frame が無ければ edge-directed）
+
+    /// 偶数行 = A、奇数行 = B（B ≠ A）の縞を作る。前 frame を同じにすれば「静止」、
+    /// 大きく変えれば「動き」。出力の奇数行がどちらになるかで weave / 空間内挿を判定する。
+    private func renderMotionAdaptive(previousLuma: UInt8?) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        let w = 32, h = 16
+        let rowsA: UInt8 = 60, rowsB: UInt8 = 200
+        func stripes(_ even: UInt8, _ odd: UInt8) throws -> CVPixelBuffer {
+            try makeNV12(width: w, height: h,
+                         luma: { row in [UInt8](repeating: row % 2 == 0 ? even : odd, count: w) },
+                         chroma: { _ in [UInt8](repeating: 128, count: w) })
+        }
+        let cur = try stripes(rowsA, rowsB)
+        var input = progressiveInput(cur, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22,
+                                        fieldSource: .formatDescription)
+        if let previousLuma {
+            // 静止: 同じ縞。動き: 全行を別の値にする。
+            input.previousPixelBuffer = previousLuma == 0 ? cur
+                : try makeNV12(width: w, height: h,
+                               luma: { _ in [UInt8](repeating: previousLuma, count: w) },
+                               chroma: { _ in [UInt8](repeating: 128, count: w) })
+        }
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(5), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .motionAdaptive)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        XCTAssertEqual(timing.deinterlaceApplied, previousLuma == nil ? .edgeDirected : .motionAdaptive)
+        return readBack(target)
+    }
+
+    func testMotionAdaptiveKeepsStaticDetailAndInterpolatesMotion() throws {
+        guard gpuGate() else { return }
+        // 保持行（偶数）は A=60 → 暗い。奇数行の源は B=200 → 明るい。
+        let still = try renderMotionAdaptive(previousLuma: 0)        // 前 frame = 同じ縞（静止）
+        let moving = try renderMotionAdaptive(previousLuma: 128)     // 前 frame と大きく違う（動き）
+        let noPrev = try renderMotionAdaptive(previousLuma: nil)     // 前 frame 無し → edge-directed
+        let y = 5   // 奇数行（補間側）
+        XCTAssertGreaterThan(Int(still[y][10].r), 150, "静止部は weave（源の他 field の線）を保つはず")
+        XCTAssertLessThan(Int(moving[y][10].r), 110, "動き部は空間内挿（保持行の明るさ）になるはず")
+        XCTAssertLessThan(Int(noPrev[y][10].r), 110, "前 frame 無しは edge-directed（空間内挿）になるはず")
+        // 保持行は常に源のまま。
+        XCTAssertLessThan(Int(still[4][10].r), 110)
+        XCTAssertLessThan(Int(moving[4][10].r), 110)
+    }
+
+    /// 色（4:2:0）も field 交互: 偶数 chroma 行 = Cb 100、奇数 chroma 行 = Cb 156。輝度は平坦。
+    /// 静止なら weave（奇数行は 156 のまま）、動きなら偶数行の chroma から補間（奇数行も 100 側に寄る）。
+    private func renderChromaStripes(previousLuma: UInt8) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        let w = 32, h = 32
+        func make(luma: UInt8) throws -> CVPixelBuffer {
+            try makeNV12(width: w, height: h,
+                         luma: { _ in [UInt8](repeating: luma, count: w) },
+                         chroma: { row in
+                // chroma 行は 1 行 = (Cb, Cr) × (w/2) 画素。偶数行 Cb=100 / 奇数行 Cb=156、Cr=128。
+                (0..<(w / 2)).flatMap { _ in [UInt8(row % 2 == 0 ? 100 : 156), UInt8(128)] }
+            })
+        }
+        let cur = try make(luma: 128)
+        var input = progressiveInput(cur, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22,
+                                        fieldSource: .formatDescription)
+        input.previousPixelBuffer = previousLuma == 128 ? cur : try make(luma: previousLuma)
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(9), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .motionAdaptive)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        _ = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        return readBack(target)
+    }
+
+    func testMotionAdaptiveInterpolatesChromaOnlyWhereThePixelMoves() throws {
+        guard gpuGate() else { return }
+        let still = try renderChromaStripes(previousLuma: 128)    // 前 frame と同じ → 静止
+        let moving = try renderChromaStripes(previousLuma: 40)    // 前 frame と大きく違う → 動き
+        // 輝度 row 6 は chroma 行 3（奇数）、row 4 は chroma 行 2（偶数）。青成分に Cb の差が出る。
+        let stillGap = abs(Int(still[6][10].b) - Int(still[4][10].b))
+        let movingGap = abs(Int(moving[6][10].b) - Int(moving[4][10].b))
+        XCTAssertGreaterThan(stillGap, 20, "静止は chroma を weave（偶数行と奇数行の色が違うまま）")
+        XCTAssertLessThan(movingGap, 6, "動きは偶数行の chroma から補間（奇数行も偶数行と同じ色になる）")
+    }
+
+    // MARK: - 5e. inverse telecine の weave 復元（画素単位で元の映画コマと一致）
+
+    /// 映画コマ k（0=A,1=B,2=C,3=D）の行 r の輝度 / chroma（コマごと・行ごとに違う値にして、織り間違いが画素に出る）。
+    private func filmLuma(_ k: Int, row: Int) -> UInt8 { UInt8(40 + k * 30 + row) }
+    private func filmChroma(_ k: Int, row: Int) -> (cb: UInt8, cr: UInt8) {
+        (UInt8(100 + k * 12 + row), UInt8(150 - k * 12 - row))
+    }
+
+    /// 偶数行（top field）を映画コマ `top` から、奇数行（bottom field）を `bottom` から取った interlaced frame。
+    private func videoFrame(top: Int, bottom: Int, w: Int, h: Int) throws -> CVPixelBuffer {
+        try makeNV12(width: w, height: h,
+                     luma: { row in [UInt8](repeating: self.filmLuma(row % 2 == 0 ? top : bottom, row: row), count: w) },
+                     chroma: { row in
+            let c = self.filmChroma(row % 2 == 0 ? top : bottom, row: row)
+            return (0..<(w / 2)).flatMap { _ in [c.cb, c.cr] }
+        })
+    }
+
+    private func render(_ pb: CVPixelBuffer, previous: CVPixelBuffer?, order: FieldOrder,
+                        fieldMatch: RenderFrameInput.FieldMatchRequest, w: Int, h: Int) throws
+        -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        var input = progressiveInput(pb, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: order, cadence: .telecine32,
+                                        fieldSource: .formatDescription)
+        input.previousPixelBuffer = previous
+        input.fieldMatch = fieldMatch
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(10), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .auto)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        switch fieldMatch {
+        case .weaveWithPrevious: XCTAssertEqual(timing.deinterlaceApplied, .inverseTelecine)
+        case .keepWoven: XCTAssertEqual(timing.deinterlaceApplied, .passthrough)
+        case .none: break
+        }
+        drainGPU()
+        return readBack(target)
+    }
+
+    private func assertEqualImages(_ a: [[(r: UInt8, g: UInt8, b: UInt8)]], _ b: [[(r: UInt8, g: UInt8, b: UInt8)]],
+                                   _ message: String, file: StaticString = #filePath, line: UInt = #line) {
+        var mismatches = 0
+        for y in 0..<a.count { for x in 0..<a[y].count where a[y][x] != b[y][x] { mismatches += 1 } }
+        XCTAssertEqual(mismatches, 0, message, file: file, line: line)
+    }
+
+    func testInverseTelecineWeaveReconstructsFilmFramesInBothFieldOrders() throws {
+        guard gpuGate() else { return }
+        let w = 32, h = 32
+        // 映画コマ A,B,C,D = 0,1,2,3。video frame（top, bottom）は field 順ごとに 3:2 の配置が違う。
+        //   top-first:    f0=(A,A) f1=(B,B) f2=(B,C) f3=(C,D) f4=(D,D)
+        //   bottom-first: f0=(A,A) f1=(B,B) f2=(C,B) f3=(D,C) f4=(D,D)   （(top, bottom) の書き方）
+        let layouts: [(order: FieldOrder, frames: [(top: Int, bottom: Int)])] = [
+            (.topFirst, [(0, 0), (1, 1), (1, 2), (2, 3), (3, 3)]),
+            (.bottomFirst, [(0, 0), (1, 1), (2, 1), (3, 2), (3, 3)]),
+        ]
+        // 各 phase で復元されるべき映画コマ: f0→A, f1→B, f2→B（重複）, f3→C, f4→D。
+        let expectedFilm = [0, 1, 1, 2, 3]
+        for layout in layouts {
+            let video = try layout.frames.map { try videoFrame(top: $0.top, bottom: $0.bottom, w: w, h: h) }
+            for phase in 0..<5 {
+                let expectedBuffer = try videoFrame(top: expectedFilm[phase], bottom: expectedFilm[phase], w: w, h: h)
+                let expected = try render(expectedBuffer, previous: nil, order: layout.order,
+                                          fieldMatch: .keepWoven, w: w, h: h)
+                let combed = (phase == 2 || phase == 3)
+                let actual = try render(video[phase], previous: phase > 0 ? video[phase - 1] : nil, order: layout.order,
+                                        fieldMatch: combed ? .weaveWithPrevious : .keepWoven, w: w, h: h)
+                assertEqualImages(actual, expected, "\(layout.order) phase \(phase): 復元結果が映画コマ \(expectedFilm[phase]) と一致しない")
+                if combed {
+                    // 指示なし（既定の deinterlace）では復元されない = テストが縞ありを区別できている。
+                    let plain = try render(video[phase], previous: video[phase - 1], order: layout.order,
+                                           fieldMatch: .none, w: w, h: h)
+                    var differs = false
+                    for y in 0..<h { for x in 0..<w where plain[y][x] != expected[y][x] { differs = true } }
+                    XCTAssertTrue(differs, "\(layout.order) phase \(phase): 既定の処理でも一致してしまう（検査が縞を区別していない）")
+                }
+            }
+        }
+    }
+
+    func testWeaveRequestWithoutPreviousFrameFallsBackToSpatialDeinterlace() throws {
+        guard gpuGate() else { return }
+        let w = 32, h = 32
+        let combed = try videoFrame(top: 1, bottom: 2, w: w, h: h)
+        var input = progressiveInput(combed, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .telecine32,
+                                        fieldSource: .formatDescription)
+        input.fieldMatch = .weaveWithPrevious      // 前 frame が無い（seek 直後など）
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(11), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .auto)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        XCTAssertEqual(timing.deinterlaceApplied, .edgeDirected, "前 frame が無いときは weave せず従来の空間内挿に倒す")
+    }
+
+    // MARK: - 5c. highQuality スケール（拡大時は bicubic。エッジが bilinear より鋭い）
+
+    private func renderStepEdge(filter: ScaleParameters.ScaleFilter, targetSize: Int) throws -> [UInt8] {
+        let w = 16, h = 16
+        let pb = try makeNV12(width: w, height: h,
+                              luma: { _ in (0..<w).map { $0 < w / 2 ? 40 : 200 } },
+                              chroma: { _ in [UInt8](repeating: 128, count: w) })
+        let input = progressiveInput(pb, width: w, height: h)
+        let target = try makeTarget(width: targetSize, height: targetSize)
+        let plan = RenderPlan(id: PlanID(6), tier: .metalOnly,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters()),
+                                       .init(stage: .scale, parameters: ScaleParameters(filter: filter))],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(targetSize), height: Int32(targetSize)),
+                                                     aspect: input.aspect, present: .offscreen))
+        _ = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        return readBack(target)[targetSize / 2].map(\.r)
+    }
+
+    func testHighQualityScaleSharpensEdgesWhenUpscalingOnly() throws {
+        guard gpuGate() else { return }
+        // 16 → 64 の拡大（4 倍）。遷移幅 = 暗側 10% 〜 明側 90% の間に居る画素数。
+        func transitionWidth(_ row: [UInt8]) -> Int {
+            let lo = Int(row.first ?? 0), hi = Int(row.last ?? 0)
+            let a = lo + (hi - lo) / 10, b = hi - (hi - lo) / 10
+            return row.filter { Int($0) > a && Int($0) < b }.count
+        }
+        let linear = try renderStepEdge(filter: .bilinear, targetSize: 64)
+        let cubic = try renderStepEdge(filter: .highQuality, targetSize: 64)
+        XCTAssertLessThan(transitionWidth(cubic), transitionWidth(linear),
+                          "拡大時の highQuality は bilinear よりエッジが鋭い（遷移幅が狭い）はず")
+        // 縮小（16 → 8）では highQuality でも linear と同じ経路（bicubic は使わない）。
+        let linearDown = try renderStepEdge(filter: .bilinear, targetSize: 8)
+        let cubicDown = try renderStepEdge(filter: .highQuality, targetSize: 8)
+        XCTAssertEqual(linearDown, cubicDown, "縮小は filter に関わらず同じ（linear）")
+        // 平坦部は変えない（overshoot を clamp で抑えても、元の暗/明の値が保たれる）。
+        XCTAssertEqual(Int(cubic.first ?? 0), Int(linear.first ?? 0), accuracy: 2)
+        XCTAssertEqual(Int(cubic.last ?? 0), Int(linear.last ?? 0), accuracy: 2)
+    }
+
+    // MARK: - 5d. 非 AI denoise（エッジ保存。小振幅の揺らぎは均し、強い edge は保つ）
+
+    private struct TestDenoise: LumaChromaDenoiseRequest {
+        var metalDenoiseStrength: Double?
+        var canonicalForm: String { "test-denoise=\(metalDenoiseStrength ?? -1)" }
+    }
+
+    private func renderNoisyEdge(strength: Double?) throws -> [[UInt8]] {
+        let w = 32, h = 32
+        // 左半分: 128 を中心に ±8 の市松ノイズ。右半分: 平坦な 220（x=16 に強い edge）。
+        let pb = try makeNV12(width: w, height: h,
+                              luma: { row in
+            (0..<w).map { x in x < 16 ? ((x + row) % 2 == 0 ? UInt8(120) : UInt8(136)) : UInt8(220) }
+        }, chroma: { _ in [UInt8](repeating: 128, count: w) })
+        let input = progressiveInput(pb, width: w, height: h)
+        var stages: [StageRequest] = [.init(stage: .colorConvert, parameters: ColorConvertParameters())]
+        if let strength { stages.insert(.init(stage: .denoise, parameters: TestDenoise(metalDenoiseStrength: strength)), at: 0) }
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(8), tier: .lightML, stages: stages,
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        let timing = try Self.graph.render(input, plan: plan, to: target)
+        XCTAssertEqual(timing.denoiseApplied, (strength ?? 0) > 0)
+        drainGPU()
+        return readBack(target).map { $0.map(\.r) }
+    }
+
+    func testMetalGuidedDenoiseSmoothsNoiseButKeepsStrongEdges() throws {
+        guard gpuGate() else { return }
+        func noiseRange(_ px: [[UInt8]]) -> Int {   // 平坦なノイズ領域（edge から離れた x 4...10）の振れ幅
+            let vals = (8...24).flatMap { y in (4...10).map { x in Int(px[y][x]) } }
+            return (vals.max() ?? 0) - (vals.min() ?? 0)
+        }
+        let off = try renderNoisyEdge(strength: nil)
+        let zero = try renderNoisyEdge(strength: 0)
+        let on = try renderNoisyEdge(strength: 0.8)
+        XCTAssertEqual(noiseRange(zero), noiseRange(off), "strength 0 は恒等（段を実行しない）")
+        XCTAssertLessThan(noiseRange(on), noiseRange(off) / 2, "ノイズ領域の振れ幅が半分未満に均される")
+        // 強い edge は保たれる: 暗側（x=12）は暗いまま、明側（x=20）は明るいまま。
+        let y = 16
+        XCTAssertLessThan(Int(on[y][12]), 150, "暗側が edge を越えて明るくならない")
+        XCTAssertGreaterThan(Int(on[y][20]), 190, "明側が edge を越えて暗くならない")
     }
 
     // MARK: - 6. field 間 SAD（05 §5.1 detector の土台。kernel 直接）

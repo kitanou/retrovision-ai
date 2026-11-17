@@ -1,8 +1,10 @@
 import CoreMedia
+import CoreVideo
 import Foundation
 import XCTest
 @testable import RVPlaybackEngine
 import RVMediaCore
+import RVMLRuntime
 import RVMediaSources
 
 // MARK: - 適応制御（08 §4、§5）
@@ -292,5 +294,202 @@ struct FailingSource: MediaSource {
         throw PlaybackError(kind: .source(.protectedNeedsLicense),
                             recovery: .needsUserAction(.contactVendorAboutLicense),
                             userMessage: "この盤は保護されており、再生ライセンスの確認が完了していません")
+    }
+}
+
+/// 適応制御の窓評価（08 §3）: 累積 stats の差分と thermal の写像。
+final class AdaptiveWindowTests: XCTestCase {
+    func testWindowedStatsIsTheDifferenceOfCumulativeStats() {
+        let previous = FrameStats(total: 100, presented: 90, dropped: 10, late: 4,
+                                  enhancementSkipped: 1, dropReasons: [.late: 4])
+        let current = FrameStats(total: 160, presented: 140, dropped: 20, late: 10,
+                                 enhancementSkipped: 3, dropReasons: [.late: 10])
+        let w = EngineCore.windowedStats(previous: previous, current: current)
+        XCTAssertEqual(w.presented, 50)
+        XCTAssertEqual(w.dropped, 10)
+        XCTAssertEqual(w.total, 60, "窓の total = 提示 + 落とした")
+        XCTAssertEqual(w.late, 6)
+        XCTAssertEqual(w.dropReasons[.late], 6)
+        XCTAssertEqual(w.deadlineMissRatio, 16.0 / 60.0, accuracy: 1e-9, "(dropped + late) / total")
+    }
+
+    func testWindowedStatsNeverGoesNegativeWhenCumulativeResets() {
+        let previous = FrameStats(total: 500, presented: 480, dropped: 20, late: 9)
+        let fresh = FrameStats(total: 3, presented: 3)
+        let w = EngineCore.windowedStats(previous: previous, current: fresh)
+        XCTAssertEqual(w.total, 0, "新 session で累積が戻っても窓は負にならない（0 に丸める）")
+        XCTAssertEqual(w.dropped, 0)
+        XCTAssertEqual(w.late, 0)
+    }
+
+    func testThermalStateMapping() {
+        XCTAssertEqual(EngineCore.thermalState(from: .nominal), .nominal)
+        XCTAssertEqual(EngineCore.thermalState(from: .fair), .fair)
+        XCTAssertEqual(EngineCore.thermalState(from: .serious), .serious)
+        XCTAssertEqual(EngineCore.thermalState(from: .critical), .critical)
+    }
+}
+
+
+// MARK: - A4: 適応制御の信号接続（breaker / memory pressure / thermal）
+
+private actor FakeModelRuntime: ModelRuntimeProtocol {
+    var breaker: ModelHealth.BreakerState = .closed
+    private(set) var unloaded: [ModelID] = []
+    func setBreaker(_ state: ModelHealth.BreakerState) { breaker = state }
+    func discover() async -> [ModelManifest] { [] }
+    func load(_ id: ModelID) async throws {}
+    func unload(_ id: ModelID) async { unloaded.append(id) }
+    func predict(_ request: InferenceRequest, input: InferenceFrame) async throws -> InferenceFrame { input }
+    func health(of id: ModelID) async -> ModelHealth { ModelHealth(breakerState: breaker) }
+}
+
+private final class EventBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [PlayerEvent] = []
+    func append(_ e: PlayerEvent) { lock.withLock { items.append(e) } }
+    var all: [PlayerEvent] { lock.withLock { items } }
+    var sawDegradation: Bool { all.contains { if case .enhancementDegraded = $0 { return true }; return false } }
+}
+
+final class AdaptiveSignalWiringTests: XCTestCase {
+    private let model = ModelID("test.model@1")
+    private func cleanWindow() -> FrameStats { FrameStats(total: 60, presented: 60) }
+    private func raisedState() -> AdaptivePolicyEngine.State {
+        var s = AdaptivePolicyEngine.State()
+        s.requestedTier = .lightML
+        s.activeTier = .lightML
+        return s
+    }
+
+    func testMakeSignalsCarriesEverySource() {
+        let signals = EngineCore.makeSignals(window: FrameStats(total: 10, presented: 8, dropped: 2), windowMS: 2_000,
+                                             thermal: .serious, memory: .warn, breakerOpen: true)
+        XCTAssertEqual(signals.thermal, .serious)
+        XCTAssertEqual(signals.memoryPressureLevel, .warn)
+        XCTAssertTrue(signals.modelBreakerOpen)
+        XCTAssertEqual(signals.summary.frames.deadlineMissRatio, 0.2, accuracy: 1e-9)
+    }
+
+    func testAnOpenModelBreakerForcesTheTierDownToMetalOnly() async {
+        let core = EngineCore()
+        let runtime = FakeModelRuntime()
+        await core.setModelRuntime(runtime, models: [model])
+        await core.seedAdaptiveState(raisedState())
+
+        // breaker が closed の間は、期限超過のない窓で tier は変わらない。
+        var actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 2_000, thermal: .nominal)
+        XCTAssertFalse(actions.contains(.setTier(.metalOnly)))
+        let before = await core.adaptiveState().activeTier
+        XCTAssertEqual(before, .lightML)
+
+        await runtime.setBreaker(.open)
+        actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 4_000, thermal: .nominal)
+        XCTAssertTrue(actions.contains(.setTier(.metalOnly)), "breaker open で tier を metalOnly に下げない")
+        let after = await core.adaptiveState().activeTier
+        XCTAssertEqual(after, .metalOnly)
+    }
+
+    func testHalfOpenBreakerDoesNotLowerTheTier() async {
+        let core = EngineCore()
+        let runtime = FakeModelRuntime()
+        await runtime.setBreaker(.halfOpen)      // 試行中。まだ「止める」状態ではない
+        await core.setModelRuntime(runtime, models: [model])
+        await core.seedAdaptiveState(raisedState())
+        let actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 2_000, thermal: .nominal)
+        XCTAssertFalse(actions.contains(.setTier(.metalOnly)))
+    }
+
+    func testMemoryPressureUnloadsTheTrackedModelsAndLowersTheTier() async {
+        let core = EngineCore()
+        let runtime = FakeModelRuntime()
+        await core.setModelRuntime(runtime, models: [model])
+        await core.seedAdaptiveState(raisedState())
+        await core.setMemoryPressure(.critical)
+        let actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 2_000, thermal: .nominal)
+        XCTAssertTrue(actions.contains(.unloadModel))
+        XCTAssertTrue(actions.contains(.setTier(.metalOnly)))
+        let unloaded = await runtime.unloaded
+        XCTAssertEqual(unloaded, [model], "memory pressure で追跡中のモデルを unload しない")
+    }
+
+    func testWithoutARuntimeNothingIsUnloadedAndTheBreakerIsNeverOpen() async {
+        let core = EngineCore()
+        await core.seedAdaptiveState(raisedState())
+        let actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 2_000, thermal: .nominal)
+        XCTAssertFalse(actions.contains(.setTier(.metalOnly)))
+        XCTAssertFalse(actions.contains(.unloadModel))
+    }
+
+    func testThermalSeriousCapsAtLightMLAndReportsTheReason() async {
+        let core = EngineCore()
+        var state = raisedState()
+        state.requestedTier = .fullML
+        state.activeTier = .fullML
+        await core.seedAdaptiveState(state)
+        let box = EventBox()
+        let stream = await core.events()
+        let collector = Task { for await e in stream { box.append(e); if case .enhancementDegraded = e { break } } }
+        let actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 2_000, thermal: .serious)
+        XCTAssertTrue(actions.contains(.setTier(.lightML)), "thermal serious の上限は lightML")
+        await collector.value
+        XCTAssertTrue(box.all.contains { if case .enhancementDegraded(let reason, let tier) = $0 { return reason == .thermal && tier == .lightML }; return false },
+                      "降格の理由（thermal）が UI へ伝わらない")
+    }
+
+    func testAnUpgradeIsNotReportedAsADegradation() async {
+        let core = EngineCore()
+        var state = AdaptivePolicyEngine.State()
+        state.requestedTier = .lightML
+        state.activeTier = .metalOnly
+        state.consecutiveCleanWindows = 5
+        state.lastDegradeAtMS = -.infinity
+        await core.seedAdaptiveState(state)
+        let box = EventBox()
+        let stream = await core.events()
+        let collector = Task { for await e in stream { box.append(e) } }
+        let actions = await core.evaluateWindow(window: cleanWindow(), elapsedMS: 2_000, nowMS: 60_000, thermal: .nominal)
+        XCTAssertTrue(actions.contains(.setTier(.lightML)), "clean window が続けば昇格する")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        collector.cancel()
+        XCTAssertFalse(box.sawDegradation, "昇格を降格として通知した")
+    }
+}
+
+/// 本物の Core ML 実行層（tiny model）で breaker を開き、エンジンの tier が下がることまでを通しで検査する。
+final class RealRuntimeBreakerIntegrationTests: XCTestCase {
+    func testRealCoreMLFailuresOpenTheBreakerAndTheEngineLowersItsTier() async throws {
+        let modelsDir = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("RVMLRuntimeTests/Models")
+        let runtime = CoreMLModelRuntime(modelsDirectory: modelsDir,
+                                         options: .init(requireMeasurement: false,
+                                                        breaker: .init(windowSize: 5, failureThreshold: 3, openDurationSeconds: 600)))
+        let id = ModelID("test.tiny.invert@1")
+        try await runtime.load(id)
+
+        let core = EngineCore()
+        await core.setModelRuntime(runtime, models: [id])
+        var state = AdaptivePolicyEngine.State()
+        state.requestedTier = .lightML
+        state.activeTier = .lightML
+        await core.seedAdaptiveState(state)
+
+        // 寸法は合うが形式違い（NV12）の入力を 3 回渡す → Core ML が拒み、実際に breaker が open する。
+        var bad: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 32, 32, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &bad)
+        let input = InferenceFrame(try XCTUnwrap(bad))
+        let request = InferenceRequest(model: id, width: 32, height: 32, frameID: FrameID(1),
+                                       deadline: HostTime.now().advancing(ms: 10_000))
+        for _ in 0..<3 { _ = try? await runtime.predict(request, input: input) }
+        let health = await runtime.health(of: id)
+        XCTAssertEqual(health.breakerState, .open)
+
+        let actions = await core.evaluateWindow(window: FrameStats(total: 60, presented: 60), elapsedMS: 2_000,
+                                                nowMS: 2_000, thermal: .nominal)
+        XCTAssertTrue(actions.contains(.setTier(.metalOnly)), "本物の breaker が open でもエンジンが tier を下げない")
+        let tier = await core.adaptiveState().activeTier
+        XCTAssertEqual(tier, .metalOnly)
     }
 }

@@ -24,9 +24,26 @@ public struct RenderFrameInput: @unchecked Sendable {
     public var aspect: AspectResolution
     /// 诊断用（frame id など。pipeline は意味を決めない）。
     public var frameID: FrameID?
+    /// 直前に提示した frame（motion-adaptive の動き検出用。無い・寸法違いなら edge-directed に倒す）。
+    public var previousPixelBuffer: CVPixelBuffer?
+    /// telecine の field matching の指示（`CadenceAnalyzer` が確信してロックしたときだけ呼び出し側が入れる）。
+    /// 既定の `.none` は従来どおり（plan の deinterlace mode に従う）。
+    public var fieldMatch: FieldMatchRequest = .none
+
+    public enum FieldMatchRequest: Sendable, Hashable {
+        case none
+        /// 縞あり frame: 現 frame の先行 field + 前 frame の後続 field を織って元の映画コマを復元する。
+        /// 前 frame が無い・寸法違いのときは従来の deinterlace に倒す。
+        case weaveWithPrevious
+        /// 縞なし frame（telecine の周期内で元から progressive）: deinterlace せず weave のまま使う。
+        case keepWoven
+    }
 
     public init(pixelBuffer: CVPixelBuffer, color: ColorInfo, interlace: InterlaceInfo,
-                aspect: AspectResolution, frameID: FrameID? = nil) {
+                aspect: AspectResolution, frameID: FrameID? = nil,
+                previousPixelBuffer: CVPixelBuffer? = nil, fieldMatch: FieldMatchRequest = .none) {
+        self.previousPixelBuffer = previousPixelBuffer
+        self.fieldMatch = fieldMatch
         self.pixelBuffer = pixelBuffer
         self.color = color
         self.interlace = interlace
@@ -43,6 +60,8 @@ public struct RenderTiming: Sendable {
     public var deinterlaceApplied: DeinterlaceMode?
     public var colorMatrixUsed: String = ""
     public var colorAssumptionApplied: Bool = false
+    /// 非 AI の denoise 段が実行されたか（plan の段と強さ > 0 のとき）。
+    public var denoiseApplied: Bool = false
 }
 
 public final class MetalRenderGraph: @unchecked Sendable {
@@ -80,14 +99,34 @@ public final class MetalRenderGraph: @unchecked Sendable {
         }
         var yTex = planes[0].texture
         var uvTex = planes[1].texture
+        // 前 frame（motion-adaptive 用。同寸法・NV12 のときだけ取り込む）
+        var previousPlanes: [PixelBufferImporter.Plane] = []
+        if let prev = input.previousPixelBuffer,
+           CVPixelBufferGetWidth(prev) == CVPixelBufferGetWidth(input.pixelBuffer),
+           CVPixelBufferGetHeight(prev) == CVPixelBufferGetHeight(input.pixelBuffer),
+           let p = importer.importNV12(prev) {
+            previousPlanes = p
+        }
+        let prevYTex: (any MTLTexture)? = previousPlanes.first?.texture
+        let prevUVTex: (any MTLTexture)? = previousPlanes.count > 1 ? previousPlanes[1].texture : nil
 
         // 2. deinterlace（plan に段があり、source が interlaced のときだけ実行）
         var interimTextures: [any MTLTexture] = []
         if let req = plan.stage(of: .deinterlace), input.interlace.fieldCount >= 2 {
-            let mode = resolveDeinterlace(req: req, input: input, timing: &timing)
+            let mode = resolveDeinterlace(req: req, input: input, previousAvailable: prevYTex != nil,
+                                          timing: &timing)
             try encodeDeinterlace(mode: mode, fieldOrder: input.interlace.fieldOrder,
-                                 y: yTex, uv: uvTex,
+                                 y: yTex, uv: uvTex, prevY: prevYTex, prevUV: prevUVTex,
                                  into: &yTex, uvOut: &uvTex, interim: &interimTextures, command: command)
+        }
+
+        // 2b. ノイズ除去（非 AI の metalGuided。plan に denoise 段があり強さ > 0 のときだけ）
+        if let strength = (plan.stage(of: .denoise)?.parameters as? any LumaChromaDenoiseRequest)?.metalDenoiseStrength,
+           strength > 0 {
+            try encodeDenoise(strength: Float(min(max(strength, 0), 1)),
+                              y: yTex, uv: uvTex, into: &yTex, uvOut: &uvTex,
+                              interim: &interimTextures, command: command)
+            timing.denoiseApplied = true
         }
 
         // 3. colorConvert（+ crop / letterbox / scale を同一 pass で）
@@ -108,13 +147,15 @@ public final class MetalRenderGraph: @unchecked Sendable {
         timing.colorAssumptionApplied = constants.assumptionApplied
 
         let stageBegan = ContinuousClock.now
+        let wantsHighQuality = (plan.stage(of: .scale)?.parameters as? ScaleParameters)?.filter == .highQuality
         try encodeColorConvert(constants: constants, aspect: input.aspect,
-                              y: yTex, uv: uvTex, target: target, command: command)
+                              y: yTex, uv: uvTex, target: target, command: command,
+                              highQualityScale: wantsHighQuality)
         timing.stageEncodeMS.append((.colorConvert, msSince(stageBegan)))
 
         // 完了処理: pool 返却と CVMetalTexture の flush（GPU 使用後）。
         // addCompletedHandler は commit より前でなければならない（Metal の実測アサーション）。
-        let imports = planes
+        let imports = planes + previousPlanes
         command.addCompletedHandler { [pool, importer] cb in
             for t in interimTextures { pool.release(t) }
             _ = imports   // CVMetalTexture の参照をここで手放す（texture は cb 完了まで生存済み）
@@ -140,6 +181,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
     // （単一フレームのみで動く中間解。detector + motionAdaptive は同一 issue の次増分）。
 
     private func resolveDeinterlace(req: StageRequest, input: RenderFrameInput,
+                                    previousAvailable: Bool,
                                     timing: inout RenderTiming) -> DeinterlaceMode {
         let requested = (req.parameters as? DeinterlaceParameters)?.mode ?? .auto
         let declared = input.interlace.fieldCount >= 2
@@ -147,14 +189,27 @@ public final class MetalRenderGraph: @unchecked Sendable {
             timing.deinterlaceApplied = .passthrough
             return .passthrough
         }
+        // telecine の field matching（呼び出し側が確信してロックしたときだけ来る）。
+        switch input.fieldMatch {
+        case .weaveWithPrevious where previousAvailable:
+            timing.deinterlaceApplied = .inverseTelecine
+            return .inverseTelecine
+        case .keepWoven:
+            timing.deinterlaceApplied = .passthrough
+            return .passthrough
+        default: break
+        }
         let actual: DeinterlaceMode
         switch requested {
         case .passthrough: actual = .passthrough
         case .bob: actual = .bob
-        case .edgeDirected, .motionAdaptive, .auto:
-            actual = .edgeDirected   // v1 の safe 側実装（motionAdaptive は detector と共に入る）
+        case .edgeDirected: actual = .edgeDirected
+        case .motionAdaptive, .auto:
+            // 前 frame があれば motion-adaptive（静止部は weave で垂直解像度を保つ）。無ければ
+            // 単一 frame で動く edge-directed（先頭 frame・seek 直後・寸法変更直後）。
+            actual = previousAvailable ? .motionAdaptive : .edgeDirected
         case .inverseTelecine:
-            actual = .edgeDirected   // telecine 検出（CadenceAnalyzer）未実装の間の代替
+            actual = .edgeDirected   // plan が inverseTelecine を要求しても、field matching の指示が無ければ空間内挿
         }
         timing.deinterlaceApplied = actual
         return actual
@@ -162,6 +217,7 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
     private func encodeDeinterlace(mode: DeinterlaceMode, fieldOrder: FieldOrder,
                                   y: any MTLTexture, uv: any MTLTexture,
+                                  prevY: (any MTLTexture)?, prevUV: (any MTLTexture)?,
                                   into yOut: inout any MTLTexture, uvOut: inout any MTLTexture,
                                   interim: inout [any MTLTexture],
                                   command: any MTLCommandBuffer) throws {
@@ -185,11 +241,13 @@ public final class MetalRenderGraph: @unchecked Sendable {
 
         let functionName = switch mode {
         case .bob: "rv_deint_bob_v1"
+        case .inverseTelecine where prevY != nil && prevUV != nil: "rv_ivtc_weave_v1"
+        case .motionAdaptive where prevY != nil: "rv_deint_motionAdaptive_v1"
         default: "rv_deint_edgeDirected_v1"
         }
         var constants: MTLFunctionConstantValues?
         var variant = ""
-        if functionName == "rv_deint_bob_v1" {
+        if functionName == "rv_deint_bob_v1" || functionName == "rv_ivtc_weave_v1" {
             // field 順序を function constant で渡す（bottom-first 素材は上 field が奇数列 —
             // 04 §3 の PCE 実測。PSO 再作成は field 順序が変わるときだけ）。
             let cv = MTLFunctionConstantValues()
@@ -211,6 +269,8 @@ public final class MetalRenderGraph: @unchecked Sendable {
         enc.setTexture(uv, index: 1)
         enc.setTexture(outY, index: 2)
         enc.setTexture(outUV, index: 3)
+        if functionName == "rv_deint_motionAdaptive_v1" { enc.setTexture(prevY, index: 4) }
+        if functionName == "rv_ivtc_weave_v1" { enc.setTexture(prevY, index: 4); enc.setTexture(prevUV, index: 5) }
         let threads = MTLSize(width: w, height: h, depth: 1)
         let group = MTLSize(width: 8, height: 8, depth: 1)
         enc.dispatchThreads(threads, threadsPerThreadgroup: group)
@@ -220,6 +280,41 @@ public final class MetalRenderGraph: @unchecked Sendable {
         yOut = outY
         uvOut = outUV
         _ = stageBegan
+    }
+
+    private func encodeDenoise(strength: Float,
+                               y: any MTLTexture, uv: any MTLTexture,
+                               into yOut: inout any MTLTexture, uvOut: inout any MTLTexture,
+                               interim: inout [any MTLTexture],
+                               command: any MTLCommandBuffer) throws {
+        let w = y.width, h = y.height
+        guard let outY = pool.acquire(width: w, height: h, format: .r8Unorm,
+                                      usage: [.shaderRead, .shaderWrite]),
+              let outUV = pool.acquire(width: w / 2, height: h / 2, format: .rg8Unorm,
+                                      usage: [.shaderRead, .shaderWrite]) else {
+            throw PlaybackError(kind: .render(.memoryLimit),
+                                recovery: .retryWith(.lowerTier),
+                                userMessage: "中間テクスチャを確保できません")
+        }
+        interim.append(outY)
+        interim.append(outUV)
+        let pso = try context.computePipeline(function: "rv_denoise_metalGuided_v1", label: "denoise_metalGuided_v1")
+        guard let enc = command.makeComputeCommandEncoder() else {
+            throw PlaybackError(kind: .render(.deviceUnavailable),
+                                recovery: .retryWith(.lowerTier), userMessage: "encoder を作れません")
+        }
+        var s = strength
+        enc.setComputePipelineState(pso)
+        enc.setTexture(y, index: 0)
+        enc.setTexture(uv, index: 1)
+        enc.setTexture(outY, index: 2)
+        enc.setTexture(outUV, index: 3)
+        enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
+        enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        enc.endEncoding()
+        yOut = outY
+        uvOut = outUV
     }
 
     // MARK: colorConvert + crop/letterbox/scale（単一 pass）
@@ -266,11 +361,8 @@ public final class MetalRenderGraph: @unchecked Sendable {
                                    aspect: AspectResolution,
                                    y: any MTLTexture, uv: any MTLTexture,
                                    target: any MTLTexture,
-                                   command: any MTLCommandBuffer) throws {
-        let pso = try context.renderPipeline(vertex: "rv_vs_fullscreen",
-                                             fragment: "rv_colorConvert_v1",
-                                             colorFormat: target.pixelFormat,
-                                             label: "colorConvert_v1")
+                                   command: any MTLCommandBuffer,
+                                   highQualityScale: Bool = false) throws {
         var p = ColorParams()
         p.m = (matrix.m[0], matrix.m[1], matrix.m[2],
                matrix.m[3], matrix.m[4], matrix.m[5],
@@ -280,6 +372,15 @@ public final class MetalRenderGraph: @unchecked Sendable {
                                targetWidth: target.width, targetHeight: target.height)
         p.sourceRect = geo.source
         p.destRect = geo.dest
+        // highQuality（bicubic）は拡大時だけ: 出力側の画素数が取り込み域より多いとき。縮小は linear。
+        let srcPixelsW = Double(geo.source.2) * Double(y.width)
+        let dstPixelsW = Double(geo.dest.2) * Double(target.width)
+        let upscaling = dstPixelsW > srcPixelsW * 1.01
+        let useBicubic = highQualityScale && upscaling
+        let pso = try context.renderPipeline(vertex: "rv_vs_fullscreen",
+                                             fragment: useBicubic ? "rv_colorConvert_bicubic_v1" : "rv_colorConvert_v1",
+                                             colorFormat: target.pixelFormat,
+                                             label: useBicubic ? "colorConvert_bicubic_v1" : "colorConvert_v1")
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target

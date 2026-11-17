@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "test.tiny.invert",
+  "revision": "1",
+  "displayName": "Tiny invert (contract test)",
+  "task": "unknown",
+  "scaleFactor": 1,
+  "license": {
+    "spdx": "CC0-1.0",
+    "weightsLicense": "none (no weights)",
+    "outputRightsConfirmed": true
+  },
+  "compiledModel": "model.mlmodelc",
+  "checksum": "sha256:unset",
+  "input": {
+    "name": "image",
+    "kind": "image",
+    "width": 32,
+    "height": 32,
+    "pixelFormat": "BGRA8",
+    "dataType": "float16"
+  },
+  "output": {
+    "name": "out_tensor",
+    "kind": "image",
+    "width": 32,
+    "height": 32,
+    "pixelFormat": "BGRA8",
+    "dataType": "float16"
+  },
+  "constraints": {
+    "multipleOf": 16,
+    "maxPixels": 4194304,
+    "allowsDynamicShape": false
+  },
+  "computeUnitsPreference": "cpuOnly",
+  "memoryEstimateMB": 1,
+  "expectedLatencyMS": {
+    "p50": 1.0,
+    "p95": 2.0
+  }
+}
