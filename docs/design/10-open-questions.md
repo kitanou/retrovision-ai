@@ -260,3 +260,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査（実際の Core ML 推論）**: discover、load → predict（画素値 245/155/55 を確認）→ unload、未計測モデルの拒否、shape 不一致が breaker に数えられない、期限超過が breaker に数えられない、連続失敗で breaker が open して以降は投入されない（`CoreMLModelRuntimeTests`）。
 - **未実装（A2 の残り）**: Metal ↔ テンソルの橋渡し（`tensor_to_texture` kernel・方針 B）と変換コストの分離計測、tile 分割 + overlap blend、memory pressure 連動の unload、`EngineCore` への接続（breaker の open を `ControlSignals.modelBreakerOpen` へ）、実モデルでの compute units 実測（G3）。実モデル（Real-ESRGAN 等）の変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。
 
+### 2026-11-17 — #6 A2: タイル分割推論（06 §5。16 px オーバーラップ + feather 合成）
+
+- **決定**: `TilePlan`（純粋な計画）が、モデルの入力寸法のタイルで frame を覆う。軸ごとに stride = tile − overlap（既定 overlap 16 px）で並べ、最後のタイルは frame の端に揃える。frame がタイルより小さい・重なりがタイル以上・倍率が不正なら nil（呼び出し側はより小さいモデル variant を選ぶか推論しない — 08 §5）。合成は重なりを線形に混ぜる feather で、**重みは出力画素ごとに正規化**するので合計は常に 1（恒等モデルなら入力が厳密に復元される）。超解像の倍率（scale）は出力タイルの配置と重みの幅に反映する。
+- **`TiledInference.run`**: BGRA の `CVPixelBuffer` を CPU でタイルに切り出し、`ModelRuntimeProtocol.predict` を**直列に**投入し（in-flight ≤ 2 の枠内 — 06 §7）、出力を合成して 1 枚の pixel buffer にする。どのタイルが失敗しても全体を失敗として返す（部分的に強調された frame は出さない。呼び出し側はその frame を非強調のまま提示 — INV-1）。入力寸法が計画と違えば、どのタイルも走らせずに `shapeMismatch`。
+- **検査**: 計画の被覆・端揃え・重なり、無効な計画の拒否、**正規化による恒等復元**（scale 1 と 2）、継ぎ目が階段にならない（単調・最大の段差が小）。**実際の Core ML 推論**（tiny model、80x64 を 32x32 のタイル・overlap 8 で）で、継ぎ目を含む全画素が全体の反転（255−x）と一致（±3）。タイルの失敗が全体の失敗になること。
+- **未実装（A2 の残り）**: Metal の texture ↔ Core ML の入出力（`tensor_to_texture`・方針 B。いまは CPU の BGRA 経由の参照実装）、タイル合成の Metal kernel 化（`blend`）、描画手順に RGB の中間 texture を挟む graph の作り替え、`EngineCore` への接続（breaker の open を `ControlSignals.modelBreakerOpen` へ）、メモリ逼迫での unload、実モデルでの計算ユニットの実測（G3）。実モデルの変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。
+
