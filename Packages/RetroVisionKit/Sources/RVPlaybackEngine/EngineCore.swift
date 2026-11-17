@@ -4,6 +4,7 @@ import RVDecode
 import RVEnhancement
 import RVMediaCore
 import RVMediaSources
+import RVMLRuntime
 import RVVideoPipeline
 
 // MARK: - EngineCore（02 §2 の実体）
@@ -407,6 +408,70 @@ public actor EngineCore {
     // session の累積値の差分。thermal は ProcessInfo、memory pressure / breaker / present jitter は
     // 供給元（A2 の runtime、MetalPresenter.onPresented）が載るまで既定値（normal / false / 0）。
 
+    // モデル実行層（A2）。無ければ breaker は常に closed、memory pressure も unload する対象が無い。
+    private var modelRuntime: (any ModelRuntimeProtocol)?
+    private var trackedModels: [ModelID] = []
+    private var memoryPressure: ControlSignals.MemoryPressureLevel = .normal
+    private var memorySource: (any DispatchSourceMemoryPressure)?
+    /// 直近に適用した tier（降格 / 昇格の判別用。nil の間は最初の setTier で基準だけを置く）。
+    private var lastAppliedTier: QualityTier?
+
+    /// モデル実行層を接続する。`models` は breaker を監視し、memory pressure で unload する対象。
+    /// nil で切り離し（memory pressure の監視も止める）。
+    public func setModelRuntime(_ runtime: (any ModelRuntimeProtocol)?, models: [ModelID] = []) {
+        modelRuntime = runtime
+        trackedModels = runtime == nil ? [] : models
+        memorySource?.cancel()
+        memorySource = nil
+        memoryPressure = .normal
+        guard runtime != nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical, .normal],
+                                                              queue: DispatchQueue.global(qos: .utility))
+        source.setEventHandler { [weak self, weak source] in
+            guard let event = source?.data else { return }
+            let level: ControlSignals.MemoryPressureLevel =
+                event.contains(.critical) ? .critical : (event.contains(.warning) ? .warn : .normal)
+            Task { await self?.setMemoryPressure(level) }
+        }
+        source.resume()
+        memorySource = source
+    }
+
+    func setMemoryPressure(_ level: ControlSignals.MemoryPressureLevel) { memoryPressure = level }
+
+    /// 追跡中のモデルのどれかの breaker が open か（half-open は試行中なので open 扱いにしない）。
+    private func anyModelBreakerOpen() async -> Bool {
+        guard let modelRuntime else { return false }
+        for id in trackedModels where await modelRuntime.health(of: id).breakerState == .open { return true }
+        return false
+    }
+
+    /// 窓の統計と各供給元から ControlSignals を作る（純粋。テストで写像を固定する）。
+    static func makeSignals(window: FrameStats, windowMS: Double, thermal: ThermalState,
+                            memory: ControlSignals.MemoryPressureLevel, breakerOpen: Bool) -> ControlSignals {
+        ControlSignals(summary: DiagnosticsSummary(windowMS: windowMS, frames: window), thermal: thermal,
+                       memoryPressureLevel: memory, modelBreakerOpen: breakerOpen)
+    }
+
+    /// 1 窓分を評価して action を適用する。`evaluateAdaptiveWindowIfDue` の中身（session に依存しない）。
+    func evaluateWindow(window: FrameStats, elapsedMS: Double, nowMS: Double,
+                        thermal: ThermalState) async -> [ControlAction] {
+        let signals = Self.makeSignals(window: window, windowMS: elapsedMS, thermal: thermal,
+                                       memory: memoryPressure, breakerOpen: await anyModelBreakerOpen())
+        if lastAppliedTier == nil { lastAppliedTier = controller.state.activeTier }   // 評価前の tier を基準にする
+        let actions = controller.evaluate(signals: signals, atMS: nowMS)
+        // UI に伝える理由: 何が原因で降格したか（優先: breaker > memory > thermal > 負荷）。
+        let reason: DegradeReason = signals.modelBreakerOpen ? .modelFailure
+            : (signals.memoryPressureLevel != .normal ? .memory
+               : ((thermal == .serious || thermal == .critical) ? .thermal : .loadHigh))
+        if !actions.isEmpty { await applyControlActions(actions, reason: reason) }
+        return actions
+    }
+
+    /// テスト用の接点（controller の状態の読み書き）。
+    func adaptiveState() -> AdaptivePolicyEngine.State { controller.state }
+    func seedAdaptiveState(_ state: AdaptivePolicyEngine.State) { controller.state = state }
+
     private var adaptiveWindowStart: ContinuousClock.Instant?
     private var adaptiveLastStats = FrameStats()
 
@@ -454,10 +519,7 @@ public actor EngineCore {
         adaptiveWindowStart = now
         adaptiveLastStats = current
         guard window.total > 0 else { return }
-        let signals = ControlSignals(summary: DiagnosticsSummary(windowMS: elapsedMS, frames: window),
-                                     thermal: thermal)
-        let actions = controller.evaluate(signals: signals, atMS: adaptiveClockMS(now))
-        if !actions.isEmpty { applyControlActions(actions) }
+        _ = await evaluateWindow(window: window, elapsedMS: elapsedMS, nowMS: adaptiveClockMS(now), thermal: thermal)
     }
 
     private let adaptiveClockOrigin = ContinuousClock.now
@@ -467,17 +529,23 @@ public actor EngineCore {
     }
 
     /// 適応制御から届いた action を適用する（08 §5）。plan の作り直しは frame 境界で行う。
-    public func applyControlActions(_ actions: [ControlAction]) {
+    public func applyControlActions(_ actions: [ControlAction], reason: DegradeReason = .loadHigh) async {
         for action in actions {
             switch action {
-            case .setTier:
-                break // controller 側で state は更新済み
+            case .setTier(let tier):
+                // controller 側で state は更新済み。**降格のときだけ**理由を UI へ（昇格は通知しない）。
+                if let previous = lastAppliedTier, tier < previous { noteDegradation(reason) }
+                lastAppliedTier = tier
             case .bypassStage(let stage):
-                noteDegradation(.loadHigh)
+                noteDegradation(reason)
                 _ = stage
+            case .unloadModel:
+                // memory pressure: 追跡中のモデルを unload して memory を戻す（06 §6。再生は止めない）。
+                if let modelRuntime { for id in trackedModels { await modelRuntime.unload(id) } }
+                noteDegradation(.memory)
             case .disableTemporalBlend, .useLighterModelVariant, .reduceInferenceScale,
-                 .enhanceEveryNFrames, .setInFlightLimit, .unloadModel:
-                noteDegradation(.loadHigh)
+                 .enhanceEveryNFrames, .setInFlightLimit:
+                noteDegradation(reason)
             }
         }
         try? rebuildPlan()

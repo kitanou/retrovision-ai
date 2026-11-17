@@ -267,3 +267,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査**: 計画の被覆・端揃え・重なり、無効な計画の拒否、**正規化による恒等復元**（scale 1 と 2）、継ぎ目が階段にならない（単調・最大の段差が小）。**実際の Core ML 推論**（tiny model、80x64 を 32x32 のタイル・overlap 8 で）で、継ぎ目を含む全画素が全体の反転（255−x）と一致（±3）。タイルの失敗が全体の失敗になること。
 - **未実装（A2 の残り）**: Metal の texture ↔ Core ML の入出力（`tensor_to_texture`・方針 B。いまは CPU の BGRA 経由の参照実装）、タイル合成の Metal kernel 化（`blend`）、描画手順に RGB の中間 texture を挟む graph の作り替え、`EngineCore` への接続（breaker の open を `ControlSignals.modelBreakerOpen` へ）、メモリ逼迫での unload、実モデルでの計算ユニットの実測（G3）。実モデルの変換・同梱は OQ-07 / OQ-11 とライセンス確認が済むまで行わない。
 
+### 2026-11-17 — #9 A4: 適応制御の信号接続（breaker / memory pressure / thermal / 降格理由）
+
+- **決定（接続）**: `EngineCore.setModelRuntime(_:models:)` でモデル実行層（`ModelRuntimeProtocol`）と追跡するモデルを接続する。窓（2 s）ごとの評価（`evaluateWindow`。session に依存せず単体で検査できる）が、次の信号を `ControlSignals` に載せる: ① **breaker**: 追跡中のモデルのどれかの `health.breakerState == .open`（half-open は試行中なので open 扱いにしない）→ `modelBreakerOpen`（controller が tier の上限を metalOnly にする）。② **memory pressure**: `DispatchSourceMemoryPressure`（warning / critical / normal。実行層を接続している間だけ監視）→ `memoryPressureLevel`。③ **thermal**: `ProcessInfo`（前の増分）。④ 窓の `FrameStats` の差分（前の増分）。
+- **決定（action の適用）**: `applyControlActions` は async になり、`.unloadModel`（memory pressure）で追跡中のモデルを実際に `unload` する。降格の理由を UI へ流す（`enhancementDegraded`: breaker → `modelFailure`、memory pressure → `memory`、thermal → `thermal`、それ以外 → `loadHigh`）。**降格のときだけ**通知し、昇格（`.setTier` が上がる方向）は通知しない。
+- **検査**: 信号の写像、breaker の open で tier が metalOnly に下がる（half-open では下がらない）、memory pressure で unload と tier 降下、実行層が無ければ breaker は常に closed で unload もしない、thermal serious の上限と理由の通知、昇格を降格として通知しない。**本物の Core ML 実行層**（tiny model を NV12 の入力で 3 回失敗させて実際に breaker を open）で、エンジンの tier が下がるところまでの通し検査。
+- **未接続（意図的）**: ① present jitter: `.immediate` の提示では「予約時刻との差」が提示までの待ち時間になり、基準値（8 ms）を超えて誤作動するため接続しない（指標の再定義が先）。② endToEnd の p95: PTS から実提示までの対応付けは `MetalPresenter.onPresented` の集計が要る。③ 実際の AI 段（超解像・学習ベースのノイズ除去）が plan に入る構成での挙動（現状は AI 段が無いので tier が上がっても段は増えない）。④ 品質インジケータ UI、負荷注入テスト、ベンチマークレポート。
+

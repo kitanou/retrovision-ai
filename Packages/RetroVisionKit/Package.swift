@@ -56,7 +56,7 @@ let package = Package(
             name: "RVPlaybackEngine",
             dependencies: [
                 "RVMediaCore", "RVDiagnostics", "RVMediaSources", "RVDecode",
-                "RVVideoPipeline", "RVEnhancement",
+                "RVVideoPipeline", "RVEnhancement", "RVMLRuntime",
             ]
         ),
 
