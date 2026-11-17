@@ -259,3 +259,9 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **確認**: 修正前後の実アプリ窓で同じ区間の輪郭を比較し、点線が消えたことを目視確認。`MetalPipelineTests` に chroma が動く画素でのみ補間されること（静止は weave のまま）を追加。
 - **G2 判定ではない**: 実素材 1 本・菜単 menu の 11 秒での目視確認で、combing の客観検査・present 間隔・GPU 時間は未実施。#15 の 7 本は未充足。
 
+### 2026-11-17 — QA 入口 RV_AUTO_TITLE（起動時に本体タイトルを選んで再生）と実盤 ISO の本体確認
+
+- **決定**: `RV_AUTO_OPEN` と同じ opt-in env 約定で、`RV_AUTO_TITLE=<n>` があれば open 後にその `titleNumber` の本体タイトルへ `select` + `play` する（menu の first-play 政策とは独立。画面を操作せずに実盤の本体を検証するため）。
+- **実測（`PICHI_PICHI_PITCH1.ISO`）**: VIDEO_TS は VMGM menu（約 13 MB、11 s）+ VTS_01（menu 235 KB + 本体 VOB 4 本 ≈ 3.6 GB、約 50 分 11 秒）。`RV_AUTO_TITLE=1` で本体が Metal 既定で再生され、実時間比 ≈ 1.0（位置が 1 s ごとに進む）。複数 VOB は連結して 1 タイトルとして扱われた（#25 の修復写しが働いた）。
+- **未決（静止ロゴの輪郭の点々）**: 本体冒頭（PONY CANYON のロゴ）の文字輪郭に細かい点々が見える。静止に近い場面なので motion-adaptive の weave 側で、動き由来ではない。MPEG-2 の mosquito noise（輪郭周りの圧縮ノイズ）の可能性が高いが、**同じ瞬間を暫定経路と比較できていない**（再生位置と実時間が実行ごとにずれて同じ場面を撮れない）。確定には、seek 位置を指定できる QA 入口（例: `RV_AUTO_SEEK`）で同じ位置を撮る、または Metal の最終出力を CPU に読み戻して差分を取る必要がある。A3 の非 AI ノイズ除去（metalGuided）は mosquito noise を狙う処理だが、UI から強度を操作する配線がまだ無く、実盤での効果は未確認。
+

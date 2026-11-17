@@ -238,6 +238,14 @@ final class PlayerViewModel {
                 if structure.items.contains(where: { $0.titleNumber == 0 }) {
                     await engine.play()
                 }
+                // 起動時 QA 入口（RV_AUTO_OPEN と同じ opt-in env 约定）: RV_AUTO_TITLE=<n> が
+                // あれば、開いた後にその titleNumber の本体タイトルへ切り替えて再生する
+                // （画面を操作せずに実盤の本体を検証するため。menu の first-play 政策とは独立）。
+                if let raw = ProcessInfo.processInfo.environment["RV_AUTO_TITLE"], let number = Int(raw),
+                   let item = structure.items.first(where: { $0.titleNumber == number }) {
+                    await engine.select(item: item.id)
+                    await engine.play()
+                }
                 // 開いた直後は再生しない（#17: preparing → ready。transport は user gate）。
             } catch let error as PlaybackError {
                 lastError = error
