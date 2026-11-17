@@ -157,6 +157,71 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertFalse(fake.calls.contains("select:item"))
     }
 
+    /// 実盤の構成: VMGM（ロゴ 11 s）→ タイトルメニュー（VTS_01_0.VOB。静止画 1 枚）→ 本体。
+    private func menuWithTitleMenuPreset() -> MediaStructure {
+        MediaStructure(itemKind: .dvdTitles, items: [
+            MediaItem(id: ItemID(0), titleNumber: 0, duration: CMTime(value: 11, timescale: 1)),
+            MediaItem(id: ItemID(1_001), titleNumber: 0, duration: CMTime(value: 1, timescale: 60), stillImage: true),
+            MediaItem(id: ItemID(1), titleNumber: 1, duration: CMTime(value: 3_000, timescale: 1)),
+        ])
+    }
+
+    func testVMGMEndedAdvancesToTheTitleMenuStillInsteadOfLooping() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuWithTitleMenuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+        XCTAssertEqual(vm.selected?.item, ItemID(0), "先頭は VMGM（first-play のロゴ）")
+        let playsBefore = fake.calls.filter { $0 == "play" }.count
+
+        fake.emit(.phaseChanged(.ended))   // ロゴの終了
+        for _ in 0..<200 where !fake.calls.contains("select:item") {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(fake.calls.filter { $0 == "select:item" }.count, 1,
+                       "ロゴの後にタイトルメニュー（静止画）へ進まない（ロゴを繰り返している）")
+        XCTAssertEqual(fake.lastSelectedItem, ItemID(1_001), "進み先がタイトルメニューでない（本体へ飛んだ）")
+        for _ in 0..<200 where fake.calls.filter({ $0 == "play" }).count == playsBefore {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, playsBefore + 1, "選択後に再生しない")
+    }
+
+    func testTitleMenuStillStopsAtItsLastFrameAndNeverLoopsOrAdvances() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuWithTitleMenuPreset()
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+        // タイトルメニューが選ばれた状態（実 engine は select で selectionChanged を送る）。
+        fake.emit(.selectionChanged(PlaybackSelection(item: ItemID(1_001))))
+        for _ in 0..<200 where vm.selected?.item != ItemID(1_001) {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let plays = fake.calls.filter { $0 == "play" }.count
+        let selects = fake.calls.filter { $0 == "select:item" }.count
+        fake.emit(.phaseChanged(.ended))
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, plays, "静止画のメニューを再生し直した（最後の画面で止まるはず）")
+        XCTAssertEqual(fake.calls.filter { $0 == "select:item" }.count, selects, "静止画の後で本体へ自動で進んだ")
+    }
+
+    func testDiscWithoutATitleMenuStillLoopsTheVMGM() async {
+        let fake = FakePlayerEngine()
+        fake.presetStructure = menuPreset()          // VMGM + 本体のみ（タイトルメニュー無し）
+        let vm = PlayerViewModel(engine: fake)
+        vm.open(url: URL(fileURLWithPath: "/tmp/does-not-matter.iso"))
+        await waitPhase(vm, .playing)
+        let plays = fake.calls.filter { $0 == "play" }.count
+        fake.emit(.phaseChanged(.ended))
+        for _ in 0..<200 where fake.calls.filter({ $0 == "play" }).count == plays {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(fake.calls.filter { $0 == "play" }.count, plays + 1, "タイトルメニューが無い盤では VMGM を繰り返す（従来どおり）")
+        XCTAssertFalse(fake.calls.contains("select:item"))
+    }
+
     func testBodyTitleEndedDoesNotLoop() async {
         let fake = FakePlayerEngine()
         fake.presetStructure = menuPreset()

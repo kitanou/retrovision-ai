@@ -62,7 +62,7 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
         for chain in found.chains {
             // menu chain（vtsNumber 0）は ItemID(0) / titleNumber 0。列の先頭に有る（実盤の
             // first-play 入口。政策は PlayerViewModel — 03 §5 の実挙動合わせ）。
-            let itemId = ItemID(UInt64(chain.vtsNumber))
+            let itemId = Self.itemID(for: chain)
             let demuxer = Self.makeDemuxer(for: chain)
             do {
                 let stream = try await demuxer.probe()
@@ -74,11 +74,14 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
                                                     detail: "\(chain.label) に映像トラックが無い（AVFoundation が読めなかった）"))
                     continue
                 }
+                // menu（VMGM もタイトルメニューも）は titleNumber 0。タイトルメニューは静止画
+                // （stillImage）で、UI は「タイトルメニュー」と表示し、VMGM の後で進む先になる。
                 items.append(MediaItem(id: itemId,
-                                       titleNumber: chain.vtsNumber,
+                                       titleNumber: chain.isMenu ? 0 : chain.vtsNumber,
                                        duration: stream.programDuration,
                                        trackTable: stream.tracks,
-                                       videoFormat: videoFormat))
+                                       videoFormat: videoFormat,
+                                       stillImage: chain.isTitleMenu))
                 warnings.append(contentsOf: stream.warnings)
             } catch let error as PlaybackError {
                 warnings.append(StructureWarning(code: .containerUnreadable,
@@ -121,7 +124,7 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
         // （menu を飛ばす — menu 目的の呼び出しなら itemId が先にヒットしている）。
         if let firstChain = chainsByID.values.filter({ !$0.isMenu })
                 .min(by: { $0.vtsNumber < $1.vtsNumber }),
-           let d = demuxers[ItemID(UInt64(firstChain.vtsNumber))] {
+           let d = demuxers[Self.itemID(for: firstChain)] {
             return d
         }
         // open() 以前（構造未知）の呼び出し: 空のチェーンは作れないので、root の
@@ -137,10 +140,19 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
     }
 
     private static func makeDemuxer(for chain: VideoTsChain) -> any Demuxer {
+        // タイトルメニュー（VTS_nn_0.VOB）は静止画 1 枚。AVFoundation は 1 枚だけの program stream から
+        // sample を渡さない（実測 — StillPSDemuxer 頭注）ので、自前で映像 ES を取り出す。
+        if chain.isTitleMenu, let url = chain.partURLs.first { return StillPSDemuxer(url: url) }
         // 単一 part も同じ経路（offset 0 で素の demux と逐語一致 — SegmentPSDemuxerTests §5 で実測。
         // 単一 part 内部の程序再開始も ProgramStreamRepair で修復できる利点がある）。
         // 旧 ConcatPSDemuxer は実写マルチパートで崩壊するため退場 — SegmentPSDemuxer 頭注。
         return SegmentPSDemuxer(partURLs: chain.partURLs)
+    }
+
+    /// chain の ItemID。VMGM は 0、タイトル本体は vts 番号、タイトルメニュー（VTS_nn_0.VOB）は
+    /// 1000 + vts（本体の ItemID と衝突しない）。
+    static func itemID(for chain: VideoTsChain) -> ItemID {
+        chain.isTitleMenu ? ItemID(UInt64(1_000 + chain.vtsNumber)) : ItemID(UInt64(chain.vtsNumber))
     }
 
     /// パスから決定的な SourceID（FNV-1a。FileMediaSource と同じ作り方）。

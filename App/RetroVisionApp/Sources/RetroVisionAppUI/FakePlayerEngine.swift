@@ -15,6 +15,8 @@ import RVPlaybackEngine
 public final class FakePlayerEngine: PlayerEngine, VideoSurfaceBinding {
     public private(set) var calls: [String] = []
     public private(set) var attachedSink: (any VideoPresentSink)?
+    /// 最後に select(item:) された項目（タイトル切り替えの検査用）。
+    public private(set) var lastSelectedItem: ItemID?
     public private(set) var lastSeekTolerance: SeekTolerance?
     public private(set) var lastVolume: Double?
 
@@ -93,7 +95,7 @@ public final class FakePlayerEngine: PlayerEngine, VideoSurfaceBinding {
     public func setRate(_ rate: Double) async { calls.append("setRate:\(rate)") }
     public func setVolume(_ gain: Double) async { calls.append("setVolume"); lastVolume = gain }
     public func select(_ track: TrackID, for kind: TrackKind) async { calls.append("select:track") }
-    public func select(item: ItemID) async { calls.append("select:item") }
+    public func select(item: ItemID) async { calls.append("select:item"); lastSelectedItem = item }
     public func apply(_ settings: PlayerSettings) async { calls.append("apply") }
 
     public var stateSnapshot: PlayerStateSnapshot { .init() }

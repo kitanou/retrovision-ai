@@ -349,17 +349,28 @@ final class PlayerViewModel {
         Task { await engine.select(item: item) }
     }
 
-    /// DVD 実機の menu 動作（03 §5・§9.7）: インタラクティブ menu は未実装なので、menu
-    /// （titleNumber 0 の約束 — VideoTsNavigator の VMGM 列）は終端で本体へ進まず、
-    /// 先頭から再生し直して繰り返す（実機の menu は選択まで待つ）。本体タイトルへは
-    /// タイトル一覧（RootView）から選んで移る。本体タイトルの .ended では何もしない。
-    /// 尺が不明・極短の menu は繰り返さず終端で止める（空転防止）。
+    /// DVD 実機の menu 動作（03 §5・§9.7）: インタラクティブ menu は未実装なので、本体へは自動で進まない。
+    /// - VMGM（ロゴ等の映像 menu）が終わったら、**タイトルメニュー（VTS_nn_0.VOB。静止画）があればそこへ進む**
+    ///   （実盤の流れ: first-play のロゴ → 本当のメニュー）。静止画は 1 フレームで終わり、最後の画面で止まる
+    ///   （極短の menu は繰り返さない）。ボタンの操作は未実装なので、本体はタイトル一覧（RootView）から選ぶ。
+    /// - タイトルメニューが無い盤では、VMGM を先頭から再生し直して繰り返す（実機の menu は選択まで待つ）。
+    /// - 本体タイトルの .ended では何もしない。尺が不明・極短の menu は繰り返さず終端で止める（空転防止）。
     private func scheduleMenuLoop() {
         guard !menuLoopPending,
               let selectedID = selected?.item,
               let playing = availableTitles.first(where: { $0.id == selectedID }),
-              playing.titleNumber == 0,
-              let seconds = playing.duration?.seconds, seconds.isFinite,
+              playing.titleNumber == 0
+        else { return }
+        if !playing.stillImage,
+           let titleMenu = availableTitles.first(where: { $0.titleNumber == 0 && $0.stillImage }) {
+            menuLoopPending = true
+            Task { [weak self] in
+                await self?.engine.select(item: titleMenu.id)
+                await self?.engine.play()
+            }
+            return
+        }
+        guard let seconds = playing.duration?.seconds, seconds.isFinite,
               seconds >= Self.minLoopableMenuSeconds
         else { return }
         menuLoopPending = true

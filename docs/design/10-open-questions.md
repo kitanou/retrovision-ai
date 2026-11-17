@@ -320,3 +320,12 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **実素材での検査（標準 3:2 素材を復号）**: ① 10〜12 frame 目までにロックし、ロック後に外れず、周期内位置が測定と全 frame で一致。② weave の指示は測定で縞ありだった位置にだけ出て、取りこぼしが無い。③ **レンダラーを通した出力の縞を実測**: 復元後は縞なしの基準の 1.5 倍以内（入力の縞ありは基準の 3 倍以上）。
 - **範囲外（明記）**: これは**縞の除去**であって「24p 化」ではない。出力は元の 29.97 のままで、重複 frame（B）は捨てず、2:3 の再タイミングもしていない（session の時刻と OQ-10 に触れるため別 PR）。実盤 PICHI は 3:2 ではないので、**実盤では検証できていない**（#15 の実素材 `telecine-32-01` が必要）。`inverseTelecineTarget: 24p` の期待値は満たしていない。縞スコアは CPU 計算で、release ビルドでの実時間への影響は未計測。
 
+### 2026-11-17 — #3: タイトルメニュー（VTS_nn_0.VOB）の静止画表示（実盤 ISO で確認）
+
+- **発見（実盤 `PICHI_PICHI_PITCH1.ISO`）**: 再生すると first-play の VMGM（VIDEO_TS.VOB。約 11 s のロゴ映像）を繰り返すだけで、DVD メニューが出なかった。実盤の「本当のメニュー」は `VTS_01_0.VOB`（235 KB。映像は I picture 1 枚 + ボタンの字幕 `dvd_subtitle` + NAV pack）で、これまで列挙の対象外だった。さらに「menu 終端で本体へ進まず繰り返す」（B0）が、ロゴ → メニューという実盤の流れを塞いでいた。
+- **決定（列挙と並び）**: `VideoTsNavigator` が `VTS_nn_0.VOB`（0 バイトでないもの）を menu チェーン（`isMenu`、`vtsNumber` = nn、`isTitleMenu`）として列挙する。並びは VMGM → タイトルメニュー（vts 昇順）→ 本体（昇順）。`VideoTsMediaSource` は ItemID を 1000 + vts（本体と衝突しない）、`titleNumber` 0、`stillImage` true とし、UI は「タイトルメニュー」と表示する。
+- **決定（再生の流れ — `PlayerViewModel`）**: VMGM（映像 menu）が終わったら、タイトルメニュー（静止画）があればそこへ `select` + `play` して進む。静止画は 1 frame で終わり、極短の menu は繰り返さない規則（尺 1 s 未満）により最後の画面で止まる。タイトルメニューが無い盤では従来どおり VMGM を繰り返す。本体はタイトル一覧から選ぶ（ボタンの操作は未実装）。
+- **発見（AVFoundation の限界）と決定（`StillPSDemuxer`）**: **AVFoundation は、ピクチャ 1 枚だけの program stream から sample を 1 枚も渡さず、長さも不定（NaN）になる**（同じファイルを 2〜3 回つないでも変わらず、生成素材では映像 track さえ見つからない）。ffmpeg は問題なく読める。そこで AVFoundation を通さず、`StillPSDemuxer`（RVDecode）が program stream から映像の PES（0xE0〜0xEF）の payload を自前で連結して ES を取り出し、1 枚の access unit（MPEG-2 の形式記述 + sequence header 付き）として VideoToolbox へ渡す。静止画は progressive frame として扱い（実測 `interlaced_frame=0`）、deinterlace で解像度を落とさない。字幕（ボタンの絵・ハイライト）・音声・NAV pack は読まない。
+- **検査**: 生成した 1 枚だけの VOB（`menu-still-01.vob`、`Scripts/gen-fixtures.sh`）で、AVFoundation が読めないこと（前提の固定）、`StillPSDemuxer` が sequence header の信号（720x480・4:3・NTSC・progressive）と長さ（1 frame）を返し、VideoToolbox で**ちょうど 1 frame を復号**して中身があること、PES 解析（映像だけ・header data の読み飛ばし・途中で切れた packet）、構造で VMGM → タイトルメニュー（`stillImage`）→ 本体と並ぶこと、VMGM 終了でタイトルメニューへ進み、静止画の終了では繰り返さず本体へも自動で進まないこと、タイトルメニューの無い盤では VMGM を繰り返すこと。**実アプリで実盤 ISO を再生し、ロゴ → タイトルメニュー（「つづけてみる」「第 1 話」「第 2 話」「TVCM 集」の画面）が表示されることを確認した。**
+- **未実装（B2。操作できるメニュー）**: ボタンのハイライトと操作（矢印・決定・クリック）、字幕（SPU）の復号と重ね合わせ、NAV pack（PCI）のボタン位置、IFO の PGC とメニューの飛び先（VM 命令）。いまは静止画の背景（ボタンの絵が焼き込まれた部分を含む）が見えるだけで、ボタンは押せない。`libdvdnav` の採否（OQ-01 / OQ-03）が前提。
+

@@ -131,6 +131,48 @@ final class VideoTsNavigatorTests: XCTestCase {
         XCTAssertFalse(found.chains[1].isMenu)
     }
 
+    // MARK: 5b. タイトルメニュー（VTS_nn_0.VOB。実盤の「本当のメニュー」の静止画）
+
+    private func tempTree(sized files: [(name: String, bytes: Int)]) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("videots-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("VIDEO_TS"),
+                                               withIntermediateDirectories: true)
+        for f in files {
+            FileManager.default.createFile(atPath: root.appendingPathComponent("VIDEO_TS/\(f.name)").path,
+                                          contents: Data(count: f.bytes))
+        }
+        return root
+    }
+
+    func testTitleMenuIsEnumeratedAfterVMGMAndBeforeTheTitles() throws {
+        let root = try tempTree(sized: [("VIDEO_TS.VOB", 100), ("VTS_01_0.VOB", 50), ("VTS_01_0.IFO", 10),
+                                        ("VTS_01_1.VOB", 200), ("VTS_02_1.VOB", 200)])
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let found = VideoTsNavigator.chains(in: root) else { return XCTFail("VIDEO_TS が見付からない") }
+        // 並び: VMGM → タイトルメニュー → タイトル本体（昇順）。
+        XCTAssertEqual(found.chains.map(\.vtsNumber), [0, 1, 1, 2])
+        XCTAssertEqual(found.chains.map(\.isMenu), [true, true, false, false])
+        XCTAssertFalse(found.chains[0].isTitleMenu, "VMGM はタイトルメニューではない")
+        XCTAssertTrue(found.chains[1].isTitleMenu)
+        XCTAssertEqual(found.chains[1].partURLs.map(\.lastPathComponent), ["VTS_01_0.VOB"])
+        XCTAssertTrue(found.chains[1].hasIfo, "VTS_01_0.IFO があるのに hasIfo でない")
+        XCTAssertEqual(found.chains[1].label, "VTS_01 menu (VTS_01_0.VOB)")
+        // 本体のチェーンにメニューの VOB は混ざらない（part 1 から始まる）。
+        XCTAssertEqual(found.chains[2].partURLs.map(\.lastPathComponent), ["VTS_01_1.VOB"])
+    }
+
+    func testTitleMenuWithoutTitlesIsStillEnumeratedAndAZeroByteOneIsNot() throws {
+        let root = try tempTree(sized: [("VTS_03_0.VOB", 50),          // メニューだけの VTS（本体無し）
+                                        ("VTS_04_0.VOB", 0),           // 0 バイト（再生できない）
+                                        ("VTS_04_1.VOB", 200)])
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let found = VideoTsNavigator.chains(in: root) else { return XCTFail("VIDEO_TS が見付からない") }
+        XCTAssertEqual(found.chains.map(\.vtsNumber), [3, 4])
+        XCTAssertTrue(found.chains[0].isTitleMenu, "メニューだけの VTS が列挙されない")
+        XCTAssertFalse(found.chains[1].isMenu, "0 バイトの VTS_04_0.VOB をメニューとして列挙した")
+    }
+
     func testNoMenuMeansNoMenuChain() throws {
         // menu の無い盘（VTS だけ）では menu 項を作らない（first-play は従来どおり先頭タイトル）。
         let root = try tempTree(["VTS_08_1.VOB"])
@@ -140,8 +182,9 @@ final class VideoTsNavigatorTests: XCTestCase {
         XCTAssertFalse(found.chains.contains { $0.isMenu })
     }
 
-    func testVTSnn0MenuVOBsStayExcluded() throws {
-        // VTS_nn_0.VOB（VTS メニュー）は v1 のまま対象外（title 本体にしない。menu 項にもしない）。
+    func testTitleMenuVOBNeverJoinsTheTitleBodyAndAnEmptyOneIsNotAMenu() throws {
+        // VTS_nn_0.VOB（タイトルメニュー）は title 本体の連結に入らない。0 バイトのときは menu 項にもならない
+        // （中身のある VTS_nn_0.VOB は menu チェーンとして別に列挙される — 5b）。
         let root = try tempTree(["VTS_09_0.VOB", "VTS_09_1.VOB"])
         defer { try? FileManager.default.removeItem(at: root) }
         let found = VideoTsNavigator.chains(in: root)
