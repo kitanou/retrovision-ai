@@ -252,3 +252,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **検査**: 5 つの位相すべてで 10 frame 目にロックし位相が合う、全縞あり / 全縞なしの分類、9 frame ではロックしない、1 回の食い違いでは抜けず 2 連続で抜ける、telecine → 全縞ありで interlaced22 に落ち着く、根拠の再現性（`CadenceAnalyzerTests`）。
 - **未実装（A1 の残り）**: comb スコアを GPU の SAD kernel から取り出して analyzer へ流す配線、`.auto` の mode 選択（telecine → inverseTelecine）、inverseTelecine の復元と 2:3 提示、`CadenceDecision` の plan / 診断への記録。OQ-22（60i の film-origin pull-down）の実素材検証（#15）も要る。
 
+### 2026-11-17 — #5 A1b 修正: 実盤 ISO での点線状アーティファクト（動き検出の拡張と chroma の動き適応）
+
+- **発見（実盤 `PICHI_PICHI_PITCH1.ISO`、menu 11 秒）**: ユーザー提供の実 DVD の ISO を実アプリ窓（Metal 既定）で再生すると、動きの速い金属リングの輪郭に点線状の縞が出た（合成素材では出ていなかった）。
+- **原因と対処**: ① 動き指標が 1 画素ごとに weave / 空間内挿を切り替えていた → 左右 1 画素と上下の保持行まで広げた 3x3 の最大にして判定を空間的に連続させ、しきい値を `smoothstep(0.02, 0.07)` に下げた。② 4:2:0 の chroma はインターレースでは行が field 交互なのに、weave のまま素通しにしていたため、動く輪郭で色が交互にずれた（chroma upsampling error）→ 動く画素の chroma は、輝度で保持した field（偶数行）の chroma から補間する（静止画素は従来どおり weave）。
+- **確認**: 修正前後の実アプリ窓で同じ区間の輪郭を比較し、点線が消えたことを目視確認。`MetalPipelineTests` に chroma が動く画素でのみ補間されること（静止は weave のまま）を追加。
+- **G2 判定ではない**: 実素材 1 本・菜単 menu の 11 秒での目視確認で、combing の客観検査・present 間隔・GPU 時間は未実施。#15 の 7 本は未充足。
+

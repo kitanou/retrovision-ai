@@ -247,44 +247,71 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
 // 静止物を動きと誤判定しない）。しきい値は輝度 [0,1] 正規化値（video range の
 // 約 7〜23 階調）。前 frame が無い / 寸法が違うときは host 側が edge-directed に倒す。
 
+// 動き指標（輝度。前 frame との同位置差を、左右 1 画素・上下の保持行まで広げた 3x3 の最大）。
+// 1 画素ごとに weave / 空間内挿が切り替わると、動く edge に点線状の縞が出る（実盤 ISO で確認）。
+static float rv_motionAt(texture2d<float, access::read> inY,
+                         texture2d<float, access::read> prevY, int x, int y, int W, int H) {
+    int yu = max(y - 1, 0), yd = min(y + 1, H);
+    float motion = 0.0;
+    for (int dx = -1; dx <= 1; dx++) {
+        uint sx = uint(clamp(x + dx, 0, W));
+        motion = max(motion, fabs(inY.read(uint2(sx, uint(y))).r - prevY.read(uint2(sx, uint(y))).r));
+        motion = max(motion, fabs(inY.read(uint2(sx, uint(yu))).r - prevY.read(uint2(sx, uint(yu))).r));
+        motion = max(motion, fabs(inY.read(uint2(sx, uint(yd))).r - prevY.read(uint2(sx, uint(yd))).r));
+    }
+    return motion;
+}
+
 kernel void rv_deint_motionAdaptive_v1(texture2d<float, access::read>  inY  [[texture(0)]],
                                        texture2d<float, access::read>  inUV [[texture(1)]],
                                        texture2d<float, access::write> outY [[texture(2)]],
                                        texture2d<float, access::write> outUV [[texture(3)]],
                                        texture2d<float, access::read>  prevY [[texture(4)]],
                                        uint2 gid [[thread_position_in_grid]]) {
-    uint w = outY.get_width();
-    uint h = outY.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    bool keepRow = (gid.y & 1u) == 0u;
-    if (keepRow) {
-        outY.write(inY.read(gid), gid);
-    } else {
-        int x = int(gid.x), y = int(gid.y);
-        int W = int(w) - 1, H = int(h) - 1;
-        int yu = max(y - 1, 0), yd = min(y + 1, H);
-        // 空間内挿（edge-directed と同じ）
-        int bestA = 0;
-        float bestCost = 1e30;
-        for (int a = -4; a <= 4; a++) {
-            float vu = inY.read(uint2(clamp(x + a, 0, W), yu)).r;
-            float vd = inY.read(uint2(clamp(x - a, 0, W), yd)).r;
-            float cost = fabs(vu - vd);
-            if (cost < bestCost) { bestCost = cost; bestA = a; }
+    int w = int(outY.get_width());
+    int h = int(outY.get_height());
+    int W = w - 1, H = h - 1;
+    int x = int(gid.x), y = int(gid.y);
+    if (x < w && y < h) {
+        bool keepRow = (y & 1) == 0;
+        if (keepRow) {
+            outY.write(inY.read(gid), gid);
+        } else {
+            int yu = max(y - 1, 0), yd = min(y + 1, H);
+            // 空間内挿（edge-directed と同じ）
+            int bestA = 0;
+            float bestCost = 1e30;
+            for (int a = -4; a <= 4; a++) {
+                float vu = inY.read(uint2(clamp(x + a, 0, W), yu)).r;
+                float vd = inY.read(uint2(clamp(x - a, 0, W), yd)).r;
+                float cost = fabs(vu - vd);
+                if (cost < bestCost) { bestCost = cost; bestA = a; }
+            }
+            float spatial = (inY.read(uint2(clamp(x + bestA, 0, W), yu)).r
+                             + inY.read(uint2(clamp(x - bestA, 0, W), yd)).r) * 0.5;
+            float weave = inY.read(gid).r;
+            float k = smoothstep(0.02, 0.07, rv_motionAt(inY, prevY, x, y, W, H));
+            outY.write(float4(mix(weave, spatial, k), 0.0, 0.0, 1.0), gid);
         }
-        float spatial = (inY.read(uint2(clamp(x + bestA, 0, W), yu)).r
-                         + inY.read(uint2(clamp(x - bestA, 0, W), yd)).r) * 0.5;
-        // 動き（前 frame との同位置差の最大。補間行と上下の保持行）
-        float weave = inY.read(gid).r;
-        float mc = fabs(weave - prevY.read(gid).r);
-        float mu = fabs(inY.read(uint2(gid.x, yu)).r - prevY.read(uint2(gid.x, yu)).r);
-        float md = fabs(inY.read(uint2(gid.x, yd)).r - prevY.read(uint2(gid.x, yd)).r);
-        float motion = max(mc, max(mu, md));
-        float k = smoothstep(0.03, 0.10, motion);
-        outY.write(float4(mix(weave, spatial, k), 0.0, 0.0, 1.0), gid);
     }
-    if (gid.x < w / 2u && gid.y < h / 2u) {
-        outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+    // 色（4:2:0）。インターレースでは chroma の行も field 交互（偶数行 = 上 field）なので、
+    // 動く画素の色を weave すると別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る
+    // （chroma upsampling error）。動く画素は、輝度で保持した field（偶数行）の chroma だけから
+    // 補間する。静止画素は従来どおり。
+    int cw = int(outUV.get_width());
+    int ch = int(outUV.get_height());
+    if (x < cw && y < ch) {
+        float2 weaveC = inUV.read(gid).rg;
+        float2 outC = weaveC;
+        if ((y & 1) == 1) {
+            float2 up = inUV.read(uint2(x, uint(max(y - 1, 0)))).rg;
+            float2 down = inUV.read(uint2(x, uint(min(y + 1, ch - 1)))).rg;
+            float2 spatialC = (up + down) * 0.5;
+            // 対応する輝度位置（2x, 2y の周辺）の動きを使う。
+            float k = smoothstep(0.02, 0.07, rv_motionAt(inY, prevY, min(2 * x, W), min(2 * y, H), W, H));
+            outC = mix(weaveC, spatialC, k);
+        }
+        outUV.write(float4(outC.x, outC.y, 0.0, 1.0), gid);
     }
 }
 

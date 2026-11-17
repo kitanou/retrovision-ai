@@ -354,6 +354,45 @@ final class MetalPipelineTests: XCTestCase {
         XCTAssertLessThan(Int(moving[4][10].r), 110)
     }
 
+    /// 色（4:2:0）も field 交互: 偶数 chroma 行 = Cb 100、奇数 chroma 行 = Cb 156。輝度は平坦。
+    /// 静止なら weave（奇数行は 156 のまま）、動きなら偶数行の chroma から補間（奇数行も 100 側に寄る）。
+    private func renderChromaStripes(previousLuma: UInt8) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        let w = 32, h = 32
+        func make(luma: UInt8) throws -> CVPixelBuffer {
+            try makeNV12(width: w, height: h,
+                         luma: { _ in [UInt8](repeating: luma, count: w) },
+                         chroma: { row in
+                // chroma 行は 1 行 = (Cb, Cr) × (w/2) 画素。偶数行 Cb=100 / 奇数行 Cb=156、Cr=128。
+                (0..<(w / 2)).flatMap { _ in [UInt8(row % 2 == 0 ? 100 : 156), UInt8(128)] }
+            })
+        }
+        let cur = try make(luma: 128)
+        var input = progressiveInput(cur, width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22,
+                                        fieldSource: .formatDescription)
+        input.previousPixelBuffer = previousLuma == 128 ? cur : try make(luma: previousLuma)
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(9), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .motionAdaptive)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        _ = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        return readBack(target)
+    }
+
+    func testMotionAdaptiveInterpolatesChromaOnlyWhereThePixelMoves() throws {
+        guard gpuGate() else { return }
+        let still = try renderChromaStripes(previousLuma: 128)    // 前 frame と同じ → 静止
+        let moving = try renderChromaStripes(previousLuma: 40)    // 前 frame と大きく違う → 動き
+        // 輝度 row 6 は chroma 行 3（奇数）、row 4 は chroma 行 2（偶数）。青成分に Cb の差が出る。
+        let stillGap = abs(Int(still[6][10].b) - Int(still[4][10].b))
+        let movingGap = abs(Int(moving[6][10].b) - Int(moving[4][10].b))
+        XCTAssertGreaterThan(stillGap, 20, "静止は chroma を weave（偶数行と奇数行の色が違うまま）")
+        XCTAssertLessThan(movingGap, 6, "動きは偶数行の chroma から補間（奇数行も偶数行と同じ色になる）")
+    }
+
     // MARK: - 5c. highQuality スケール（拡大時は bicubic。エッジが bilinear より鋭い）
 
     private func renderStepEdge(filter: ScaleParameters.ScaleFilter, targetSize: Int) throws -> [UInt8] {
