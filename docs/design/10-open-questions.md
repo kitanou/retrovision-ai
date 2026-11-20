@@ -353,3 +353,11 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **決定（操作）**: `PlayerEngine` に `isMenuActive` / `menuInput(_:)`（矢印・決定・ポインタ）。App は矢印キー（メニュー有効時はメニュー優先、でなければ従来の 5 秒移動・音量）、Return、マウスの移動・クリックを転送。ポインタは映像と同じ geometry の逆引きで 720x480 の座標へ直す（`OverlayMapping`）。
 - **動作の実行**: JumpVTS_PTT / JumpVTS_TT のみ。本体の item（ItemID(vts)）へ切り替え、IFO の時刻（`startTime`）へ seek して再生。条件つき・PGC 内リンク・レジスタ命令は未対応（何もしない）。
 - **確認**: 合成盤（`Scripts/gen-menu-fixture.py` → `fixtures/generated/dvd-menu-01`）で、アプリを起動し、オーバーレイの表示・矢印での選択移動・Return での本体への移動を目視と transport ログで確認。**未確認**: マウス操作、実盤（PICHI）でのアプリ上の表示と操作、複数 PGC・ボタンの強制選択・ハイライトの切り替え（hli_ss ≠ 1）。
+
+### 2026-11-20 — #3 B2 第 7 段: VM（レジスタとコマンド評価）
+
+- **決定**: `DVDVM`（RVMediaSources）。GPRM 16 / SPRM 24 と、type 0〜3 の評価（条件 v1〜v3、Goto / Break / Jump / Call / Link、Set の mov・swp・add・sub・mul・div・mod・rnd・and・or・xor、SetSTN / SetNVTMR / SetMode / SetHL_BTNN）。type 4〜6 は評価せず `unsupported` に数える。ビット位置は libdvdnav vmcmd.c の逆アセンブラ側から読み、実盤 PICHI のメニュー PGC の PRE 30 命令が「GPRM15 = ボタン << 10 → SetHL_BTNN → LinkCN のボタン欄で選択」という意味どおりに読めることで裏づけた。
+- **未確認（前提）**: 演算の飽和（add・mul は 0xFFFF、sub は 0）と 0 除算（何もしない）、type 4〜6 の比較と代入のビットの重なり、eval 側の SPRM 添字の取り方（libdvdnav のページが eval 部を含まず、逆アセンブラ側のみ）。
+- **接続**: メニューの表示前に PGC の PRE を評価して初期の選択ボタン（SPRM 8）を決め、ボタンの決定は VM で評価（条件つき・Set・Link に対応。リンクのボタン欄は選択に反映）。実盤 PICHI では初期選択は従来と同じ 1 番（画面で確認）。
+- **取り込みの訂正**: #50 は #49 の取り込み後に積み先のブランチへ入ったため main に入っていなかった。同じ 2 コミットを main へ載せ直した（本 PR）。
+- **次**: タイトルの PGC の POST / CELL（本編の終わり → メニューへ戻る）と、`link` の実行（メニュー内のセル / PGC リンク）。

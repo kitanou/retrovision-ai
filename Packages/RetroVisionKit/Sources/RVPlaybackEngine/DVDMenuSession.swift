@@ -32,11 +32,15 @@ final class DVDMenuSession {
     let vtsNumber: Int
     let codedWidth: Int, codedHeight: Int
     private(set) var state: DVDMenuState
+    private(set) var registers = DVDRegisters.initial()
 
     init(data: DVDMenuData, item: ItemID, vtsNumber: Int) {
         self.data = data; self.item = item; self.vtsNumber = vtsNumber
         self.codedWidth = data.canvasWidth; self.codedHeight = data.canvasHeight
         self.state = DVDMenuState(highlight: data.pci.highlight)
+        // メニューの PRE コマンドを評価して、初期のボタン選択（SPRM 8）を決める。
+        _ = DVDVM.run(data.preCommands, registers: &registers)
+        state.select(button: registers.highlightedButton)
     }
 
     func render() -> OverlayImage { DVDMenuOverlayRenderer.render(data, state: state) }
@@ -49,14 +53,14 @@ final class DVDMenuSession {
         case .down: return state.move(.down) ? .redraw : .unchanged
         case .left: return state.move(.left) ? .redraw : .unchanged
         case .right: return state.move(.right) ? .redraw : .unchanged
-        case .activate: return .action(state.activate())
+        case .activate: return .action(state.activate(registers: &registers))
         case let .pointer(x, y, w, h, click):
             guard let aspect,
                   let p = OverlayMapping.canvasPoint(viewX: x, viewY: y, viewWidth: w, viewHeight: h, aspect: aspect,
                                                      codedWidth: codedWidth, codedHeight: codedHeight),
                   state.button(atX: p.x, y: p.y) != nil else { return .unchanged }
             let moved = state.select(atX: p.x, y: p.y)
-            if click { return .action(state.activate()) }
+            if click { return .action(state.activate(registers: &registers)) }
             return moved ? .redraw : .unchanged
         }
     }

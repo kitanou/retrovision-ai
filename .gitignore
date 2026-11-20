@@ -9,3 +9,4 @@ bench/captures/
 .venv-tools/
 __pycache__/
 /build/
+fixtures/local/

@@ -19,6 +19,8 @@ struct DVDMenuData: Sendable {
     let pci: DVDNavPCI
     let subpicture: Subpicture
     let titleSet: DVDTitleSetInfo
+    /// メニューの PGC のコマンド表（PRE = 表示前に評価して、ボタンの初期選択などを決める）。
+    let preCommands: [[UInt8]]
     /// メニューのパレット 16 色（0x00 Y Cr Cb）。
     let palette: [UInt32]
     /// 映像の coded frame の寸法（オーバーレイ画の寸法。DVD は 720x480 / 720x576）。
@@ -38,7 +40,8 @@ struct DVDMenuData: Sendable {
         let menu = titleSet.menus.first { $0.menuType == 3 } ?? titleSet.menus.first
         let palette = menu.map(\.pgc.palette).flatMap { $0.count == 16 ? $0 : nil }
             ?? (0..<16).map { UInt32(0x00_00_80_80) | UInt32(16 + $0 * 14) << 16 }
-        return DVDMenuData(pci: pci, subpicture: subpicture, titleSet: titleSet, palette: palette,
+        return DVDMenuData(pci: pci, subpicture: subpicture, titleSet: titleSet,
+                           preCommands: menu?.pgc.preCommands ?? [], palette: palette,
                            canvasWidth: canvasWidth, canvasHeight: canvasHeight)
     }
 }
