@@ -184,21 +184,26 @@ public actor CoreMLModelRuntime: ModelRuntimeProtocol {
             throw PlaybackError.model(.disabledByBreaker, message: "連続失敗のため AI 処理を一時停止しています",
                                       recovery: .retryWith(.lowerTier))
         }
-        guard input.width == spec.width, input.height == spec.height, input.channels == 3 else {
+        let accepted = entry.manifest.acceptedInputSizes
+        guard input.channels == 3, accepted.contains(.init(width: input.width, height: input.height)) else {
             if tracker.breaker.state == .halfOpen { tracker.recordSuccess(latencyMS: 0, atSeconds: Self.seconds()) }
             health[request.model] = tracker
+            let list = accepted.map { "\($0.width)x\($0.height)" }.joined(separator: " / ")
             throw PlaybackError.model(.shapeMismatch,
-                                      message: "入力寸法がモデルと一致しません（\(input.width)x\(input.height) / 必要 \(spec.width)x\(spec.height)）",
+                                      message: "入力寸法がモデルと一致しません（\(input.width)x\(input.height) / 受ける寸法 \(list)）",
                                       recovery: .retryWith(.lowerTier))
         }
-        guard let output = TensorFrame.make(width: outSpec.width, height: outSpec.height) else {
+        // 出力寸法 = 入力 × 倍率（EnumeratedShapes では入力ごとに変わる）。
+        let scale = max(entry.manifest.scaleFactor, 1)
+        let outWidth = input.width * scale, outHeight = input.height * scale
+        guard let output = TensorFrame.make(width: outWidth, height: outHeight) else {
             throw PlaybackError(kind: .render(.memoryLimit), recovery: .retryWith(.lowerTier),
                                 userMessage: "AI 段の出力 buffer を確保できません")
         }
         let started = HostTime.now()
         do {
-            let inArray = MLMultiArray(pixelBuffer: input.pixelBuffer, shape: [1, 3, spec.height, spec.width].map(NSNumber.init(value:)))
-            let outArray = MLMultiArray(pixelBuffer: output.pixelBuffer, shape: [1, 3, outSpec.height, outSpec.width].map(NSNumber.init(value:)))
+            let inArray = MLMultiArray(pixelBuffer: input.pixelBuffer, shape: [1, 3, input.height, input.width].map(NSNumber.init(value:)))
+            let outArray = MLMultiArray(pixelBuffer: output.pixelBuffer, shape: [1, 3, outHeight, outWidth].map(NSNumber.init(value:)))
             let provider = try MLDictionaryFeatureProvider(dictionary: [spec.name: MLFeatureValue(multiArray: inArray)])
             let options = MLPredictionOptions()
             options.outputBackings = [outSpec.name: outArray]

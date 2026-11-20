@@ -78,3 +78,30 @@ final class TensorPredictionTests: XCTestCase {
         }
     }
 }
+
+// MARK: - EnumeratedShapes（設計 11 D4）
+
+extension TensorPredictionTests {
+    func testEnumeratedModelAcceptsEachListedSizeAndRejectsOthers() async throws {
+        let runtime = CoreMLModelRuntime(modelsDirectory: modelsDirectory, options: .init(requireMeasurement: false))
+        let enumID = ModelID("test.tiny.sr2x.f16.enum@1")
+        try await runtime.load(enumID)
+        for (w, h) in [(24, 16), (32, 24)] {
+            let input = try XCTUnwrap(TensorFrame.make(width: w, height: h))
+            Self.write(input) { c, y, x in Float(c * 10 + y + x) / 100 }
+            let out = try await runtime.predictTensor(InferenceRequest(model: enumID, width: w, height: h, frameID: FrameID(1),
+                                                                       deadline: HostTime.now().advancing(ms: 5_000)), input: input)
+            XCTAssertEqual(out.width, w * 2); XCTAssertEqual(out.height, h * 2)
+            XCTAssertEqual(Self.read(out, c: 2, y: h * 2 - 1, x: w * 2 - 1),
+                           1 - Float(20 + (h - 1) + (w - 1)) / 100, accuracy: 2e-3, "\(w)x\(h)")
+        }
+        let other = try XCTUnwrap(TensorFrame.make(width: 20, height: 20))
+        do {
+            _ = try await runtime.predictTensor(InferenceRequest(model: enumID, width: 20, height: 20, frameID: FrameID(1),
+                                                                 deadline: HostTime.now().advancing(ms: 5_000)), input: other)
+            XCTFail("一覧に無い寸法が通った")
+        } catch let error as PlaybackError {
+            guard case .model(.shapeMismatch) = error.kind else { return XCTFail("\(error.kind)") }
+        }
+    }
+}

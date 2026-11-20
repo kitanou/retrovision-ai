@@ -158,6 +158,69 @@ kernel void rv_unpack_nchw_f16_v1(texture2d<float, access::read>  tensor [[textu
     rgb.write(float4(clamp(float3(r, g, b), 0.0, 1.0), 1.0), gid);
 }
 
+// ---------- SR のタイル（設計 11 §5.4、D4 の予備）: 切り出しと重みつき合成（GPU） ----------
+//
+// 切り出し: 全画面のテンソル（W×3H）から、(x, y) を左上とするタイル（tw×3th）を写す。
+// 合成: 各タイルの出力（tw·s × 3·th·s）を、出力全体の累積 texture（rgba32Float: rgb = Σ w·値、a = Σ w）へ
+// 足し込む。重みは TilePlan.axisWeight と同じ（隣と重なる側だけ、重なり幅で 0→1）。タイルごとの dispatch は
+// 同じ encoder 内で直列に実行される（既定の serial dispatch）。最後に正規化して planar のテンソルへ書く。
+
+struct TensorTileParams {
+    uint2 origin;      // 出力全体での左上（出力 px）
+    uint2 size;        // タイルの出力寸法
+    uint4 neighbours;  // x: 左あり、y: 右あり、z: 上あり、w: 下あり
+    uint ramp;         // 重なり幅（出力 px）
+    uint pad0, pad1, pad2;
+};
+
+kernel void rv_tensor_crop_v1(texture2d<float, access::read>  src  [[texture(0)]],
+                              texture2d<float, access::write> tile [[texture(1)]],
+                              constant uint2& origin [[buffer(0)]],
+                              constant uint2& srcSize [[buffer(1)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint tw = tile.get_width(), th = tile.get_height() / 3u;
+    if (gid.x >= tw || gid.y >= th) return;
+    for (uint c = 0; c < 3u; c++) {
+        float v = src.read(uint2(origin.x + gid.x, c * srcSize.y + origin.y + gid.y)).r;
+        tile.write(float4(v), uint2(gid.x, c * th + gid.y));
+    }
+}
+
+static float rv_tileAxisWeight(uint u, uint length, bool hasPrev, bool hasNext, uint ramp) {
+    float r = float(max(ramp, 1u)) + 1.0;
+    float w = 1.0;
+    if (hasPrev) { w = min(w, float(u + 1u) / r); }
+    if (hasNext) { w = min(w, float(length - u) / r); }
+    return w;
+}
+
+kernel void rv_tensor_tile_accumulate_v1(texture2d<float, access::read>       tile [[texture(0)]],
+                                         texture2d<float, access::read_write> acc  [[texture(1)]],
+                                         constant TensorTileParams& p [[buffer(0)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.size.x || gid.y >= p.size.y) return;
+    float w = rv_tileAxisWeight(gid.x, p.size.x, p.neighbours.x != 0u, p.neighbours.y != 0u, p.ramp)
+            * rv_tileAxisWeight(gid.y, p.size.y, p.neighbours.z != 0u, p.neighbours.w != 0u, p.ramp);
+    float3 v = float3(tile.read(uint2(gid.x, gid.y)).r,
+                      tile.read(uint2(gid.x, p.size.y + gid.y)).r,
+                      tile.read(uint2(gid.x, 2u * p.size.y + gid.y)).r);
+    uint2 o = p.origin + gid;
+    float4 cur = acc.read(o);
+    acc.write(float4(cur.rgb + w * v, cur.a + w), o);
+}
+
+kernel void rv_tensor_tile_resolve_v1(texture2d<float, access::read>  acc [[texture(0)]],
+                                      texture2d<float, access::write> out [[texture(1)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    uint w = acc.get_width(), h = acc.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float4 a = acc.read(gid);
+    float3 v = a.a > 0.0 ? a.rgb / a.a : float3(0.0);
+    out.write(float4(v.r), uint2(gid.x, gid.y));
+    out.write(float4(v.g), uint2(gid.x, gid.y + h));
+    out.write(float4(v.b), uint2(gid.x, gid.y + 2u * h));
+}
+
 // ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
 //
 // 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。

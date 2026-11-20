@@ -106,4 +106,112 @@ extension MetalRenderGraph {
             return (rgb, [rgb])
         }
     }
+
+    // MARK: タイル（設計 11 §5.4、D4 の予備。切り出しと合成を GPU で）
+
+    /// タイル 1 枚の置き場所（出力 px）と、隣のタイルの有無（重なり側だけ重みを下げる）。
+    public struct TensorTilePlacement: Sendable {
+        public var outputX: Int, outputY: Int
+        public var hasLeft: Bool, hasRight: Bool, hasTop: Bool, hasBottom: Bool
+        public init(outputX: Int, outputY: Int, hasLeft: Bool, hasRight: Bool, hasTop: Bool, hasBottom: Bool) {
+            self.outputX = outputX; self.outputY = outputY
+            self.hasLeft = hasLeft; self.hasRight = hasRight; self.hasTop = hasTop; self.hasBottom = hasBottom
+        }
+    }
+
+    /// 全画面のテンソルから、各タイル（`tiles[i]` の寸法）を `origins[i]`（入力 px）で切り出す。
+    public func cropTensorTiles(_ source: TensorTexture, origins: [(x: Int, y: Int)], into tiles: [TensorTexture],
+                                completed: @escaping (Result<Void, PlaybackError>) -> Void) throws {
+        precondition(origins.count == tiles.count)
+        guard let command = context.commandQueue.makeCommandBuffer(),
+              let enc = command.makeComputeCommandEncoder() else {
+            throw PlaybackError(kind: .render(.deviceUnavailable), recovery: .retryWith(.lowerTier),
+                                userMessage: "command buffer を作成できません")
+        }
+        let pso = try context.computePipeline(function: "rv_tensor_crop_v1", label: "tensor_crop")
+        enc.setComputePipelineState(pso)
+        var srcSize = SIMD2<UInt32>(UInt32(source.width), UInt32(source.height))
+        for (origin, tile) in zip(origins, tiles) {
+            var o = SIMD2<UInt32>(UInt32(origin.x), UInt32(origin.y))
+            enc.setTexture(source.texture, index: 0)
+            enc.setTexture(tile.texture, index: 1)
+            enc.setBytes(&o, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 0)
+            enc.setBytes(&srcSize, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
+            enc.dispatchThreads(MTLSize(width: tile.width, height: tile.height, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        }
+        enc.endEncoding()
+        command.addCompletedHandler { cb in
+            _ = source; _ = tiles
+            completed(cb.error.map { .failure(PlaybackError(kind: .render(.drawableLost), causeDescription: String(describing: $0),
+                                                            recovery: .retryWith(.lowerTier), userMessage: "GPU 処理が完了しませんでした")) }
+                      ?? .success(()))
+        }
+        command.commit()
+    }
+
+    /// タイルの出力を重みつきで合成して `output`（全体の出力寸法のテンソル）へ書く。`rampPixels` は重なり幅（出力 px）。
+    public func composeTensorTiles(_ tiles: [TensorTexture], placements: [TensorTilePlacement], rampPixels: Int,
+                                   into output: TensorTexture,
+                                   completed: @escaping (Result<Void, PlaybackError>) -> Void) throws {
+        precondition(tiles.count == placements.count)
+        let w = output.width, h = output.height
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        guard let acc = context.device.makeTexture(descriptor: desc),
+              let command = context.commandQueue.makeCommandBuffer(),
+              let blit = command.makeBlitCommandEncoder() else {
+            throw PlaybackError(kind: .render(.memoryLimit), recovery: .retryWith(.lowerTier),
+                                userMessage: "タイル合成の texture を確保できません")
+        }
+        // 累積 texture を 0 で初期化する（private storage は内容不定）。
+        let zeros = context.device.makeBuffer(length: w * h * 16, options: .storageModePrivate)!
+        blit.fill(buffer: zeros, range: 0..<zeros.length, value: 0)
+        blit.copy(from: zeros, sourceOffset: 0, sourceBytesPerRow: w * 16, sourceBytesPerImage: w * h * 16,
+                  sourceSize: MTLSize(width: w, height: h, depth: 1), to: acc, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        guard let enc = command.makeComputeCommandEncoder() else {
+            throw PlaybackError(kind: .render(.deviceUnavailable), recovery: .retryWith(.lowerTier), userMessage: "encoder を作れません")
+        }
+        let accumulate = try context.computePipeline(function: "rv_tensor_tile_accumulate_v1", label: "tensor_tile_accumulate")
+        let resolve = try context.computePipeline(function: "rv_tensor_tile_resolve_v1", label: "tensor_tile_resolve")
+        enc.setComputePipelineState(accumulate)
+        for (tile, place) in zip(tiles, placements) {
+            var params = TensorTileParams(
+                origin: SIMD2(UInt32(place.outputX), UInt32(place.outputY)),
+                size: SIMD2(UInt32(tile.width), UInt32(tile.height)),
+                neighbours: SIMD4(place.hasLeft ? 1 : 0, place.hasRight ? 1 : 0, place.hasTop ? 1 : 0, place.hasBottom ? 1 : 0),
+                ramp: UInt32(max(rampPixels, 1)), pad0: 0, pad1: 0, pad2: 0)
+            enc.setTexture(tile.texture, index: 0)
+            enc.setTexture(acc, index: 1)
+            enc.setBytes(&params, length: MemoryLayout<TensorTileParams>.stride, index: 0)
+            enc.dispatchThreads(MTLSize(width: tile.width, height: tile.height, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            enc.memoryBarrier(resources: [acc])   // 重なり部分の読み書きを前のタイルの後にする
+        }
+        enc.setComputePipelineState(resolve)
+        enc.setTexture(acc, index: 0)
+        enc.setTexture(output.texture, index: 1)
+        enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        enc.endEncoding()
+        command.addCompletedHandler { cb in
+            _ = tiles; _ = output; _ = acc; _ = zeros
+            completed(cb.error.map { .failure(PlaybackError(kind: .render(.drawableLost), causeDescription: String(describing: $0),
+                                                            recovery: .retryWith(.lowerTier), userMessage: "GPU 処理が完了しませんでした")) }
+                      ?? .success(()))
+        }
+        command.commit()
+    }
 }
+
+/// `rv_tensor_tile_accumulate_v1` の引数（Shaders.swift の `TensorTileParams` と同じ並び）。
+struct TensorTileParams {
+    var origin: SIMD2<UInt32>
+    var size: SIMD2<UInt32>
+    var neighbours: SIMD4<UInt32>
+    var ramp: UInt32
+    var pad0: UInt32, pad1: UInt32, pad2: UInt32
+}
+

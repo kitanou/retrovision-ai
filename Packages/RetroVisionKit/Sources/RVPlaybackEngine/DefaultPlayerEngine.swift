@@ -173,7 +173,8 @@ public final class DefaultPlayerEngine: PlayerEngine {
         let tiling = MLEnhancementStage.Tiling(
             tileWidth: model.input.width, tileHeight: model.input.height,
             overlap: min(16, max(0, min(model.input.width, model.input.height) / 2 - 1)),
-            scale: max(1, model.scaleFactor), io: model.input.kind == .tensor ? .tensor : .image)
+            scale: max(1, model.scaleFactor), io: model.input.kind == .tensor ? .tensor : .image,
+            fullFrameSizes: model.acceptedInputSizes.map { PixelSize(width: Int32($0.width), height: Int32($0.height)) })
         pendingEnhancement = (runtime, model.modelID, tiling)
         metalPresenter?.setEnhancement(runtime: runtime, model: model.modelID, tiling: tiling)
         await core.setModelRuntime(runtime, models: [model.modelID], manifests: [model])
