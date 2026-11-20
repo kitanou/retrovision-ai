@@ -361,3 +361,18 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **接続**: メニューの表示前に PGC の PRE を評価して初期の選択ボタン（SPRM 8）を決め、ボタンの決定は VM で評価（条件つき・Set・Link に対応。リンクのボタン欄は選択に反映）。実盤 PICHI では初期選択は従来と同じ 1 番（画面で確認）。
 - **取り込みの訂正**: #50 は #49 の取り込み後に積み先のブランチへ入ったため main に入っていなかった。同じ 2 コミットを main へ載せ直した（本 PR）。
 - **次**: タイトルの PGC の POST / CELL（本編の終わり → メニューへ戻る）と、`link` の実行（メニュー内のセル / PGC リンク）。
+
+### 2026-11-20 — 設計 11（アップスケール）の D3〜D5 を推奨どおり決定、P2: 16 bit テンソルの橋渡し
+
+- **決定（ユーザー）**: D3 = SR の入出力は 16 bit 浮動小数、D4 = 全画面の固定寸法（入力の種類ごと）を第 1 案・GPU タイルを予備、D5 = 先読みキュー（提示は待たない）。
+- **P2 の実装**: SR の入出力を NCHW の planar fp16（`kCVPixelFormatType_OneComponent16Half`、IOSurface 付き、幅 W × 高さ 3H）にした。Core ML 側は `MLMultiArray(pixelBuffer:shape:)` で包み、出力は `outputBackings` に呼び出し側の buffer を渡す（SDK のヘッダで API を確認）。Metal 側は同じ buffer を r16Float の texture として読み書きする（`rv_pack_nchw_f16_v1` / `rv_unpack_nchw_f16_v1`）。manifest の `input.kind == tensor` のモデルがこの経路を通り、`image` のモデルは従来の BGRA8 + CPU タイルのまま。
+- **検査**: tiny model `test.tiny.sr2x.f16`（入力 [1,3,16,24] → 「1 − x」を最近傍で 2 倍。`Scripts/make-tiny-sr-model.py`、重みなし 20 KB）で、Core ML の往復（全チャネル・位置、誤差 2e-3）と、Metal → Core ML → Metal の通し（全画素 ±3）を確認。
+- **未実施**: 橋渡しのコストを SR と分けて測ること（06 §4）、ANE で実際にコピー無しになるかの確認（tiny model は CPU 指定）、取り込み域とモデル寸法が違う場合（P3 の EnumeratedShapes / GPU タイル）。
+- **P3（同日）**: manifest に `constraints.enumeratedSizes`（全画面で受ける入力寸法の一覧）を追加した。取り込み域が一覧の寸法なら全画面で 1 回推論し、そうでなければ GPU のタイルに倒す。タイルの切り出し（`rv_tensor_crop_v1`）と重み付き合成（`rv_tensor_tile_accumulate_v1` → `rv_tensor_tile_resolve_v1`。重みは `TilePlan` と同じ式）は compute で行い、CPU では画素を触らない。検査: EnumeratedShapes の tiny model（16×24 / 24×32）が両寸法を受けて他を拒否する。40×24 を 24×16 のタイル 4 枚（重なり 8 px）で処理した出力が、全画素で「1 − 入力」の 2 倍と fp16 の誤差内（2e-3 未満）で一致する（継ぎ目なし）。既存の BGRA8 の image 経路（CPU タイル）はそのまま残る。
+- **P4（同日）: 先読みキュー（D5）**: session が復号直後（`acceptFrame`）に `VideoFramePresenter.prepare` を復号順に同期で呼び、presenter が直列 queue の上で入力（telecine の判断・前 frame）を 1 回だけ組み立てて、AI 段の推論を始める（同時 2 本まで）。提示（`present`）は推論を待たず、結果が（世代, FrameID, PTS）で見つかり planHash が一致すれば強調、そうでなければ理由別に数えて非強調で出す（notReady / skippedBusy / fellBack / notPrepared / suspended。保存則 eligible = enhanced + 各理由をテストで固定）。シーク・presenter の付け替え・層の取り外しで世代を進めて捨てる。最初に強調して提示するまでは取りこぼしを数えず、その後 1 秒の窓で 5% を超えたら 10 秒止める（窓・率・時間・時計は注入できる）。速度 ≠ 1 では始めない。一時停止・終端・コマ送りの後は最後の frame を期限なしで強調して描き直す（`refineLastFrame`。後から来た提示で取り消す）。
+- **P4 の未確認・既知**: A/V のずれが変わらないことは、session の drift 計測が `presentDue` で取るため SR の待ちを見ておらず、この計測では示せない（`present` が待たないことはテストで確認）。実機での目視は未実施。コマ送り後の強調は 100 ms 待ってから始める暫定。`FrameBudget` の 2 本化（占有時間と遅延）と、毎 frame のテンソル確保のプール化は後続。
+- **P4 の実再生での確認（同日）**: `DefaultPlayerEngine` で合成素材（`ntsc480i-22-01.mpg`、180 frame、29.97i）を、推論ほぼ 0 秒の偽の実行層で再生した。session の先読みは `maxQueuedFrames = 4`。
+  - 初版の結果: 強調 12 / 停止 2 回。原因は 2 つ。復号は 4 frame まとめて進むのに推論は同時 2 本までで、3 本目が `skippedBusy` になった。取りこぼしの判定が 10 サンプルからで、1 枚で 10% と判定した。
+  - 直したこと: 上限を超えた推論は捨てずに待ち行列（4 まで）へ入れる。判定は 1 秒ぶん（30 サンプル）揃ってから。plan 違い・先読みなしの提示は取りこぼしに数えない。
+  - 結果: テンソル経路で強調 178 / 180（残り 2 は plan 昇格前の frame）、停止 0。
+  - **従来の image 経路（BGRA8 + CPU タイル）**は、同じ即時推論でも debug ビルドで強調 0（`skippedBusy` 152・`notReady` 26。初版の判定で測定）。CPU での切り出し・合成が先読みの約 133 ms に間に合わない。実時間の SR はテンソル経路（P2・P3）を前提にする。

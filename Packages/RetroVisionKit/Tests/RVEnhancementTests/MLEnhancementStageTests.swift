@@ -141,3 +141,139 @@ final class MLEnhancementStageTests: XCTestCase {
         }
     }
 }
+
+// MARK: - 16 bit テンソル経路（設計 11 §5.3・§5.4・P2）
+
+extension MLEnhancementStageTests {
+    /// Metal → fp16 NCHW → Core ML（tiny: 1 − x を最近傍 2 倍）→ fp16 → 最終拡大。
+    /// SR 出力（48x32）を同寸法へ描くので、出力 (X, Y) は通常の描画（24x16）の (X/2, Y/2) の 255 − x になる。
+    func testTensorPathRoundTripThroughCoreMLAtTwiceTheSize() async throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "Metal device が無い")
+        let context = try MetalRenderContext(device: device)
+        let graph = try MetalRenderGraph(context: context)
+        let runtime = CoreMLModelRuntime(modelsDirectory: modelsDirectory, options: .init(requireMeasurement: false))
+        let srID = ModelID("test.tiny.sr2x.f16@1")
+        try await runtime.load(srID)
+
+        let w = 24, h = 16
+        let aspect = AspectResolution(targetDAR: AspectRatio(w: 3, h: 2),
+                                      cleanAperture: PixelRect(x: 0, y: 0, width: Int32(w), height: Int32(h)),
+                                      source: .sampleAspectOnly)
+        let input = RenderFrameInput(pixelBuffer: try makeNV12(width: w, height: h), color: .unspecified,
+                                     interlace: .progressive, aspect: aspect, frameID: FrameID(1))
+        let plan = RenderPlan(id: PlanID(2), tier: .lightML,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: aspect, present: .offscreen))
+        func target(_ tw: Int, _ th: Int) throws -> any MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: tw, height: th, mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead]; d.storageMode = .shared
+            return try XCTUnwrap(device.makeTexture(descriptor: d))
+        }
+        let plain = try target(w, h)
+        _ = try graph.render(input, plan: plan, to: plain)
+
+        let stage = MLEnhancementStage(graph: graph, runtime: runtime, model: srID,
+                                       tiling: .init(tileWidth: w, tileHeight: h, overlap: 0, scale: 2, io: .tensor))
+        guard case .tensor(let out) = try await stage.enhanceFrame(input, plan: plan, frameID: FrameID(1),
+                                                                    deadline: HostTime.now().advancing(ms: 10_000)) else {
+            return XCTFail("テンソル経路にならなかった")
+        }
+        XCTAssertEqual(out.width, w * 2); XCTAssertEqual(out.height, h * 2)
+        let ai = try target(w * 2, h * 2)
+        try graph.presentTensor(out, aspect: aspect, to: ai)
+        let drain = try XCTUnwrap(context.commandQueue.makeCommandBuffer()); drain.commit(); await drain.completed()
+
+        let a = bytes(plain), b = bytes(ai)
+        var maxError = 0
+        for y in 0..<(h * 2) { for x in 0..<(w * 2) { for c in 0..<3 {
+            let expected = 255 - Int(a[((y / 2) * w + x / 2) * 4 + c])
+            maxError = max(maxError, abs(Int(b[(y * w * 2 + x) * 4 + c]) - expected))
+        } } }
+        // fp16 の往復・8 bit の丸め・ディザ（±0.5 LSB）を見込んで ±3。
+        XCTAssertLessThanOrEqual(maxError, 3, "テンソル経路の結果が 1 − x の 2 倍と違う（最大誤差 \(maxError)）")
+    }
+
+    func testTensorPathRejectsAnApertureSmallerThanTheTile() async throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let graph = try MetalRenderGraph(context: try MetalRenderContext(device: device))
+        let runtime = CoreMLModelRuntime(modelsDirectory: modelsDirectory, options: .init(requireMeasurement: false))
+        let aspect = AspectResolution(targetDAR: AspectRatio(w: 1, h: 1), cleanAperture: PixelRect(x: 0, y: 0, width: 16, height: 16),
+                                      source: .sampleAspectOnly)
+        let input = RenderFrameInput(pixelBuffer: try makeNV12(width: 16, height: 16), color: .unspecified,
+                                     interlace: .progressive, aspect: aspect, frameID: FrameID(1))
+        let plan = RenderPlan(id: PlanID(3), tier: .lightML,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: 16, height: 16), aspect: aspect, present: .offscreen))
+        // 16x16 は 24x16 のタイルで覆えない（全画面の寸法でもない）→ shapeMismatch（推論の前に止まる）。
+        let stage = MLEnhancementStage(graph: graph, runtime: runtime, model: ModelID("test.tiny.sr2x.f16@1"),
+                                       tiling: .init(tileWidth: 24, tileHeight: 16, overlap: 0, scale: 2, io: .tensor))
+        do {
+            _ = try await stage.enhanceFrame(input, plan: plan, frameID: FrameID(1), deadline: HostTime.now().advancing(ms: 1_000))
+            XCTFail("タイルより小さい取り込み域が通った")
+        } catch let error as PlaybackError {
+            guard case .model(.shapeMismatch) = error.kind else { return XCTFail("\(error.kind)") }
+        }
+    }
+}
+
+// MARK: - 全画面の固定寸法 / GPU タイル（設計 11 D4・P3）
+
+extension MLEnhancementStageTests {
+    private func tensorValue(_ t: TensorTexture, c: Int, y: Int, x: Int) -> Float {
+        let pb = t.pixelBuffer
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        let row = CVPixelBufferGetBaseAddress(pb)!.advanced(by: (c * t.height + y) * CVPixelBufferGetBytesPerRow(pb))
+        return Float(row.assumingMemoryBound(to: Float16.self)[x])
+    }
+
+    /// 取り込み域 w×h のテンソル（SR の入力そのもの）と、AI 段の出力テンソルを返す。
+    private func runTensorStage(model: ModelID, aperture w: Int, _ h: Int,
+                                tiling: MLEnhancementStage.Tiling) async throws -> (input: TensorTexture, output: TensorTexture) {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let graph = try MetalRenderGraph(context: try MetalRenderContext(device: device))
+        let runtime = CoreMLModelRuntime(modelsDirectory: modelsDirectory, options: .init(requireMeasurement: false))
+        try await runtime.load(model)
+        let aspect = AspectResolution(targetDAR: AspectRatio(w: Int32(w), h: Int32(h)),
+                                      cleanAperture: PixelRect(x: 0, y: 0, width: Int32(w), height: Int32(h)), source: .sampleAspectOnly)
+        let input = RenderFrameInput(pixelBuffer: try makeNV12(width: w, height: h), color: .unspecified,
+                                     interlace: .progressive, aspect: aspect, frameID: FrameID(1))
+        let plan = RenderPlan(id: PlanID(4), tier: .lightML,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)), aspect: aspect, present: .offscreen))
+        let reference = try XCTUnwrap(graph.importTensor(try XCTUnwrap(TensorFrame.make(width: w, height: h)).pixelBuffer))
+        let packed = expectation(description: "reference")
+        try graph.renderToTensor(input, plan: plan, into: reference) { _ in packed.fulfill() }
+        await fulfillment(of: [packed], timeout: 5)
+        let stage = MLEnhancementStage(graph: graph, runtime: runtime, model: model, tiling: tiling)
+        let out = try await stage.enhanceTensor(input, plan: plan, frameID: FrameID(1), deadline: HostTime.now().advancing(ms: 10_000))
+        return (reference, out)
+    }
+
+    /// 出力 (c, Y, X) が 1 − 入力 (c, Y/2, X/2) と全画素で一致する（継ぎ目・取り違えが無い）。
+    private func assertInvertedDouble(_ r: (input: TensorTexture, output: TensorTexture), file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(r.output.width, r.input.width * 2, file: file, line: line)
+        XCTAssertEqual(r.output.height, r.input.height * 2, file: file, line: line)
+        var maxError: Float = 0
+        for c in 0..<3 { for y in 0..<r.output.height { for x in 0..<r.output.width {
+            let expected = 1 - tensorValue(r.input, c: c, y: y / 2, x: x / 2)
+            maxError = max(maxError, abs(tensorValue(r.output, c: c, y: y, x: x) - expected))
+        } } }
+        XCTAssertLessThan(maxError, 2e-3, "最大誤差 \(maxError)", file: file, line: line)
+    }
+
+    func testEnumeratedModelRunsTheWholeFrameAtOnce() async throws {
+        let r = try await runTensorStage(model: ModelID("test.tiny.sr2x.f16.enum@1"), aperture: 32, 24,
+                                         tiling: .init(tileWidth: 24, tileHeight: 16, overlap: 8, scale: 2, io: .tensor,
+                                                       fullFrameSizes: [PixelSize(width: 24, height: 16), PixelSize(width: 32, height: 24)]))
+        assertInvertedDouble(r)
+    }
+
+    /// 寸法が合わないときは GPU のタイル（40x24 を 24x16 のタイル 4 枚、重なり 8 px）。継ぎ目の誤差が fp16 の精度内。
+    func testGPUTilesComposeWithoutSeams() async throws {
+        let r = try await runTensorStage(model: ModelID("test.tiny.sr2x.f16@1"), aperture: 40, 24,
+                                         tiling: .init(tileWidth: 24, tileHeight: 16, overlap: 8, scale: 2, io: .tensor))
+        assertInvertedDouble(r)
+    }
+}

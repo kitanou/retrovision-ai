@@ -75,9 +75,18 @@ public struct ModelManifest: Codable, Sendable, Hashable, Identifiable {
         public var multipleOf: Int
         public var maxPixels: Int
         public var allowsDynamicShape: Bool
-        public init(multipleOf: Int = 16, maxPixels: Int = 4_194_304, allowsDynamicShape: Bool = false) {
+        /// 全画面の固定寸法を複数受けるモデル（Core ML の EnumeratedShapes。設計 11 D4）の、受ける入力寸法。
+        /// nil は `input.width × input.height` の 1 種類だけ。
+        public var enumeratedSizes: [Size]?
+        public struct Size: Codable, Sendable, Hashable {
+            public var width: Int, height: Int
+            public init(width: Int, height: Int) { self.width = width; self.height = height }
+        }
+        public init(multipleOf: Int = 16, maxPixels: Int = 4_194_304, allowsDynamicShape: Bool = false,
+                    enumeratedSizes: [Size]? = nil) {
             self.multipleOf = multipleOf; self.maxPixels = maxPixels
             self.allowsDynamicShape = allowsDynamicShape
+            self.enumeratedSizes = enumeratedSizes
         }
     }
 
@@ -176,6 +185,38 @@ public struct InferenceFrame: @unchecked Sendable {
     public init(_ pixelBuffer: CVPixelBuffer) { self.pixelBuffer = pixelBuffer }
 }
 
+/// NCHW の planar テンソル（16 bit 浮動小数、IOSurface 付き。設計 11 §5.4）。
+/// `kCVPixelFormatType_OneComponent16Half` の buffer で、幅 = W、高さ = C × H（チャネルを縦に積む）。
+/// Core ML には `MLMultiArray(pixelBuffer:shape:)` でコピー無しに渡し、Metal からは r16Float の texture として読み書きする。
+extension ModelManifest {
+    /// 全画面で受ける入力寸法（EnumeratedShapes の一覧、無ければ input の 1 種類）。
+    public var acceptedInputSizes: [Constraints.Size] {
+        constraints.enumeratedSizes ?? [Constraints.Size(width: input.width, height: input.height)]
+    }
+}
+
+public struct TensorFrame: @unchecked Sendable {
+    public let pixelBuffer: CVPixelBuffer
+    public let channels: Int
+    public var width: Int { CVPixelBufferGetWidth(pixelBuffer) }
+    public var height: Int { CVPixelBufferGetHeight(pixelBuffer) / max(channels, 1) }
+    public init(_ pixelBuffer: CVPixelBuffer, channels: Int = 3) {
+        self.pixelBuffer = pixelBuffer; self.channels = channels
+    }
+
+    /// IOSurface 付き・Metal 互換の空のテンソル。
+    public static func make(width: Int, height: Int, channels: Int = 3) -> TensorFrame? {
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        var pb: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height * channels, kCVPixelFormatType_OneComponent16Half,
+                                  attrs as CFDictionary, &pb) == kCVReturnSuccess, let pb else { return nil }
+        return TensorFrame(pb, channels: channels)
+    }
+}
+
 public protocol ModelRuntimeProtocol: Sendable {
     func discover() async -> [ModelManifest]
     func load(_ id: ModelID) async throws
@@ -184,4 +225,12 @@ public protocol ModelRuntimeProtocol: Sendable {
     /// deadline 超過・breaker open・shape 不一致は `PlaybackError.model(...)` で返す（再生は止めない）。
     func predict(_ request: InferenceRequest, input: InferenceFrame) async throws -> InferenceFrame
     func health(of id: ModelID) async -> ModelHealth
+    /// 1 frame の推論（テンソル入出力。manifest の input.kind == .tensor のモデル）。
+    func predictTensor(_ request: InferenceRequest, input: TensorFrame) async throws -> TensorFrame
+}
+
+extension ModelRuntimeProtocol {
+    public func predictTensor(_ request: InferenceRequest, input: TensorFrame) async throws -> TensorFrame {
+        throw PlaybackError.model(.conversionUnsupported, message: "この実行層はテンソル入出力に対応していません")
+    }
 }

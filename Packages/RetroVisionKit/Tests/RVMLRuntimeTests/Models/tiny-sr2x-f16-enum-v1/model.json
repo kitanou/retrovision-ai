@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "test.tiny.sr2x.f16.enum",
+  "revision": "1",
+  "displayName": "Tiny SR x2 fp16 tensor (contract test)",
+  "task": "superResolution",
+  "scaleFactor": 2,
+  "license": {
+    "spdx": "CC0-1.0",
+    "weightsLicense": "none (no weights)",
+    "outputRightsConfirmed": true
+  },
+  "compiledModel": "model.mlmodelc",
+  "checksum": "sha256:unset",
+  "input": {
+    "name": "image",
+    "kind": "tensor",
+    "width": 24,
+    "height": 16,
+    "pixelFormat": "RGB_NCHW",
+    "dataType": "float16"
+  },
+  "output": {
+    "name": "out",
+    "kind": "tensor",
+    "width": 48,
+    "height": 32,
+    "pixelFormat": "RGB_NCHW",
+    "dataType": "float16"
+  },
+  "constraints": {
+    "multipleOf": 8,
+    "maxPixels": 4194304,
+    "allowsDynamicShape": false,
+    "enumeratedSizes": [
+      {
+        "width": 24,
+        "height": 16
+      },
+      {
+        "width": 32,
+        "height": 24
+      }
+    ]
+  },
+  "computeUnitsPreference": "cpuOnly",
+  "memoryEstimateMB": 1,
+  "expectedLatencyMS": {
+    "p50": 1.0,
+    "p95": 2.0
+  }
+}
