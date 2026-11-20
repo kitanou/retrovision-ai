@@ -356,7 +356,8 @@ final class MetalPipelineTests: XCTestCase {
 
     /// 色（4:2:0）も field 交互: 偶数 chroma 行 = Cb 100、奇数 chroma 行 = Cb 156。輝度は平坦。
     /// 静止なら weave（奇数行は 156 のまま）、動きなら偶数行の chroma から補間（奇数行も 100 側に寄る）。
-    private func renderChromaStripes(previousLuma: UInt8) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+    private func renderChromaStripes(previousLuma: UInt8?, mode: DeinterlaceMode = .motionAdaptive,
+                                     order: FieldOrder = .topFirst) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
         let w = 32, h = 32
         func make(luma: UInt8) throws -> CVPixelBuffer {
             try makeNV12(width: w, height: h,
@@ -368,18 +369,40 @@ final class MetalPipelineTests: XCTestCase {
         }
         let cur = try make(luma: 128)
         var input = progressiveInput(cur, width: w, height: h)
-        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: .topFirst, cadence: .interlaced22,
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: order, cadence: .interlaced22,
                                         fieldSource: .formatDescription)
-        input.previousPixelBuffer = previousLuma == 128 ? cur : try make(luma: previousLuma)
+        if let previousLuma {
+            input.previousPixelBuffer = previousLuma == 128 ? cur : try make(luma: previousLuma)
+        }
         let target = try makeTarget(width: w, height: h)
         let plan = RenderPlan(id: PlanID(9), tier: .metalOnly,
-                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: .motionAdaptive)),
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: mode)),
                                        .init(stage: .colorConvert, parameters: ColorConvertParameters())],
                               output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
                                                      aspect: input.aspect, present: .offscreen))
         _ = try Self.graph.render(input, plan: plan, to: target)
         drainGPU()
         return readBack(target)
+    }
+
+    /// 前 frame が無いとき（先頭・シーク直後）の edgeDirected も、色を保持 field の chroma 行だけから作る（D8）。
+    func testEdgeDirectedTakesChromaFromTheKeptFieldOnly() throws {
+        guard gpuGate() else { return }
+        let out = try renderChromaStripes(previousLuma: nil, mode: .edgeDirected)
+        let gap = abs(Int(out[6][10].b) - Int(out[4][10].b))
+        XCTAssertLessThan(gap, 6, "奇数 chroma 行（別 field）の色が混ざっている: \(out[6][10]) vs \(out[4][10])")
+    }
+
+    /// bob は field 順序どおりの chroma 行を複製する（top-first = 偶数行の色、bottom-first = 奇数行の色）。
+    func testBobTakesChromaFromTheSameFieldAsLuma() throws {
+        guard gpuGate() else { return }
+        let top = try renderChromaStripes(previousLuma: nil, mode: .bob, order: .topFirst)
+        let bottom = try renderChromaStripes(previousLuma: nil, mode: .bob, order: .bottomFirst)
+        for row in [4, 6] {
+            XCTAssertLessThan(abs(Int(top[row][10].b) - Int(top[4][10].b)), 6, "top-first 行\(row)")
+            XCTAssertLessThan(abs(Int(bottom[row][10].b) - Int(bottom[6][10].b)), 6, "bottom-first 行\(row)")
+        }
+        XCTAssertGreaterThan(abs(Int(top[4][10].b) - Int(bottom[4][10].b)), 20, "順序で選ぶ field の色が変わる")
     }
 
     func testMotionAdaptiveInterpolatesChromaOnlyWhereThePixelMoves() throws {

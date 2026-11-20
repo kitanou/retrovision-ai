@@ -200,8 +200,10 @@ kernel void rv_deint_bob_v1(texture2d<float, access::read>  inY  [[texture(0)]],
     uint srcRow = (gid.y / 2u) * 2u + (topFieldFirst ? 0u : 1u);
     float v = inY.read(uint2(gid.x, srcRow)).r;
     outY.write(float4(v, 0.0, 0.0, 1.0), gid);
+    // 色も同じ field の chroma 行だけを行複製する（chroma 行も field 交互。輝度と同じ規則）。
     if (gid.x < w / 2u && gid.y < h / 2u) {
-        outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+        uint cSrc = min((gid.y / 2u) * 2u + (topFieldFirst ? 0u : 1u), h / 2u - 1u);
+        outUV.write(inUV.read(uint2(gid.x, cSrc)), uint2(gid.x, gid.y));
     }
 }
 
@@ -242,8 +244,19 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
         float vd = inY.read(uint2(clamp(x - bestA, 0, W), yd)).r;
         outY.write(float4((vu + vd) * 0.5, 0.0, 0.0, 1.0), gid);
     }
+    // 色（4:2:0）も field 交互（偶数 chroma 行 = 保持した上 field）。前 frame が無い = 全画素を
+    // 「動き」とみなすのと同じで、奇数 chroma 行は保持 field の上下の行から補間する（motion-adaptive の
+    // 動く画素と同じ規則。weave すると別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る）。
     if (gid.x < w / 2u && gid.y < h / 2u) {
-        outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+        int cy = int(gid.y), cH = int(h / 2u) - 1;
+        float2 c = inUV.read(gid).rg;
+        if ((cy & 1) == 1) {
+            float2 up = inUV.read(uint2(gid.x, uint(max(cy - 1, 0)))).rg;
+            float2 down = inUV.read(uint2(gid.x, uint(min(cy + 1, cH)))).rg;
+            // 下端で奇数行の下が無いときは上の行だけ（cy + 1 > cH なら down は自分 = 別 field なので使わない）
+            c = (cy + 1 <= cH) ? (up + down) * 0.5 : up;
+        }
+        outUV.write(float4(c.x, c.y, 0.0, 1.0), gid);
     }
 }
 
