@@ -18,7 +18,7 @@ import RVDecode
 //     現状契約）。deinit で best-effort 解除 + 明示 close() を用意する。
 //     解除漏れは UI からの取り出しで回収できる（実運用の eject と同じ）。
 
-public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
+public actor DiscImageMediaSource: MediaSource, DemuxerProviding, DVDMenuAssetProviding {
     public let isoURL: URL
     private var internalSource: VideoTsMediaSource?
     private var mountedDevice: String?   // /dev/diskN（eject 用）
@@ -61,6 +61,10 @@ public actor DiscImageMediaSource: MediaSource, DemuxerProviding {
             return await internalSource.makeDemuxer(itemId: itemId)
         }
         return AVFoundationDemuxer(url: isoURL)
+    }
+
+    public func menuAssets(for item: ItemID) async -> DVDMenuAssets? {
+        await internalSource?.menuAssets(for: item)
     }
 
     /// マウント解除（明示。deinit の best-effort とは別に、テストと UI の停止経路から呼ぶ）。

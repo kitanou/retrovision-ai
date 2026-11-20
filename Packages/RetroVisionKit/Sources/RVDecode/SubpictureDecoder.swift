@@ -29,6 +29,39 @@ public struct Subpicture: Sendable {
 }
 
 public enum SubpictureDecoder {
+    /// program stream（2048 byte の sector の並び）から、字幕ストリーム（private_stream_1 = 0xBD の
+    /// substream 0x20〜0x3F）の **最初の SPU 1 個分**を取り出す。SPU は複数の PES に分かれて届くので、
+    /// payload を順につなぎ、先頭 2 byte の全体サイズに達したところで切る（それより後ろは次の SPU）。
+    /// `substream` を指定すると、その ID（0x20〜0x3F）だけを対象にする。見つからなければ nil。
+    public static func firstUnit(fromProgramStream data: Data, substream: UInt8? = nil) -> Data? {
+        var unit = Data()
+        var expected: Int?
+        let sectorCount = data.count / 2048
+        for s in 0..<sectorCount {
+            let sector = [UInt8](data[(data.startIndex + s * 2048)..<(data.startIndex + (s + 1) * 2048)])
+            guard sector[0] == 0, sector[1] == 0, sector[2] == 1, sector[3] == 0xBA else { continue }
+            var i = 14 + Int(sector[13] & 0x07)
+            while i + 6 <= 2048, sector[i] == 0, sector[i + 1] == 0, sector[i + 2] == 1 {
+                let id = sector[i + 3]
+                let length = Int(sector[i + 4]) << 8 | Int(sector[i + 5])
+                let end = i + 6 + length
+                guard end <= 2048 else { break }
+                if id == 0xBD, length >= 4 {
+                    let headerDataLength = Int(sector[i + 8])
+                    let sub = i + 9 + headerDataLength
+                    if sub < end, (0x20...0x3F).contains(sector[sub]), substream == nil || sector[sub] == substream {
+                        unit.append(contentsOf: sector[(sub + 1)..<end])
+                        if expected == nil, unit.count >= 2 { expected = Int(unit[unit.startIndex]) << 8 | Int(unit[unit.startIndex + 1]) }
+                        if let expected, expected > 0, unit.count >= expected { return unit.prefix(expected) }
+                    }
+                }
+                i = end
+            }
+        }
+        // サイズに満たなくても、読めた分は返す（壊れた SPU は decode が nil を返す）。
+        return unit.isEmpty ? nil : unit
+    }
+
     /// private_stream_1 の PES payload（substream id の後ろ）を順につないだ SPU 1 個分から画を作る。
     /// 壊れた SPU は nil（呼び出し側は表示しない）。
     public static func decode(_ spu: Data) -> Subpicture? {

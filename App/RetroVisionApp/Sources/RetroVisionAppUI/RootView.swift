@@ -104,13 +104,16 @@ struct PlayerScreenView: View {
             model.attachSurface(layer)
         }
         let redraw: @MainActor () -> Void = { model.redrawSurface() }
+        let pointer: @MainActor (Double, Double, Double, Double, Bool) -> Void = { x, y, w, h, click in
+            model.menuPointer(x: x, y: y, width: w, height: h, click: click)
+        }
         if let aspect = model.displayAspectValue, aspect > 0 {
-            VideoSurfaceView(onLayer: attach, onResize: redraw, onActivity: { showControls() })
+            VideoSurfaceView(onLayer: attach, onResize: redraw, onActivity: { showControls() }, onPointer: pointer)
                 .aspectRatio(aspect, contentMode: .fit)
         } else {
             // 比率未解決のあいまは枠いっぱいに仮表示（最初の帧で解決され、直ちに枠が変わる。
             // unknown を 4:3 に倒さない — #17 の方針 4・01 §2 と同じ「推測で既定にしない」）。
-            VideoSurfaceView(onLayer: attach, onResize: redraw, onActivity: { showControls() })
+            VideoSurfaceView(onLayer: attach, onResize: redraw, onActivity: { showControls() }, onPointer: pointer)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
