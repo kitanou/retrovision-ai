@@ -325,6 +325,23 @@ final class PlayerViewModel {
         Task { await engine.seek(to: target, tolerance: .exact) }
     }
 
+    // MARK: DVD メニューの操作（メニューが表示されていれば、矢印・決定・マウスはメニューが受ける）
+
+    /// 矢印キー: メニューが処理すればそれで終わり、そうでなければ従来の動作（fallback）。
+    func arrowKey(_ input: MenuInput, fallback: @escaping @MainActor () -> Void) {
+        Task {
+            if await engine.menuInput(input) { return }
+            fallback()
+        }
+    }
+
+    func menuActivate() { Task { _ = await engine.menuInput(.activate) } }
+
+    func menuPointer(x: Double, y: Double, width: Double, height: Double, click: Bool) {
+        guard engine.isMenuActive else { return }
+        Task { _ = await engine.menuInput(.pointer(x: x, y: y, viewWidth: width, viewHeight: height, click: click)) }
+    }
+
     func skip(by seconds: Double) {
         let base = position.isValid ? position.seconds : 0
         let target = max(0, min(base + seconds, durationSeconds > 0 ? durationSeconds : base + seconds))
