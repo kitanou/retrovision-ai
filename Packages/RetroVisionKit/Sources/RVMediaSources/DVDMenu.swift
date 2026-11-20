@@ -42,6 +42,15 @@ public struct DVDMenuState: Sendable {
         }
     }
 
+    /// ボタン番号で選ぶ（VM の SPRM 8 = 初期選択・リンクのボタン欄）。存在しない番号・0 は無視。変わったら true。
+    @discardableResult
+    public mutating func select(button number: Int) -> Bool {
+        guard number != 0, number != selectedButton, highlight.button(numbered: number) != nil else { return false }
+        selectedButton = number
+        isActivated = false
+        return true
+    }
+
     public var selected: DVDButton? { selectedButton.flatMap { highlight.button(numbered: $0) } }
 
     /// 矢印キー。隣が無い（0）・存在しないボタンなら動かない。動いたら true。
@@ -84,6 +93,20 @@ public struct DVDMenuState: Sendable {
 
     /// 選択中のボタンの「見た目の状態」を戻す（実行の色から選択の色へ）。
     public mutating func clearActivation() { isActivated = false }
+
+    /// 決定（VM 版）。ボタンのコマンドをレジスタつきで評価する（条件つき・Set・Link を含む）。
+    /// リンクのボタン欄（SPRM 8）が変わっていれば、選択もそれに移す。
+    public mutating func activate(registers: inout DVDRegisters) -> DVDMenuAction {
+        guard let b = selected else { return .none }
+        isActivated = true
+        let run = DVDVM.run([b.command], registers: &registers)
+        select(button: registers.highlightedButton)
+        isActivated = true
+        switch run.outcome {
+        case .jump(let command): return Self.action(for: command)
+        case .link, .finished: return run.unsupported.isEmpty ? .none : .unsupported(b.command)
+        }
+    }
 
     public static func action(for command: DVDCommand) -> DVDMenuAction {
         switch command {

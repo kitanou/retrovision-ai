@@ -1,9 +1,11 @@
+import CoreMedia
 import Foundation
 import RVMediaCore
 import RVMLRuntime
 import QuartzCore
 import RVEnhancement
 import RVMediaSources
+import RVVideoPipeline
 
 // MARK: - PlayerEngine への適合（02 §2 の「実装クラス」）
 //
@@ -64,6 +66,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
             mirror.available = tracks
         case .selectionChanged(let selection):
             mirror.selected = selection
+            updateMenu(for: selection.item)
         case .qualityChanged(let quality):
             mirror.quality = quality
         case .statisticsUpdated(let summary):
@@ -77,6 +80,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
 
     public func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws -> MediaStructure {
         startPumpIfNeeded()
+        menuProvider = source as? any DVDMenuAssetProviding
         try await core.load(source, selection: selection)
         if let resolved = await core.snapshot().selected {
             mirror.selected = resolved
@@ -91,10 +95,14 @@ public final class DefaultPlayerEngine: PlayerEngine {
                                 userMessage: "開いた素材の構造が得られませんでした")
         }
         lastStructure = structure
+        if let item = mirror.selected?.item { updateMenu(for: item) }
         return structure
     }
 
     public func close() async {
+        menuStartTask?.cancel()
+        menu = nil; menuOverlay = nil; menuItem = nil; menuProvider = nil
+        metalPresenter?.setOverlay(nil)
         await core.close()
         mirror = PlayerStateSnapshot()
         lastStructure = nil
@@ -163,6 +171,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
         guard let presenter = metalPresenter else { return false }
         if let pending = pendingEnhancement { presenter.setEnhancement(runtime: pending.runtime, model: pending.model, tiling: pending.tiling) }
         presenter.attachLayer(layer)
+        presenter.setOverlay(menuOverlay)
         presenter.setAspectHandler(onAspectResolved)
         await core.setVideoPresenter(presenter)
         return true
@@ -214,5 +223,69 @@ public final class DefaultPlayerEngine: PlayerEngine {
     /// AI 段の統計（強調して提示した frame 数・非強調に倒した数など）。診断・テスト用。
     public func enhancementStatistics() -> MetalFramePresenter.EnhancementStatistics? {
         metalPresenter?.statistics
+    }
+
+    // MARK: DVD メニュー（B2）
+
+    private var menu: DVDMenuSession?
+    private var menuOverlay: OverlayImage?
+    private var menuItem: ItemID?
+    private var menuProvider: (any DVDMenuAssetProviding)?
+    private var menuStartTask: Task<Void, Never>?
+
+    public var isMenuActive: Bool { menu != nil }
+
+    /// 選択された item が静止画のタイトルメニューなら、その VOB / IFO からメニューを組み立てる。そうでなければ外す。
+    private func updateMenu(for item: ItemID) {
+        guard item != menuItem else { return }
+        guard let mediaItem = lastStructure?.items.first(where: { $0.id == item }) else { return }   // 構造が来てから
+        menuItem = item
+        menuStartTask?.cancel()
+        menu = nil; menuOverlay = nil
+        metalPresenter?.setOverlay(nil)
+        guard let provider = menuProvider, mediaItem.stillImage else { return }
+        let size = mediaItem.videoFormat?.codedSize
+        menuStartTask = Task { [weak self] in
+            guard let assets = await provider.menuAssets(for: item) else { return }
+            let w = size.map { Int($0.width) } ?? 720, h = size.map { Int($0.height) } ?? 480
+            let data = await Task.detached {
+                DVDMenuData.load(vobURL: assets.vobURL, ifoURL: assets.ifoURL, canvasWidth: w, canvasHeight: h)
+            }.value
+            guard let data, !Task.isCancelled, let self, self.menuItem == item else { return }
+            let session = DVDMenuSession(data: data, item: item, vtsNumber: assets.vtsNumber)
+            self.menu = session
+            self.menuOverlay = session.render()
+            self.metalPresenter?.setOverlay(self.menuOverlay)
+        }
+    }
+
+    @discardableResult
+    public func menuInput(_ input: MenuInput) async -> Bool {
+        guard let session = menu else { return false }
+        switch session.handle(input, aspect: metalPresenter?.currentAspect) {
+        case .unchanged: break
+        case .redraw:
+            menuOverlay = session.render()
+            metalPresenter?.setOverlay(menuOverlay)
+        case .action(let action):
+            menuOverlay = session.render()   // 実行の色
+            metalPresenter?.setOverlay(menuOverlay)
+            await perform(action, in: session)
+        }
+        return true
+    }
+
+    private func perform(_ action: DVDMenuAction, in session: DVDMenuSession) async {
+        let target: (title: Int, chapter: Int)
+        switch action {
+        case .playTitle(let ttn): target = (ttn, 1)
+        case .playChapter(let ttn, let ptt): target = (ttn, ptt)
+        case .showMenu, .exit, .none, .unsupported: return
+        }
+        // タイトル本体の item は VTS 番号（ItemID(vts)）。VTS 内の開始時刻へ飛ぶ。
+        let start = session.data.titleSet.startTime(title: target.title, chapter: target.chapter) ?? 0
+        await select(item: ItemID(UInt64(session.vtsNumber)))
+        if start > 0 { await seek(to: CMTime(seconds: start, preferredTimescale: 90_000), tolerance: .exact) }
+        await play()
     }
 }

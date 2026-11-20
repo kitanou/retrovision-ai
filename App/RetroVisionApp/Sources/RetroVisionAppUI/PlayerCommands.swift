@@ -21,12 +21,10 @@ struct PlayerCommands: Commands {
                 .keyboardShortcut(.space, modifiers: [])
                 .disabled(!model.transportEnabled)
             Divider()
-            Button("5 秒戻る") { model.skip(by: -5) }
+            Button("5 秒戻る") { model.arrowKey(.left) { if model.seekEnabled { model.skip(by: -5) } } }
                 .keyboardShortcut(.leftArrow, modifiers: [])
-                .disabled(!model.seekEnabled)
-            Button("5 秒進む") { model.skip(by: 5) }
+            Button("5 秒進む") { model.arrowKey(.right) { if model.seekEnabled { model.skip(by: 5) } } }
                 .keyboardShortcut(.rightArrow, modifiers: [])
-                .disabled(!model.seekEnabled)
             Button("30 秒戻る") { model.skip(by: -30) }
                 .keyboardShortcut(.leftArrow, modifiers: .shift)
                 .disabled(!model.seekEnabled)
@@ -43,10 +41,13 @@ struct PlayerCommands: Commands {
             Divider()
             Button("ミュート切替") { model.muted.toggle() }
                 .keyboardShortcut("m", modifiers: [])
-            Button("音量を上げる") { model.volume = min(model.volume + 0.05, 1) }
+            Button("音量を上げる") { model.arrowKey(.up) { model.volume = min(model.volume + 0.05, 1) } }
                 .keyboardShortcut(.upArrow, modifiers: [])
-            Button("音量を下げる") { model.volume = max(model.volume - 0.05, 0) }
+            Button("音量を下げる") { model.arrowKey(.down) { model.volume = max(model.volume - 0.05, 0) } }
                 .keyboardShortcut(.downArrow, modifiers: [])
+            Divider()
+            Button("メニューのボタンを決定") { model.menuActivate() }
+                .keyboardShortcut(.return, modifiers: [])
         }
         CommandMenu("映像") {
             Picker("比率", selection: Binding(get: { model.aspectPolicy },

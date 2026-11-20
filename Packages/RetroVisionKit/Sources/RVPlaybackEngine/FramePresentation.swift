@@ -175,6 +175,17 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
 
     public func clearEnhancement() { lock.withLock { enhancer = nil; resetSchedulingLocked() } }
 
+    // MARK: オーバーレイ（DVD メニューのハイライトなど。映像の上に重ねる）
+
+    /// 直近に描いた映像の geometry（取り込み域・目標比率）。ポインタ座標の変換に使う。
+    public var currentAspect: AspectResolution? { lock.withLock { latestAspect } }
+    private var latestAspect: AspectResolution?
+
+    /// オーバーレイを設定する（nil で消す）。映像と同じ geometry で重なり、すぐ描き直される。
+    public func setOverlay(_ image: OverlayImage?) {
+        presenter.setOverlay(image, aspect: lock.withLock { latestAspect })
+    }
+
     /// 再生速度（≠ 1 では強調を止める — 周期が変わり予算が崩れるため。設計 11 §6.3）。
     public func setPlaybackRate(_ rate: Double) { lock.withLock { playbackRate = rate } }
 
@@ -313,6 +324,8 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     public func present(_ frame: DecodedVideoFrame, plan: RenderPlan?) async -> FrameDeliveryOutcome {
         guard let plan else { return .dropped }
         notifyAspect(plan.output.aspect.targetDAR)
+        lock.withLock { latestAspect = plan.output.aspect }
+        presenter.updateOverlayAspect(plan.output.aspect)
         // 先読みの入力があれば使い、無ければここで組み立てる（同じ直列 queue の上なので順序は保たれる）。
         // 先に lock の下で引き、無いときだけ直列 queue を待つ（先読み中の後続 frame の組み立てを待たない）。
         var input: RenderFrameInput
