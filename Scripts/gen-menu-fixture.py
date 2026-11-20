@@ -158,12 +158,12 @@ body_sectors = len(body) // SECTOR
 
 
 # ---- IFO ----
-def pgc(programs, cells, duration, palette=(), pre=()):
+def pgc(programs, cells, duration, palette=(), pre=(), post=()):
     h = bytearray(0xEC)
     h[2] = len(programs); h[3] = len(cells)
     h[4:8] = duration
     for i, p in enumerate(palette[:16]): h[0xA4 + i * 4:0xA8 + i * 4] = be32(p)
-    cmd = be16(len(pre)) + be16(0) + be16(0) + be16(7 + len(pre) * 8) + b"".join(pre)
+    cmd = be16(len(pre)) + be16(len(post)) + be16(0) + be16(7 + (len(pre) + len(post)) * 8) + b"".join(pre) + b"".join(post)
     prog = bytes(programs) + (b"\0" if len(programs) % 2 else b"")
     cellpb = b"".join(be32(0x02000000) + t + be32(f) + be32(f) + be32(l) + be32(l) for (f, l, t) in cells)
     c_off = 0xEC; p_off = c_off + len(cmd); cell_off = p_off + len(prog)
@@ -197,10 +197,17 @@ def ptt(titles):
 half = body_sectors // 2
 frames = lambda n: bytes([0x00, 0x00, 0x00, 0xC0 | n])           # n frame（29.97 fps）
 cell1 = (0, half - 1, frames(6)); cell2 = (half, body_sectors - 1, frames(6))
-pgc1 = pgc([1, 2], [cell1, cell2], frames(12))
-pgc2 = pgc([1], [cell2], frames(6))
+# 実盤 PICHI と同じ作り: PRE で GPRM15 = 1、「GPRM12 == GPRM15 ならメニュー（VTSM ルート）を呼ぶ」。
+# POST で GPRM12 = 1 にして自分へ Link（→ PRE の条件が成立してメニューへ戻る）。
+title_pre = [bytes.fromhex("7100000f00010000"), bytes.fromhex("3028000001830c0f")]
+title_post = [bytes.fromhex("7100000c00010000"), bytes.fromhex("2004000000000001")]
+pgc1 = pgc([1, 2], [cell1, cell2], frames(12), pre=title_pre, post=[bytes.fromhex("7100000c00010000"), bytes.fromhex("2004000000000001")])
+pgc2 = pgc([1], [cell2], frames(6), pre=title_pre, post=title_post)
 palette = [0x00D88D2F, 0x008DC381] + [0x00108080] * 14
-menu_pgc = pgc([1], [(0, len(menu) // SECTOR - 1, frames(15))], frames(15), palette=palette)
+# メニューの PRE: GPRM12 = 0（本編の POST が立てた「終わった」印を下ろす。これが無いと、戻ったメニューから
+# 本編に入った直後の PRE の条件（GPRM12 == GPRM15）が成立して、メニューへ戻されてしまう）。
+menu_pgc = pgc([1], [(0, len(menu) // SECTOR - 1, frames(15))], frames(15), palette=palette,
+               pre=[bytes.fromhex("7100000c00000000")])
 lu = pgcit([(0x83, menu_pgc)])
 ut = be16(1) + be16(0) + be32(0) + b"ja" + bytes([0, 0x80]) + be32(16)
 ut = ut + b"\0" * (16 - len(ut)) + lu

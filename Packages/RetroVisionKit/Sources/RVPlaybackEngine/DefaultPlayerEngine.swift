@@ -55,9 +55,12 @@ public final class DefaultPlayerEngine: PlayerEngine {
             case .paused, .ended: refineStill()
             default: break
             }
+            if phase == .ended { titleEnded() }
         case .positionUpdated(let position, let duration, _):
             mirror.position = position
             if duration != nil { mirror.duration = duration }
+            // タイトルの PGC の終わり（IFO の再生時間から出した時刻）に着いたら POST へ進む。
+            if let end = titleRun?.endTime, position.seconds >= end { titleEnded() }
         case .structureChanged(let structure):
             lastStructure = structure
             mirror.available = structure.items.first?.trackTable ?? mirror.available
@@ -66,6 +69,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
             mirror.available = tracks
         case .selectionChanged(let selection):
             mirror.selected = selection
+            if let run = titleRun, selection.item != ItemID(UInt64(run.vts)) { titleRun = nil }   // 別の item に移った
             updateMenu(for: selection.item)
         case .qualityChanged(let quality):
             mirror.quality = quality
@@ -81,6 +85,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
     public func load(_ source: any MediaSource, selection: PlaybackSelection?) async throws -> MediaStructure {
         startPumpIfNeeded()
         menuProvider = source as? any DVDMenuAssetProviding
+        dvdRegisters = .initial(); titleRun = nil   // 新しい盤: レジスタは初期値から
         try await core.load(source, selection: selection)
         if let resolved = await core.snapshot().selected {
             mirror.selected = resolved
@@ -101,7 +106,7 @@ public final class DefaultPlayerEngine: PlayerEngine {
 
     public func close() async {
         menuStartTask?.cancel()
-        menu = nil; menuOverlay = nil; menuItem = nil; menuProvider = nil
+        menu = nil; menuOverlay = nil; menuItem = nil; menuProvider = nil; titleRun = nil
         metalPresenter?.setOverlay(nil)
         await core.close()
         mirror = PlayerStateSnapshot()
@@ -252,7 +257,9 @@ public final class DefaultPlayerEngine: PlayerEngine {
                 DVDMenuData.load(vobURL: assets.vobURL, ifoURL: assets.ifoURL, canvasWidth: w, canvasHeight: h)
             }.value
             guard let data, !Task.isCancelled, let self, self.menuItem == item else { return }
-            let session = DVDMenuSession(data: data, item: item, vtsNumber: assets.vtsNumber)
+            let session = DVDMenuSession(data: data, item: item, vtsNumber: assets.vtsNumber,
+                                         registers: self.dvdRegisters)
+            self.dvdRegisters = session.registers   // メニューの PRE が決めた値を引き継ぐ
             self.menu = session
             self.menuOverlay = session.render()
             self.metalPresenter?.setOverlay(self.menuOverlay)
@@ -262,7 +269,9 @@ public final class DefaultPlayerEngine: PlayerEngine {
     @discardableResult
     public func menuInput(_ input: MenuInput) async -> Bool {
         guard let session = menu else { return false }
-        switch session.handle(input, aspect: metalPresenter?.currentAspect) {
+        let outcome = session.handle(input, aspect: metalPresenter?.currentAspect)
+        dvdRegisters = session.registers
+        switch outcome {
         case .unchanged: break
         case .redraw:
             menuOverlay = session.render()
@@ -276,16 +285,93 @@ public final class DefaultPlayerEngine: PlayerEngine {
     }
 
     private func perform(_ action: DVDMenuAction, in session: DVDMenuSession) async {
-        let target: (title: Int, chapter: Int)
+        await run(action, vts: session.vtsNumber, info: session.data.titleSet, depth: 0)
+    }
+
+    // MARK: タイトルの PGC の流れ（B2 第 8 段。PRE → 再生 → POST → メニューへ戻る / 次の PGC）
+
+    private var dvdRegisters = DVDRegisters.initial()
+    /// 再生中のタイトルの PGC。`endTime` は IFO の再生時間から出した終わり（VOB の最後まで続くときは nil。
+    /// その場合は再生の終端（.ended）で POST へ進む）。
+    private struct TitleRun {
+        let vts: Int, ttn: Int, pgc: Int
+        let info: DVDTitleSetInfo
+        let endTime: Double?
+    }
+    private var titleRun: TitleRun?
+    private var flowBusy = false
+
+    /// メニューの動作 / PGC の流れの結果を実行する。`depth` は PRE ↔ POST の連鎖の打ち切り用。
+    private func run(_ action: DVDMenuAction, vts: Int, info: DVDTitleSetInfo, depth: Int) async {
+        guard depth < 8 else { return }
         switch action {
-        case .playTitle(let ttn): target = (ttn, 1)
-        case .playChapter(let ttn, let ptt): target = (ttn, ptt)
-        case .showMenu, .exit, .none, .unsupported: return
+        case .playTitle(let ttn): await startTitle(ttn, chapter: 1, vts: vts, info: info, depth: depth)
+        case .playChapter(let ttn, let ptt): await startTitle(ttn, chapter: ptt, vts: vts, info: info, depth: depth)
+        case .showMenu: await showTitleMenu(vts: vts)
+        case .exit, .none, .unsupported: return
         }
-        // タイトル本体の item は VTS 番号（ItemID(vts)）。VTS 内の開始時刻へ飛ぶ。
-        let start = session.data.titleSet.startTime(title: target.title, chapter: target.chapter) ?? 0
-        await select(item: ItemID(UInt64(session.vtsNumber)))
-        if start > 0 { await seek(to: CMTime(seconds: start, preferredTimescale: 90_000), tolerance: .exact) }
+    }
+
+    private func startTitle(_ ttn: Int, chapter: Int, vts: Int, info: DVDTitleSetInfo, depth: Int) async {
+        guard let pgc = info.title(ttn)?.pgcNumber else {
+            // IFO にタイトルが無い（読めなかった）: 流れは追わず、本体を先頭から再生する。
+            await select(item: ItemID(UInt64(vts)))
+            await play()
+            return
+        }
+        switch DVDTitleFlow.enter(pgc: pgc, in: info, registers: &dvdRegisters) {
+        case .play(let n): await playPGC(n, ttn: ttn, chapter: n == pgc ? chapter : 1, vts: vts, info: info)
+        case .action(let a): await run(a, vts: vts, info: info, depth: depth + 1)
+        case .stop: return
+        }
+    }
+
+    private func playPGC(_ number: Int, ttn: Int, chapter: Int, vts: Int, info: DVDTitleSetInfo) async {
+        let title = info.titles.first { $0.pgcNumber == number } ?? info.title(ttn)
+        let start = title.flatMap { info.startTime(title: $0.number, chapter: chapter) } ?? 0
+        // PGC の終わり（IFO の再生時間）。VOB の終端に近いときは .ended に任せる（IFO と demux の時刻は約 3 s ずれる）。
+        var end: Double?
+        if number >= 1, number <= info.titlePGCs.count {
+            let pgc = info.titlePGCs[number - 1]
+            let itemDuration = lastStructure?.items.first { $0.id == ItemID(UInt64(vts)) }?.duration?.seconds
+            if let first = pgc.cells.first, let s = info.timeline.time(ofSector: first.firstSector), pgc.duration > 0,
+               let itemDuration, s + pgc.duration < itemDuration - 5 {
+                end = s + pgc.duration
+            }
+        }
+        if mirror.selected?.item != ItemID(UInt64(vts)) { await select(item: ItemID(UInt64(vts))) }
+        titleRun = TitleRun(vts: vts, ttn: title?.number ?? ttn, pgc: number, info: info, endTime: end)
+        await seek(to: CMTime(seconds: start, preferredTimescale: 90_000), tolerance: .exact)
         await play()
+    }
+
+    /// 本体（または PGC の終わり）の再生が終わった: POST を評価して、メニューへ戻る / 次の PGC / 止まる。
+    private func titleEnded() {
+        guard let run = titleRun, !flowBusy else { return }
+        flowBusy = true
+        titleRun = nil
+        Task { [weak self] in
+            guard let self else { return }
+            switch DVDTitleFlow.afterPlayback(pgc: run.pgc, in: run.info, registers: &self.dvdRegisters) {
+            case .play(let n): await self.playPGC(n, ttn: run.ttn, chapter: 1, vts: run.vts, info: run.info)
+            case .action(let a): await self.run(a, vts: run.vts, info: run.info, depth: 1)
+            case .stop: break
+            }
+            self.flowBusy = false
+        }
+    }
+
+    private func showTitleMenu(vts: Int) async {
+        // タイトルメニュー（VTS_nn_0.VOB）の item は 1000 + vts（VideoTsMediaSource.itemID）。
+        guard lastStructure?.items.contains(where: { $0.id == ItemID(UInt64(1_000 + vts)) }) == true else { return }
+        titleRun = nil
+        await select(item: ItemID(UInt64(1_000 + vts)))
+        await play()
+    }
+
+    /// 再生中のタイトルからメニューへ戻る（UI の「メニュー」操作の受け口）。メニューが無ければ何もしない。
+    public func showMenu() async {
+        guard let item = mirror.selected?.item, item.rawValue > 0, item.rawValue < 1_000 else { return }
+        await showTitleMenu(vts: Int(item.rawValue))
     }
 }
