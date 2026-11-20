@@ -50,6 +50,11 @@ public final class DefaultPlayerEngine: PlayerEngine {
         switch event {
         case .phaseChanged(let phase):
             mirror.phase = phase
+            // 一時停止・終端（静止画のメニューを含む）: 最後の frame を期限なしで強調して描き直す（設計 11 §6.3）。
+            switch phase {
+            case .paused, .ended: refineStill()
+            default: break
+            }
         case .positionUpdated(let position, let duration, _):
             mirror.position = position
             if duration != nil { mirror.duration = duration }
@@ -108,8 +113,25 @@ public final class DefaultPlayerEngine: PlayerEngine {
     public func seek(to time: MediaTime, tolerance: SeekTolerance) async {
         await core.seek(to: time, tolerance: tolerance)
     }
-    public func step(_ direction: StepDirection) async { await core.step(direction) }
-    public func setRate(_ rate: Double) async { await core.setRate(rate) }
+    public func step(_ direction: StepDirection) async {
+        await core.step(direction)
+        // 一時停止中のコマ送りは phase が変わらないことがある（設計 11 §6.3）。コマ送りの frame の提示が
+        // 先に済むよう少し待ってから強調する（後から来た提示は refine を取り消すため）。
+        guard let presenter = metalPresenter else { return }
+        Task {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            await presenter.refineLastFrame()
+        }
+    }
+    public func setRate(_ rate: Double) async {
+        metalPresenter?.setPlaybackRate(rate)   // 速度 ≠ 1 では強調を止める
+        await core.setRate(rate)
+    }
+
+    private func refineStill() {
+        guard let presenter = metalPresenter else { return }
+        Task { await presenter.refineLastFrame() }
+    }
     public func setVolume(_ gain: Double) async { await core.setVolume(gain) }
 
     public func select(_ track: TrackID, for kind: TrackKind) async {
