@@ -346,3 +346,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **既知の誤差**: IFO のセル時間の合計（PICHI の通しで 3008.67 s）は、アプリの demux の時間軸（3011.70 s）と約 3 s ずれる（IFO の時間は名目値で、demux 側は program 再開始の修復などを含む）。チャプターの開始を IFO の累積時間で求めると、後ろのチャプターほど数百 ms〜数 s ずれうる。精度を上げるには、NAV pack の `vobu_s_ptm`（VOBU ごとの実際の表示時刻）とセルの先頭 sector を突き合わせる（`DVDNavigation.scanNavPacks` が原料。ただし 3.6 GB の走査になるので、必要なセルの先頭付近だけを読む形にする）。
 - **決定（VM コマンド — `DVDCommand`）**: 8 byte を、type（byte0 >> 5）・直接 / レジスタ（bit4）・副命令（byte1 下位 4 bit）・比較演算（byte1 の bits 6〜4）から解釈する。解釈するのは、Nop / Goto / Break / Exit、JumpTT / JumpVTS_TT / JumpVTS_PTT、JumpSS / CallSS（firstPlay・VMGM メニュー・VTSM・VMGM PGC）、Link（PGCN・PTT・PGN・CN・サブセット）、Set GPRM（即値の代入）。**条件つき（比較つき）・種別 4〜6 の複合形・レジスタ間接・Set の演算子が代入でないもの・未知の副命令は `unsupported`**（レジスタを評価する VM を持たないので推測で実行しない）。実盤のメニューのボタン 12 個は、すべて `JumpVTS_PTT`（ttn 2 / 3 の chapter 1〜5）と `JumpVTS_TT`（ttn 4）、通しの先頭（ttn 1 ptt 1）で、画面のボタンと意味が一致した（左の列 = 第 1 話の各チャプター、右の列 = 第 2 話、「つづけてみる」= 通しの先頭、「TVCM 集」= タイトル 4）。メニューの PGC の先頭コマンド群（30 個）は比較つきの命令（どのボタンを最初に選ぶか等をレジスタで決める）で `unsupported`: 最初に選ぶボタンは PCI の強制選択、なければ 1 番に倒す。
 - **未実装**: ボタンの選択状態の管理と入力（矢印・クリック・Enter）、字幕（SPU）の Metal での重ね合わせ（ボタンのハイライト色の適用）、ボタンの動作を再生に結びつける（タイトルへ切り替え + チャプターの開始時刻へシーク）。
+
+### 2026-11-20 — #3 B2 第 5〜6 段: メニューの重ね合わせと操作
+
+- **決定（描画）**: SPU（2 bit 画素）を premultiplied の BGRA に合成し、Metal で映像の上に重ねる（`OverlayImage` / `drawOverlay`。映像と同じ cleanAperture + letterbox の矩形、linear サンプラ）。SPU 自身はコントラスト 0 で、ボタン選択中だけ PCI の `btn_colit`（選択 / 実行）の色とコントラストをボタン矩形内に当てる。
+- **決定（操作）**: `PlayerEngine` に `isMenuActive` / `menuInput(_:)`（矢印・決定・ポインタ）。App は矢印キー（メニュー有効時はメニュー優先、でなければ従来の 5 秒移動・音量）、Return、マウスの移動・クリックを転送。ポインタは映像と同じ geometry の逆引きで 720x480 の座標へ直す（`OverlayMapping`）。
+- **動作の実行**: JumpVTS_PTT / JumpVTS_TT のみ。本体の item（ItemID(vts)）へ切り替え、IFO の時刻（`startTime`）へ seek して再生。条件つき・PGC 内リンク・レジスタ命令は未対応（何もしない）。
+- **確認**: 合成盤（`Scripts/gen-menu-fixture.py` → `fixtures/generated/dvd-menu-01`）で、アプリを起動し、オーバーレイの表示・矢印での選択移動・Return での本体への移動を目視と transport ログで確認。**未確認**: マウス操作、実盤（PICHI）でのアプリ上の表示と操作、複数 PGC・ボタンの強制選択・ハイライトの切り替え（hli_ss ≠ 1）。

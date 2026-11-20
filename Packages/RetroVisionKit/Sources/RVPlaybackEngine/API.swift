@@ -153,4 +153,14 @@ public protocol PlayerEngine: AnyObject {
     var stateSnapshot: PlayerStateSnapshot { get }
     func events() -> AsyncStream<PlayerEvent>
     var structure: MediaStructure? { get }
+
+    /// 操作できる DVD メニューが表示されている間 true（UI はキー・マウスをメニューへ流す）。
+    var isMenuActive: Bool { get }
+    /// メニューへの入力。処理した（メニューが有効だった）なら true。
+    @discardableResult func menuInput(_ input: MenuInput) async -> Bool
+}
+
+public extension PlayerEngine {
+    var isMenuActive: Bool { false }
+    func menuInput(_ input: MenuInput) async -> Bool { false }
 }

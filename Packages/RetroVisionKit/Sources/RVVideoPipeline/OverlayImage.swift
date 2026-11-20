@@ -74,3 +74,24 @@ extension MetalRenderGraph {
         command.commit()
     }
 }
+
+// MARK: - 画面上の位置 → オーバーレイ画の座標（マウスでメニューのボタンを選ぶ）
+
+public enum OverlayMapping {
+    /// 表示面（view）内の位置（左上原点、点 / 画素）を、映像の coded frame の座標へ直す。
+    /// 映像と同じ geometry（cleanAperture + letterbox）を逆に引く。映像の外（余白）は nil。
+    public static func canvasPoint(viewX: Double, viewY: Double, viewWidth: Double, viewHeight: Double,
+                                   aspect: AspectResolution, codedWidth: Int, codedHeight: Int) -> (x: Int, y: Int)? {
+        guard viewWidth > 0, viewHeight > 0 else { return nil }
+        let g = MetalRenderGraph.geometry(aspect: aspect, codedWidth: codedWidth, codedHeight: codedHeight,
+                                          targetWidth: Int(viewWidth.rounded()), targetHeight: Int(viewHeight.rounded()))
+        let nx = viewX / viewWidth, ny = viewY / viewHeight
+        let d = g.dest, s = g.source
+        guard d.2 > 0, d.3 > 0 else { return nil }
+        let u = (nx - Double(d.0)) / Double(d.2), v = (ny - Double(d.1)) / Double(d.3)
+        guard u >= 0, u < 1, v >= 0, v < 1 else { return nil }
+        let cx = (Double(s.0) + Double(s.2) * u) * Double(codedWidth)
+        let cy = (Double(s.1) + Double(s.3) * v) * Double(codedHeight)
+        return (Int(cx), Int(cy))
+    }
+}
