@@ -167,6 +167,63 @@ public actor CoreMLModelRuntime: ModelRuntimeProtocol {
         }
     }
 
+    /// テンソル入出力の推論（設計 11 §5.4。D3: 16 bit）。入力・出力とも IOSurface 付きの fp16 planar buffer を
+    /// `MLMultiArray(pixelBuffer:shape:)` で包み、出力は `outputBackings` で呼び出し側の buffer に直接書かせる。
+    /// breaker・期限・shape 不一致の扱いは `predict` と同じ。
+    public func predictTensor(_ request: InferenceRequest, input: TensorFrame) async throws -> TensorFrame {
+        guard let model = loaded[request.model], let entry = entries[request.model] else {
+            throw PlaybackError.model(.notCompiled, message: "モデルが load されていません: \(request.model)")
+        }
+        let spec = entry.manifest.input, outSpec = entry.manifest.output
+        guard spec.kind == .tensor, outSpec.kind == .tensor else {
+            throw PlaybackError.model(.conversionUnsupported, message: "テンソル入出力のモデルではありません: \(request.model)")
+        }
+        var tracker = health[request.model] ?? ModelHealthTracker(breaker: FailureBreaker(config: options.breaker))
+        guard tracker.allowRequest(atSeconds: Self.seconds()) else {
+            health[request.model] = tracker
+            throw PlaybackError.model(.disabledByBreaker, message: "連続失敗のため AI 処理を一時停止しています",
+                                      recovery: .retryWith(.lowerTier))
+        }
+        guard input.width == spec.width, input.height == spec.height, input.channels == 3 else {
+            if tracker.breaker.state == .halfOpen { tracker.recordSuccess(latencyMS: 0, atSeconds: Self.seconds()) }
+            health[request.model] = tracker
+            throw PlaybackError.model(.shapeMismatch,
+                                      message: "入力寸法がモデルと一致しません（\(input.width)x\(input.height) / 必要 \(spec.width)x\(spec.height)）",
+                                      recovery: .retryWith(.lowerTier))
+        }
+        guard let output = TensorFrame.make(width: outSpec.width, height: outSpec.height) else {
+            throw PlaybackError(kind: .render(.memoryLimit), recovery: .retryWith(.lowerTier),
+                                userMessage: "AI 段の出力 buffer を確保できません")
+        }
+        let started = HostTime.now()
+        do {
+            let inArray = MLMultiArray(pixelBuffer: input.pixelBuffer, shape: [1, 3, spec.height, spec.width].map(NSNumber.init(value:)))
+            let outArray = MLMultiArray(pixelBuffer: output.pixelBuffer, shape: [1, 3, outSpec.height, outSpec.width].map(NSNumber.init(value:)))
+            let provider = try MLDictionaryFeatureProvider(dictionary: [spec.name: MLFeatureValue(multiArray: inArray)])
+            let options = MLPredictionOptions()
+            options.outputBackings = [outSpec.name: outArray]
+            let box = ModelBox(model: model)
+            _ = try await box.model.prediction(from: provider, options: options)
+            let elapsedMS = HostTime.now().ms(since: started)
+            tracker.recordSuccess(latencyMS: elapsedMS, atSeconds: Self.seconds())
+            health[request.model] = tracker
+            if HostTime.now() > request.deadline {
+                throw PlaybackError.model(.deadlineExceeded, message: "推論が期限に間に合いませんでした",
+                                          recovery: .retryWith(.lowerTier))
+            }
+            return output
+        } catch let error as PlaybackError {
+            if case .model(.deadlineExceeded) = error.kind { throw error }
+            tracker.recordFailure(atSeconds: Self.seconds())
+            health[request.model] = tracker
+            throw error
+        } catch {
+            tracker.recordFailure(atSeconds: Self.seconds())
+            health[request.model] = tracker
+            throw PlaybackError.model(.runtimeFailure, message: "推論に失敗しました", cause: String(describing: error))
+        }
+    }
+
     public func health(of id: ModelID) -> ModelHealth {
         health[id]?.health ?? ModelHealth()
     }

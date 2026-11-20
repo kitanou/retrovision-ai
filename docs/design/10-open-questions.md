@@ -346,3 +346,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **既知の誤差**: IFO のセル時間の合計（PICHI の通しで 3008.67 s）は、アプリの demux の時間軸（3011.70 s）と約 3 s ずれる（IFO の時間は名目値で、demux 側は program 再開始の修復などを含む）。チャプターの開始を IFO の累積時間で求めると、後ろのチャプターほど数百 ms〜数 s ずれうる。精度を上げるには、NAV pack の `vobu_s_ptm`（VOBU ごとの実際の表示時刻）とセルの先頭 sector を突き合わせる（`DVDNavigation.scanNavPacks` が原料。ただし 3.6 GB の走査になるので、必要なセルの先頭付近だけを読む形にする）。
 - **決定（VM コマンド — `DVDCommand`）**: 8 byte を、type（byte0 >> 5）・直接 / レジスタ（bit4）・副命令（byte1 下位 4 bit）・比較演算（byte1 の bits 6〜4）から解釈する。解釈するのは、Nop / Goto / Break / Exit、JumpTT / JumpVTS_TT / JumpVTS_PTT、JumpSS / CallSS（firstPlay・VMGM メニュー・VTSM・VMGM PGC）、Link（PGCN・PTT・PGN・CN・サブセット）、Set GPRM（即値の代入）。**条件つき（比較つき）・種別 4〜6 の複合形・レジスタ間接・Set の演算子が代入でないもの・未知の副命令は `unsupported`**（レジスタを評価する VM を持たないので推測で実行しない）。実盤のメニューのボタン 12 個は、すべて `JumpVTS_PTT`（ttn 2 / 3 の chapter 1〜5）と `JumpVTS_TT`（ttn 4）、通しの先頭（ttn 1 ptt 1）で、画面のボタンと意味が一致した（左の列 = 第 1 話の各チャプター、右の列 = 第 2 話、「つづけてみる」= 通しの先頭、「TVCM 集」= タイトル 4）。メニューの PGC の先頭コマンド群（30 個）は比較つきの命令（どのボタンを最初に選ぶか等をレジスタで決める）で `unsupported`: 最初に選ぶボタンは PCI の強制選択、なければ 1 番に倒す。
 - **未実装**: ボタンの選択状態の管理と入力（矢印・クリック・Enter）、字幕（SPU）の Metal での重ね合わせ（ボタンのハイライト色の適用）、ボタンの動作を再生に結びつける（タイトルへ切り替え + チャプターの開始時刻へシーク）。
+
+### 2026-11-20 — 設計 11（アップスケール）の D3〜D5 を推奨どおり決定、P2: 16 bit テンソルの橋渡し
+
+- **決定（ユーザー）**: D3 = SR の入出力は 16 bit 浮動小数、D4 = 全画面の固定寸法（入力の種類ごと）を第 1 案・GPU タイルを予備、D5 = 先読みキュー（提示は待たない）。
+- **P2 の実装**: SR の入出力を NCHW の planar fp16（`kCVPixelFormatType_OneComponent16Half`、IOSurface 付き、幅 W × 高さ 3H）にした。Core ML 側は `MLMultiArray(pixelBuffer:shape:)` で包み、出力は `outputBackings` に呼び出し側の buffer を渡す（SDK のヘッダで API を確認）。Metal 側は同じ buffer を r16Float の texture として読み書きする（`rv_pack_nchw_f16_v1` / `rv_unpack_nchw_f16_v1`）。manifest の `input.kind == tensor` のモデルがこの経路を通り、`image` のモデルは従来の BGRA8 + CPU タイルのまま。
+- **検査**: tiny model `test.tiny.sr2x.f16`（入力 [1,3,16,24] → 「1 − x」を最近傍で 2 倍。`Scripts/make-tiny-sr-model.py`、重みなし 20 KB）で、Core ML の往復（全チャネル・位置、誤差 2e-3）と、Metal → Core ML → Metal の通し（全画素 ±3）を確認。
+- **未実施**: 橋渡しのコストを SR と分けて測ること（06 §4）、ANE で実際にコピー無しになるかの確認（tiny model は CPU 指定）、取り込み域とモデル寸法が違う場合（P3 の EnumeratedShapes / GPU タイル）。

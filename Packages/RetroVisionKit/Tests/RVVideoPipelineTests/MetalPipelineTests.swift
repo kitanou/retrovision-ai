@@ -656,3 +656,71 @@ final class MetalPipelineTests: XCTestCase {
         XCTAssertNil(MetalPresenter.estimateRefresh(records: records(intervalMS: [16.7, 16.7])))
     }
 }
+
+// MARK: - 6. SR の 16 bit テンソル橋渡し（設計 11 §5.3・§5.4・P2）
+
+extension MetalPipelineTests {
+    private func makeTensorBuffer(width: Int, height: Int) throws -> TensorTexture {
+        let attrs: [String: Any] = [String(kCVPixelBufferMetalCompatibilityKey): true,
+                                    String(kCVPixelBufferIOSurfacePropertiesKey): [String: Any]()]
+        var pb: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(kCFAllocatorDefault, width, height * 3, kCVPixelFormatType_OneComponent16Half,
+                                           attrs as CFDictionary, &pb), kCVReturnSuccess)
+        return try XCTUnwrap(Self.graph.importTensor(try XCTUnwrap(pb)))
+    }
+
+    private func tensorValue(_ t: TensorTexture, c: Int, y: Int, x: Int) -> Float {
+        let pb = t.pixelBuffer
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        let row = CVPixelBufferGetBaseAddress(pb)!.advanced(by: (c * t.height + y) * CVPixelBufferGetBytesPerRow(pb))
+        return Float(row.assumingMemoryBound(to: Float16.self)[x])
+    }
+
+    func testRenderToTensorWritesRGBPlanesInNCHWOrder() throws {
+        guard gpuGate() else { return }
+        let w = 32, h = 24
+        // BT.601 video range の赤（Y 81, Cb 90, Cr 240）。R の面は高く、B の面は低い。
+        let pb = try makeNV12(width: w, height: h, luma: { _ in [UInt8](repeating: 81, count: w) },
+                              chroma: { _ in (0..<(w / 2)).flatMap { _ in [UInt8(90), UInt8(240)] } })
+        let tensor = try makeTensorBuffer(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(20), tier: .metalOnly,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: progressiveInput(pb, width: w, height: h).aspect, present: .offscreen))
+        let done = expectation(description: "pack")
+        try Self.graph.renderToTensor(progressiveInput(pb, width: w, height: h), plan: plan, into: tensor) { _ in done.fulfill() }
+        wait(for: [done], timeout: 5)
+        for (x, y) in [(0, 0), (31, 23), (10, 12)] {
+            XCTAssertGreaterThan(tensorValue(tensor, c: 0, y: y, x: x), 0.9, "R 面")
+            XCTAssertLessThan(tensorValue(tensor, c: 1, y: y, x: x), 0.1, "G 面")
+            XCTAssertLessThan(tensorValue(tensor, c: 2, y: y, x: x), 0.1, "B 面")
+        }
+    }
+
+    func testPresentTensorReadsPlanesBackAsRGB() throws {
+        guard gpuGate() else { return }
+        let w = 32, h = 24
+        let tensor = try makeTensorBuffer(width: w, height: h)
+        let pb = tensor.pixelBuffer
+        CVPixelBufferLockBaseAddress(pb, [])
+        let stride = CVPixelBufferGetBytesPerRow(pb)
+        for c in 0..<3 { for y in 0..<h { for x in 0..<w {
+            let v: Float = c == 0 ? Float(x) / 31 : (c == 1 ? 0.5 : Float(y) / 23)
+            CVPixelBufferGetBaseAddress(pb)!.advanced(by: (c * h + y) * stride + x * 2).assumingMemoryBound(to: Float16.self).pointee = Float16(v)
+        } } }
+        CVPixelBufferUnlockBaseAddress(pb, [])
+        let target = try makeTarget(width: w, height: h)
+        let done = expectation(description: "present")
+        try Self.graph.presentTensor(tensor, aspect: AspectResolution(targetDAR: AspectRatio(w: 4, h: 3),
+                                                                     cleanAperture: PixelRect(x: 0, y: 0, width: Int32(w), height: Int32(h)),
+                                                                     source: .userOverride), to: target) { _ in done.fulfill() }
+        wait(for: [done], timeout: 5)
+        let out = readBack(target)
+        for (x, y) in [(0, 0), (31, 23), (16, 5)] {
+            XCTAssertEqual(Double(out[y][x].r), Double(x) / 31 * 255, accuracy: 1.5, "R (\(x),\(y))")
+            XCTAssertEqual(Double(out[y][x].g), 127.5, accuracy: 1.5, "G (\(x),\(y))")
+            XCTAssertEqual(Double(out[y][x].b), Double(y) / 23 * 255, accuracy: 1.5, "B (\(x),\(y))")
+        }
+    }
+}

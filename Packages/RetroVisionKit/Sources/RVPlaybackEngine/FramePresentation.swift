@@ -157,10 +157,15 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
             defer { releaseEnhancement() }
             do {
                 let budget = enhancementBudgetMS ?? max(frame.duration.seconds * 1_000, 1)
-                let rgb = try await stage.enhance(input, plan: plan, frameID: frame.id,
-                                                  deadline: HostTime.now().advancing(ms: budget))
-                let outcome = try presenter.presentEnhanced(rgb, aspect: plan.output.aspect, pts: frame.pts,
-                                                            frameID: frame.id)
+                let enhanced = try await stage.enhanceFrame(input, plan: plan, frameID: frame.id,
+                                                            deadline: HostTime.now().advancing(ms: budget))
+                let outcome: PresentOutcome
+                switch enhanced {
+                case .rgb(let rgb):
+                    outcome = try presenter.presentEnhanced(rgb, aspect: plan.output.aspect, pts: frame.pts, frameID: frame.id)
+                case .tensor(let tensor):
+                    outcome = try presenter.presentEnhancedTensor(tensor, aspect: plan.output.aspect, pts: frame.pts, frameID: frame.id)
+                }
                 lock.withLock { enhancementStatistics.enhanced += 1 }
                 switch outcome {
                 case .scheduled: return .delivered

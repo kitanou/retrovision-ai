@@ -1,0 +1,11 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3605.1.1"}, {"coremlc-version", "3600.25.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 3, 16, 24]> image) {
+            fp16 sub_0_x_0 = const()[name = string("sub_0_x_0"), val = fp16(0x1p+0)];
+            tensor<fp16, [1, 3, 16, 24]> sub_0 = sub(x = sub_0_x_0, y = image)[name = string("sub_0")];
+            int32 out_scale_factor_height_0 = const()[name = string("out_scale_factor_height_0"), val = int32(2)];
+            int32 out_scale_factor_width_0 = const()[name = string("out_scale_factor_width_0"), val = int32(2)];
+            tensor<fp16, [1, 3, 32, 48]> out = upsample_nearest_neighbor(scale_factor_height = out_scale_factor_height_0, scale_factor_width = out_scale_factor_width_0, x = sub_0)[name = string("out")];
+        } -> (out);
+}

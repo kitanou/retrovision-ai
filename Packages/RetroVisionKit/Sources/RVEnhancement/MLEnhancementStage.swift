@@ -19,9 +19,19 @@ public struct MLEnhancementStage: Sendable {
         public var tileHeight: Int
         public var overlap: Int
         public var scale: Int
-        public init(tileWidth: Int, tileHeight: Int, overlap: Int = 16, scale: Int = 1) {
+        /// モデルの入出力の形（manifest の input.kind）。`.tensor` は 16 bit の NCHW（設計 11 §5.4・D3）。
+        public var io: IO
+        public enum IO: Sendable { case image, tensor }
+        public init(tileWidth: Int, tileHeight: Int, overlap: Int = 16, scale: Int = 1, io: IO = .image) {
             self.tileWidth = tileWidth; self.tileHeight = tileHeight; self.overlap = overlap; self.scale = scale
+            self.io = io
         }
+    }
+
+    /// 強調の結果（最終拡大の入力）。
+    public enum EnhancedFrame: @unchecked Sendable {
+        case rgb(RGBFrameBuffer)
+        case tensor(TensorTexture)
     }
 
     private let graph: MetalRenderGraph
@@ -34,6 +44,52 @@ public struct MLEnhancementStage: Sendable {
         self.runtime = runtime
         self.model = model
         self.tiling = tiling
+    }
+
+    /// モデルの入出力の形に応じて強調する（`.tensor` は 16 bit、`.image` は従来の BGRA8 + タイル）。
+    public func enhanceFrame(_ input: RenderFrameInput, plan: RenderPlan, frameID: FrameID,
+                             deadline: HostTime) async throws -> EnhancedFrame {
+        switch tiling.io {
+        case .tensor: return .tensor(try await enhanceTensor(input, plan: plan, frameID: frameID, deadline: deadline))
+        case .image: return .rgb(try await enhance(input, plan: plan, frameID: frameID, deadline: deadline))
+        }
+    }
+
+    /// 16 bit テンソル経路（設計 11 §5.3・§5.4）: NV12 → deinterlace + 色変換 → fp16 NCHW（取り込み域の寸法、
+    /// 元格子のまま — D2）→ Core ML（IOSurface をコピー無しで共有）→ fp16 NCHW の出力を texture として返す。
+    /// 取り込み域とモデルの入力寸法が一致すること（全画面の固定寸法 — D4。合わない寸法は P3 で扱う）。
+    public func enhanceTensor(_ input: RenderFrameInput, plan: RenderPlan, frameID: FrameID,
+                              deadline: HostTime) async throws -> TensorTexture {
+        let aperture = input.aspect.cleanAperture
+        let width = Int(aperture.width), height = Int(aperture.height)
+        guard width == tiling.tileWidth, height == tiling.tileHeight else {
+            throw PlaybackError.model(.shapeMismatch,
+                                      message: "取り込み域（\(width)x\(height)）がモデルの入力（\(tiling.tileWidth)x\(tiling.tileHeight)）と一致しません")
+        }
+        guard let inFrame = TensorFrame.make(width: width, height: height),
+              let inTexture = graph.importTensor(inFrame.pixelBuffer) else {
+            throw PlaybackError(kind: .render(.memoryLimit), recovery: .retryWith(.lowerTier),
+                                userMessage: "AI 段の入力 buffer を確保できません")
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            do {
+                try graph.renderToTensor(input, plan: plan, into: inTexture) { result in
+                    switch result {
+                    case .success: continuation.resume()
+                    case .failure(let error): continuation.resume(throwing: error)
+                    }
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        let request = InferenceRequest(model: model, width: width, height: height, frameID: frameID, deadline: deadline)
+        let output = try await runtime.predictTensor(request, input: inFrame)
+        guard let outTexture = graph.importTensor(output.pixelBuffer, channels: output.channels) else {
+            throw PlaybackError(kind: .render(.memoryLimit), recovery: .retryWith(.lowerTier),
+                                userMessage: "AI 段の出力を取り込めません")
+        }
+        return outTexture
     }
 
     public func enhance(_ input: RenderFrameInput, plan: RenderPlan, frameID: FrameID,

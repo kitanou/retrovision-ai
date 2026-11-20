@@ -132,6 +132,32 @@ fragment float4 rv_rgbPresent_v2(const VSOut in [[stage_in]],
     return float4(clamp(c, 0.0, 1.0), 1.0);
 }
 
+// ---------- SR の 16 bit テンソル（NCHW planar）の詰め込み / 展開（設計 11 §5.4） ----------
+//
+// テンソル texture は r16Float、幅 W × 高さ 3H（R の面・G の面・B の面を縦に積む）。
+
+kernel void rv_pack_nchw_f16_v1(texture2d<float, access::read>  rgb    [[texture(0)]],
+                                texture2d<float, access::write> tensor [[texture(1)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint w = rgb.get_width(), h = rgb.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float3 c = rgb.read(gid).rgb;
+    tensor.write(float4(c.r), uint2(gid.x, gid.y));
+    tensor.write(float4(c.g), uint2(gid.x, gid.y + h));
+    tensor.write(float4(c.b), uint2(gid.x, gid.y + 2u * h));
+}
+
+kernel void rv_unpack_nchw_f16_v1(texture2d<float, access::read>  tensor [[texture(0)]],
+                                  texture2d<float, access::write> rgb    [[texture(1)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint w = rgb.get_width(), h = rgb.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float r = tensor.read(uint2(gid.x, gid.y)).r;
+    float g = tensor.read(uint2(gid.x, gid.y + h)).r;
+    float b = tensor.read(uint2(gid.x, gid.y + 2u * h)).r;
+    rgb.write(float4(clamp(float3(r, g, b), 0.0, 1.0), 1.0), gid);
+}
+
 // ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
 //
 // 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。

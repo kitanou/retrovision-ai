@@ -176,6 +176,31 @@ public struct InferenceFrame: @unchecked Sendable {
     public init(_ pixelBuffer: CVPixelBuffer) { self.pixelBuffer = pixelBuffer }
 }
 
+/// NCHW の planar テンソル（16 bit 浮動小数、IOSurface 付き。設計 11 §5.4）。
+/// `kCVPixelFormatType_OneComponent16Half` の buffer で、幅 = W、高さ = C × H（チャネルを縦に積む）。
+/// Core ML には `MLMultiArray(pixelBuffer:shape:)` でコピー無しに渡し、Metal からは r16Float の texture として読み書きする。
+public struct TensorFrame: @unchecked Sendable {
+    public let pixelBuffer: CVPixelBuffer
+    public let channels: Int
+    public var width: Int { CVPixelBufferGetWidth(pixelBuffer) }
+    public var height: Int { CVPixelBufferGetHeight(pixelBuffer) / max(channels, 1) }
+    public init(_ pixelBuffer: CVPixelBuffer, channels: Int = 3) {
+        self.pixelBuffer = pixelBuffer; self.channels = channels
+    }
+
+    /// IOSurface 付き・Metal 互換の空のテンソル。
+    public static func make(width: Int, height: Int, channels: Int = 3) -> TensorFrame? {
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        var pb: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height * channels, kCVPixelFormatType_OneComponent16Half,
+                                  attrs as CFDictionary, &pb) == kCVReturnSuccess, let pb else { return nil }
+        return TensorFrame(pb, channels: channels)
+    }
+}
+
 public protocol ModelRuntimeProtocol: Sendable {
     func discover() async -> [ModelManifest]
     func load(_ id: ModelID) async throws
@@ -184,4 +209,12 @@ public protocol ModelRuntimeProtocol: Sendable {
     /// deadline 超過・breaker open・shape 不一致は `PlaybackError.model(...)` で返す（再生は止めない）。
     func predict(_ request: InferenceRequest, input: InferenceFrame) async throws -> InferenceFrame
     func health(of id: ModelID) async -> ModelHealth
+    /// 1 frame の推論（テンソル入出力。manifest の input.kind == .tensor のモデル）。
+    func predictTensor(_ request: InferenceRequest, input: TensorFrame) async throws -> TensorFrame
+}
+
+extension ModelRuntimeProtocol {
+    public func predictTensor(_ request: InferenceRequest, input: TensorFrame) async throws -> TensorFrame {
+        throw PlaybackError.model(.conversionUnsupported, message: "この実行層はテンソル入出力に対応していません")
+    }
 }

@@ -117,6 +117,14 @@ public final class MetalPresenter: @unchecked Sendable {
         }
     }
 
+    /// SR の 16 bit テンソル出力を最終拡大して提示する（設計 11 §5.6）。
+    public func presentEnhancedTensor(_ tensor: TensorTexture, aspect: AspectResolution, pts: MediaTime,
+                                      frameID: FrameID) throws -> PresentOutcome {
+        try submit(pts: pts, frameID: frameID, retain: tensor) { [graph] texture in
+            try graph.presentTensor(tensor, aspect: aspect, to: texture)
+        }
+    }
+
     /// drawable の確保・描画・present 予約・presented 記録の共通部分。`draw` が drawable の texture へ描く。
     private func submit(pts: MediaTime, frameID: FrameID, retain: AnyObject,
                         draw: @escaping @Sendable (any MTLTexture) throws -> Void) throws -> PresentOutcome {
