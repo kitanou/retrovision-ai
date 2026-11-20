@@ -13,6 +13,16 @@ import RVVideoPipeline
 
 /// AI 段の再生経路への組み込み（#6 / #7）。実際の Metal + Core ML（tiny model）で、plan への反映・
 /// 強調して提示・失敗時に非強調で提示・同時に 1 推論だけ、を検査する。
+/// 入力をそのまま返す実行層（推論時間ほぼ 0。session の先読みが実際に効くかだけを見る）。
+private actor ImmediateRuntime: ModelRuntimeProtocol {
+    func discover() async -> [ModelManifest] { [] }
+    func load(_ id: ModelID) async throws {}
+    func unload(_ id: ModelID) async {}
+    func predict(_ request: InferenceRequest, input: InferenceFrame) async throws -> InferenceFrame { input }
+    func predictTensor(_ request: InferenceRequest, input: TensorFrame) async throws -> TensorFrame { input }
+    func health(of id: ModelID) async -> ModelHealth { ModelHealth() }
+}
+
 /// 推論の完了をテストが決める実行層（sleep に頼らず、先読みのタイミングを決定的にする）。
 private actor GatedRuntime: ModelRuntimeProtocol {
     private var open = false
@@ -200,8 +210,8 @@ final class EnhancementPlaybackTests: XCTestCase {
         await presenter.waitUntilIdle()
     }
 
-    /// 同時に走る推論は上限（2）まで。それを超えた frame は推論を始めず、非強調で出す。保存則も確かめる。
-    func testOnlyMaxJobsRunAndTheRestAreCountedAsBusy() async throws {
+    /// 同時に走る推論は上限（2）まで。超えた分は待ち行列に入り、枠が空いたら走る（復号は数 frame まとめて進むため）。
+    func testJobsOverTheCapWaitAndRunWhenASlotFrees() async throws {
         let runtime = GatedRuntime()
         let presenter = try makePresenter(runtime: runtime, size: 64)
         let p = plan(size: 64, withSR: true)
@@ -209,14 +219,32 @@ final class EnhancementPlaybackTests: XCTestCase {
         frames.forEach { presenter.prepare($0, plan: p) }
         await presenter.waitUntilIdle(timeout: 0.3)   // 2 本は門で止まっている
         let started = await runtime.started
-        XCTAssertLessThanOrEqual(started, 2, "上限を超えて推論を始めた")
+        XCTAssertEqual(started, 2, "上限を超えて推論を始めた")
+        await runtime.release()
+        await presenter.waitUntilIdle()
+        for f in frames { _ = await presenter.present(f, plan: p) }
+        let s = presenter.statistics
+        XCTAssertEqual(s.enhanced, 3, "待ち行列の推論が走っていない: \(s)")
+        XCTAssertEqual(s.eligible, 3, "提示した frame = 強調 + 非強調（理由別）の保存則: \(s)")
+    }
+
+    /// 待ち行列も一杯なら、推論を始めずに非強調で出す（skippedBusy）。
+    func testFramesBeyondTheQueueAreSkippedAsBusy() async throws {
+        var scheduling = MetalFramePresenter.Scheduling()
+        scheduling.maxPendingJobs = 0
+        let runtime = GatedRuntime()
+        let presenter = try makePresenter(runtime: runtime, size: 64, scheduling: scheduling)
+        let p = plan(size: 64, withSR: true)
+        let frames = try (0..<3).map { try makeFrame(size: 64, index: $0) }
+        frames.forEach { presenter.prepare($0, plan: p) }
+        await presenter.waitUntilIdle(timeout: 0.3)
         await runtime.release()
         await presenter.waitUntilIdle()
         for f in frames { _ = await presenter.present(f, plan: p) }
         let s = presenter.statistics
         XCTAssertEqual(s.enhanced, 2)
         XCTAssertEqual(s.skippedBusy, 1)
-        XCTAssertEqual(s.eligible, 3, "提示した frame = 強調 + 非強調（理由別）の保存則: \(s)")
+        XCTAssertEqual(s.eligible, 3, "保存則: \(s)")
     }
 
     /// シーク等で世代が進んだら、古い世代の結果は使わない。
@@ -250,13 +278,21 @@ final class EnhancementPlaybackTests: XCTestCase {
 
     /// 起動直後（まだ 1 枚も強調していない）の取りこぼしでは、強調を止めない。
     func testStartupMissesDoNotSuspendEnhancement() async throws {
+        let runtime = CoreMLModelRuntime(modelsDirectory: modelsDirectory, options: .init(requireMeasurement: false))
+        try await runtime.load(modelID)
         var scheduling = MetalFramePresenter.Scheduling()
         scheduling.minSamples = 3
-        let presenter = try makePresenter(runtime: GatedRuntime(), size: 64, scheduling: scheduling)
+        let presenter = try makePresenter(runtime: runtime, size: 64, scheduling: scheduling)
+        presenter.enhancementBudgetMS = -1_000   // どの推論も期限切れ（取りこぼし）
         let p = plan(size: 64, withSR: true)
-        for i in 0..<10 { _ = await presenter.present(try makeFrame(size: 64, index: i), plan: p) }   // 先読みなし
+        for i in 0..<10 {
+            let f = try makeFrame(size: 64, index: i)
+            presenter.prepare(f, plan: p)
+            await presenter.waitUntilIdle()
+            _ = await presenter.present(f, plan: p)
+        }
         XCTAssertEqual(presenter.statistics.suspensions, 0)
-        XCTAssertEqual(presenter.statistics.notPrepared, 10)
+        XCTAssertEqual(presenter.statistics.fellBack, 10)
     }
 
     /// 強調が始まった後に取りこぼしが続くと、強調を止める。止めている間は推論を始めない。
@@ -268,19 +304,19 @@ final class EnhancementPlaybackTests: XCTestCase {
         scheduling.suspendSeconds = 1_000
         let presenter = try makePresenter(runtime: runtime, size: 64, scheduling: scheduling, clock: { 100 })
         let p = plan(size: 64, withSR: true)
-        let first = try makeFrame(size: 64, index: 0)
-        presenter.prepare(first, plan: p)
-        await presenter.waitUntilIdle()
-        _ = await presenter.present(first, plan: p)                                   // 強調（armed）
-        for i in 1...3 { _ = await presenter.present(try makeFrame(size: 64, index: i), plan: p) }   // 取りこぼし
+        func run(_ i: Int) async throws {
+            let f = try makeFrame(size: 64, index: i)
+            presenter.prepare(f, plan: p)
+            await presenter.waitUntilIdle()
+            _ = await presenter.present(f, plan: p)
+        }
+        try await run(0)                                    // 強調（ここから数える）
+        presenter.enhancementBudgetMS = -1_000
+        for i in 1...2 { try await run(i) }                 // 期限切れの取りこぼし → 3 サンプル中 2 → 停止
         XCTAssertEqual(presenter.statistics.suspensions, 1)
-        // 3 枚目の取りこぼしで閾値を超えた（2/3 > 5%）ので、それ以降の frame は停止中として数える。
-        let before = presenter.statistics.suspended
-        let next = try makeFrame(size: 64, index: 10)
-        presenter.prepare(next, plan: p)
-        await presenter.waitUntilIdle()
-        _ = await presenter.present(next, plan: p)
-        XCTAssertEqual(presenter.statistics.suspended, before + 1, "止めている間に推論した")
+        presenter.enhancementBudgetMS = nil
+        try await run(10)
+        XCTAssertEqual(presenter.statistics.suspended, 1, "止めている間に推論した")
         XCTAssertEqual(presenter.statistics.enhanced, 1)
     }
 
@@ -305,6 +341,46 @@ final class EnhancementPlaybackTests: XCTestCase {
         let stale = await pending
         XCTAssertFalse(stale, "新しい frame の後に古い frame の強調を出した")
         XCTAssertEqual(presenter2.statistics.refined, 0)
+    }
+
+    // MARK: 実際の再生（session の先読み → presenter）
+
+    /// 実ファイルを再生し、session の復号の先読み（maxQueuedFrames = 4）で推論が提示に間に合うこと。
+    /// 推論はほぼ 0 秒の偽物なので、強調されないなら先読みの配線か橋渡しの処理が間に合っていない。
+    @MainActor
+    private func playWithInstantModel(io: ModelManifest.TensorSpec.Kind) async throws -> MetalFramePresenter.EnhancementStatistics {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("fixtures/generated/ntsc480i-22-01.mpg")
+        let core = EngineCore()
+        let engine = DefaultPlayerEngine(core: core)
+        let attachedSurface = await engine.attachMetalSurface(layer: try makeLayer(size: 720), onAspectResolved: { _ in })
+        XCTAssertTrue(attachedSurface)
+        var m = try manifest()
+        m.input.kind = io; m.output.kind = io
+        m.input.width = 704; m.input.height = 480; m.output.width = 704; m.output.height = 480; m.scaleFactor = 1
+        m.constraints.enumeratedSizes = [.init(width: 704, height: 480), .init(width: 720, height: 480)]
+        let attached = await engine.attachEnhancement(runtime: ImmediateRuntime(), model: m)
+        XCTAssertTrue(attached)
+        _ = try await engine.load(FileMediaSource(url: url), selection: nil)
+        var raised = AdaptivePolicyEngine.State()
+        raised.requestedTier = .lightML; raised.activeTier = .lightML
+        await core.seedAdaptiveState(raised)
+        // tier を上げた状態で plan を作り直させる（apply が plan を作り直す。seed だけでは作り直さない）。
+        await core.apply(PlayerSettings(enhancement: .presetConservative))
+        await engine.play()
+        for _ in 0..<200 where engine.stateSnapshot.phase != .ended { try await Task.sleep(nanoseconds: 50_000_000) }
+        XCTAssertEqual(engine.stateSnapshot.phase, .ended)
+        return try XCTUnwrap(engine.enhancementStatistics())
+    }
+
+    /// 16 bit テンソル経路（GPU）なら、先読みで大半の frame が強調されて提示される。
+    @MainActor
+    func testRealPlaybackEnhancesFramesThroughTheSessionLookahead() async throws {
+        let s = try await playWithInstantModel(io: .tensor)
+        print("SESSION-LOOKAHEAD tensor:", s)
+        XCTAssertGreaterThan(s.enhanced, s.eligible / 2, "先読みで強調が間に合っていない: \(s)")
+        XCTAssertEqual(s.suspensions, 0, "偽の即時推論で強調を止めた: \(s)")
     }
 
     // MARK: エンジンの公開 API

@@ -93,8 +93,10 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
         public var missWindowSeconds = 1.0
         public var maxMissRate = 0.05
         public var suspendSeconds = 10.0
-        /// 窓の中でこの数以上の frame を見てから判定する（数 frame で止めない）。
-        public var minSamples = 10
+        /// 窓の中でこの数以上の frame を見てから判定する（1 秒ぶん。数 frame の取りこぼしで止めない）。
+        public var minSamples = 30
+        /// 推論の上限に達しているとき、始めずに待たせておける frame の数（復号は数 frame まとめて進むため）。
+        public var maxPendingJobs = 4
         /// 推論の期限 = 開始から frame の表示長 × この数（提示より前に始めるので、表示長 1 つ分より長く取る）。
         public var deadlineFrames = 4.0
         public init() {}
@@ -141,6 +143,8 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     private var inputs: [FrameKey: RenderFrameInput] = [:]
     private var jobs: [FrameKey: JobState] = [:]
     private var runningJobs = 0
+    /// 上限待ちの推論（復号順）。枠が空いたら先頭から始める。
+    private var pendingJobs: [(key: FrameKey, start: () -> Void)] = []
     private var playbackRate = 1.0
     private var suspendedUntil: Double?
     /// 現世代で最初に強調して提示するまでは取りこぼしを数えない（起動・シーク直後の自己停止を防ぐ）。
@@ -188,6 +192,7 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     private func resetSchedulingLocked() {
         inputs.removeAll()
         jobs.removeAll()
+        pendingJobs.removeAll()
         window.removeAll()
         armed = false
         presentSerial += 1   // 走っている refine を無効にする
@@ -254,31 +259,47 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
             let k = lock.withLock { key(frame) }
             lock.withLock { inputs[k] = input }
             guard let stage = eligibleStage(for: plan) else { return }
-            let start: Bool = lock.withLock {
-                guard playbackRate == 1, !isSuspendedLocked(), k.generation == generation else { return false }
-                if runningJobs >= scheduling.maxJobs { jobs[k] = .skippedBusy; return false }
-                runningJobs += 1
-                jobs[k] = .running(planHash: plan.planHash)
-                return true
-            }
-            guard start else { return }
             let budget = lock.withLock { _enhancementBudgetMS } ?? max(frame.duration.seconds * 1_000 * scheduling.deadlineFrames, 1)
-            Task { [self] in
-                let result: JobState
-                do {
-                    let enhanced = try await stage.enhanceFrame(input, plan: plan, frameID: frame.id,
-                                                                deadline: HostTime.now().advancing(ms: budget))
-                    result = .done(enhanced, planHash: plan.planHash)
-                } catch {
-                    result = .failed(String(describing: error))
-                }
-                lock.withLock {
-                    runningJobs = max(0, runningJobs - 1)
-                    guard k.generation == generation, jobs[k] != nil else { return }   // 古い世代・提示済みは捨てる
-                    jobs[k] = result
+            // 推論を始める（枠が空いたとき。終わったら待ち行列の先頭を始める）。
+            let launch: () -> Void = { [self] in
+                Task { [self] in
+                    let result: JobState
+                    do {
+                        let enhanced = try await stage.enhanceFrame(input, plan: plan, frameID: frame.id,
+                                                                    deadline: HostTime.now().advancing(ms: budget))
+                        result = .done(enhanced, planHash: plan.planHash)
+                    } catch {
+                        result = .failed(String(describing: error))
+                    }
+                    let next: (() -> Void)? = lock.withLock {
+                        runningJobs = max(0, runningJobs - 1)
+                        if k.generation == generation, jobs[k] != nil { jobs[k] = result }   // 古い世代・提示済みは捨てる
+                        return dequeuePendingLocked()
+                    }
+                    next?()
                 }
             }
+            let startNow: Bool = lock.withLock {
+                guard playbackRate == 1, !isSuspendedLocked(), k.generation == generation else { return false }
+                jobs[k] = .running(planHash: plan.planHash)
+                if runningJobs < scheduling.maxJobs { runningJobs += 1; return true }
+                if pendingJobs.count < scheduling.maxPendingJobs { pendingJobs.append((k, launch)); return false }
+                jobs[k] = .skippedBusy
+                return false
+            }
+            if startNow { launch() }
         }
+    }
+
+    /// 待ち行列の先頭（まだ提示されていない・現世代のもの）を取り出し、枠を確保して返す。lock の中で呼ぶ。
+    private func dequeuePendingLocked() -> (() -> Void)? {
+        while !pendingJobs.isEmpty {
+            let entry = pendingJobs.removeFirst()
+            guard entry.key.generation == generation, case .running = jobs[entry.key] else { continue }
+            runningJobs += 1
+            return entry.start
+        }
+        return nil
     }
 
     private func isSuspendedLocked() -> Bool {
@@ -293,10 +314,15 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
         guard let plan else { return .dropped }
         notifyAspect(plan.output.aspect.targetDAR)
         // 先読みの入力があれば使い、無ければここで組み立てる（同じ直列 queue の上なので順序は保たれる）。
-        var input: RenderFrameInput = inputQueue.sync {
-            let k = lock.withLock { key(frame) }
-            if let cached = lock.withLock({ inputs.removeValue(forKey: k) }) { return cached }
-            return buildInput(frame, aspect: plan.output.aspect)
+        // 先に lock の下で引き、無いときだけ直列 queue を待つ（先読み中の後続 frame の組み立てを待たない）。
+        var input: RenderFrameInput
+        if let cached = lock.withLock({ inputs.removeValue(forKey: key(frame)) }) {
+            input = cached
+        } else {
+            input = inputQueue.sync {
+                if let cached = lock.withLock({ inputs.removeValue(forKey: key(frame)) }) { return cached }
+                return buildInput(frame, aspect: plan.output.aspect)
+            }
         }
         input.aspect = plan.output.aspect   // 提示時の plan の比率（先読み時から plan が替わっていても正しく描く）
         let eligible = eligibleStage(for: plan) != nil
@@ -308,11 +334,14 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
             evictLocked(upTo: frame.pts)
             guard eligible else { return (nil, presentSerial) }
             var hit: MLEnhancementStage.EnhancedFrame?
+            var countsAsMiss = true
             switch state {
             case .done(let result, let hash) where hash == plan.planHash:
                 hit = result
             case .done, .none:
                 if isSuspendedLocked() { enhancementStatistics.suspended += 1 } else { enhancementStatistics.notPrepared += 1 }
+                // plan が替わった直後（設定変更）や先読みを通らなかった frame は、推論の遅れではないので数えない。
+                countsAsMiss = false
             case .running:
                 enhancementStatistics.notReady += 1
             case .failed(let message):
@@ -321,7 +350,7 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
             case .skippedBusy:
                 enhancementStatistics.skippedBusy += 1
             }
-            recordLocked(hit: hit != nil)
+            if hit != nil || countsAsMiss { recordLocked(hit: hit != nil) }
             return (hit, presentSerial)
         }
         _ = serial
