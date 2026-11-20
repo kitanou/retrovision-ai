@@ -346,3 +346,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **既知の誤差**: IFO のセル時間の合計（PICHI の通しで 3008.67 s）は、アプリの demux の時間軸（3011.70 s）と約 3 s ずれる（IFO の時間は名目値で、demux 側は program 再開始の修復などを含む）。チャプターの開始を IFO の累積時間で求めると、後ろのチャプターほど数百 ms〜数 s ずれうる。精度を上げるには、NAV pack の `vobu_s_ptm`（VOBU ごとの実際の表示時刻）とセルの先頭 sector を突き合わせる（`DVDNavigation.scanNavPacks` が原料。ただし 3.6 GB の走査になるので、必要なセルの先頭付近だけを読む形にする）。
 - **決定（VM コマンド — `DVDCommand`）**: 8 byte を、type（byte0 >> 5）・直接 / レジスタ（bit4）・副命令（byte1 下位 4 bit）・比較演算（byte1 の bits 6〜4）から解釈する。解釈するのは、Nop / Goto / Break / Exit、JumpTT / JumpVTS_TT / JumpVTS_PTT、JumpSS / CallSS（firstPlay・VMGM メニュー・VTSM・VMGM PGC）、Link（PGCN・PTT・PGN・CN・サブセット）、Set GPRM（即値の代入）。**条件つき（比較つき）・種別 4〜6 の複合形・レジスタ間接・Set の演算子が代入でないもの・未知の副命令は `unsupported`**（レジスタを評価する VM を持たないので推測で実行しない）。実盤のメニューのボタン 12 個は、すべて `JumpVTS_PTT`（ttn 2 / 3 の chapter 1〜5）と `JumpVTS_TT`（ttn 4）、通しの先頭（ttn 1 ptt 1）で、画面のボタンと意味が一致した（左の列 = 第 1 話の各チャプター、右の列 = 第 2 話、「つづけてみる」= 通しの先頭、「TVCM 集」= タイトル 4）。メニューの PGC の先頭コマンド群（30 個）は比較つきの命令（どのボタンを最初に選ぶか等をレジスタで決める）で `unsupported`: 最初に選ぶボタンは PCI の強制選択、なければ 1 番に倒す。
 - **未実装**: ボタンの選択状態の管理と入力（矢印・クリック・Enter）、字幕（SPU）の Metal での重ね合わせ（ボタンのハイライト色の適用）、ボタンの動作を再生に結びつける（タイトルへ切り替え + チャプターの開始時刻へシーク）。
+
+### 2026-11-20 — #15 実素材の自己抽出（animation-480i-01）
+
+- **決定（運用）**: 所有盤から `Scripts/extract-real-fixture.py` で VOBU 境界の短い VOB を切り出し、`fixtures/local/`（`.gitignore` 済み・非同梱）に置く。manifest の status は `local`（sha256 とレシピを記録）。素材が無い環境のテストは skip にして、失敗にはしない（合成素材の「無ければ失敗」とは別扱い）。
+- **実測（PICHI 第 1 話の 30 s・9000 sector。ffprobe / ffmpeg idet / rvprobe）**: 720x480 の MPEG-2、AC-3、29.97、PCE は `topFieldFirst=true`・`progressiveFrame=false`・`pictureStructure=3`（フレーム符号化）。ffprobe は SAR 8:9（4:3）、AVFoundation の `sampleAspect` は 10:11（clean aperture 704 の前提の値で、AspectResolution が吸収する）。idet の多フレーム判定は TFF 305 / BFF 86 / Progressive 79（473 フレーム）で、純粋な 3:2 でも完全な 2:2 でもない（アニメの混在）。
+- **気づき**: 実盤の field 順は **top-first**（合成素材は bottom-first）。`fieldOrder` は format 側では `topFirst`、decodedBuffer 由来の保持記録では `unknown`（出所による差）。検出器と deinterlace の順序の供給元が実盤でも PCE で一貫するかは、次に実機の描画で確かめる。
+- **未実施**: 同じ盤から 60 s の混在素材（`ntsc480i-mixed-01`。字幕・AC-3 つき）と、劣化盤（`damaged-*`。壊した VOB / IFO を自作する）、実 3:2 の素材。

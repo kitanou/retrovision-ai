@@ -66,18 +66,23 @@
     },
     {
       "id": "animation-480i-01",
-      "status": "pending",
-      "kind": "videoTsFolder",
-      "sha256": null,
+      "status": "local",
+      "kind": "localExtract",
+      "sha256": "eb6dd6d8dfa0f853a6c9e83f983760d8416c003099e3530adcc80974bb0d12a3",
       "seconds": 30,
       "properties": [
         "lineArt",
         "flatAreas",
         "interlaced22"
       ],
-      "license": "unresolved",
+      "license": "所有盤からの自己抽出（非同梱・非公開利用。repo に載せない）",
       "expectations": {
         "cadence": "interlaced22"
+      },
+      "path": "fixtures/local/animation-480i-01.vob",
+      "generator": {
+        "recipe": "python3 Scripts/extract-real-fixture.py <VIDEO_TS>/VTS_01_1.VOB 300000 9000 animation-480i-01",
+        "source": "PICHI_PICHI_PITCH1.ISO（手元の所有盤）の VTS_01_1.VOB、sector 300247 から 9000 sector（VOBU 境界）"
       }
     },
     {
