@@ -69,6 +69,9 @@ public final class MetalPresenter: @unchecked Sendable {
     /// 最後に描いた入力（窓リサイズ・一時停止中の再描画用。pixel buffer を保持する）。
     private var lastDraw: (draw: @Sendable (any MTLTexture) throws -> Void, retain: AnyObject,
                            pts: MediaTime, frameID: FrameID)?
+    /// 映像の上に重ねる画（字幕・DVD メニューのハイライト）。毎 frame、映像を描いた直後に重ねる。
+    private var overlayTexture: (any MTLTexture)?
+    private var overlayAspect: AspectResolution?
 
     private let graph: MetalRenderGraph
     private let lock = NSLock()
@@ -137,6 +140,11 @@ public final class MetalPresenter: @unchecked Sendable {
 
         do {
             try draw(drawable.texture)
+            // 映像と同じ geometry でオーバーレイを重ねる（無ければ何もしない）。
+            let overlay = lock.withLock { (overlayTexture, overlayAspect) }
+            if let texture = overlay.0, let aspect = overlay.1 {
+                try graph.drawOverlay(texture, aspect: aspect, onto: drawable.texture)
+            }
         } catch {
             lock.withLock { inFlight = max(0, inFlight - 1) }   // drawable は deinit でプールへ戻る
             throw error
@@ -169,6 +177,22 @@ public final class MetalPresenter: @unchecked Sendable {
     public func redrawLast() -> PresentOutcome? {
         guard let last = lock.withLock({ lastDraw }) else { return nil }
         return try? submit(pts: last.pts, frameID: last.frameID, retain: last.retain, draw: last.draw)
+    }
+
+    /// オーバーレイの画を設定する（nil で消す）。変わったら最後の frame を描き直す（一時停止・静止画のメニューでも
+    /// 選択の変化がすぐ画面に出る）。`aspect` は映像と同じ geometry を使うために、映像の描画計画から渡す。
+    public func setOverlay(_ image: OverlayImage?, aspect: AspectResolution?) {
+        let texture = image.flatMap { graph.makeOverlayTexture($0) }
+        lock.withLock {
+            overlayTexture = texture
+            if let aspect { overlayAspect = aspect }
+        }
+        redrawLast()
+    }
+
+    /// 映像の geometry（取り込み域・目標比率）が変わったときに、オーバーレイの geometry も合わせる。
+    public func updateOverlayAspect(_ aspect: AspectResolution) {
+        lock.withLock { overlayAspect = aspect }
     }
 
     /// 保持している最後の frame を手放す（close・item 切替。復号 buffer を生かし続けない）。

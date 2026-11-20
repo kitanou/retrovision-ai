@@ -52,16 +52,27 @@ public final class MetalRenderContext: @unchecked Sendable {
 
     // MARK: PSO cache（05 §9: stage_variant + function constants の key）
 
+    /// `premultipliedBlend`: 出力を premultiplied alpha として下の画に重ねる（src + dst × (1 − srcα)）。
     func renderPipeline(vertex: String, fragment: String,
                         colorFormat: MTLPixelFormat,
-                        label: String) throws -> any MTLRenderPipelineState {
-        let key = "r:\(vertex)|\(fragment):\(colorFormat.rawValue)"
+                        label: String, premultipliedBlend: Bool = false) throws -> any MTLRenderPipelineState {
+        let key = "r:\(vertex)|\(fragment):\(colorFormat.rawValue)\(premultipliedBlend ? ":blend" : "")"
         if let pso = lock.withLock({ renderPipelines[key] }) { return pso }
         let desc = MTLRenderPipelineDescriptor()
         desc.label = label
         desc.vertexFunction = try function(named: vertex)
         desc.fragmentFunction = try function(named: fragment)
         desc.colorAttachments[0].pixelFormat = colorFormat
+        if premultipliedBlend {
+            let a = desc.colorAttachments[0]!
+            a.isBlendingEnabled = true
+            a.rgbBlendOperation = .add
+            a.alphaBlendOperation = .add
+            a.sourceRGBBlendFactor = .one
+            a.sourceAlphaBlendFactor = .one
+            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
         let pso: any MTLRenderPipelineState
         do {
             pso = try device.makeRenderPipelineState(descriptor: desc)
