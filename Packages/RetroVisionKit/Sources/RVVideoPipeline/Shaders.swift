@@ -373,15 +373,44 @@ kernel void rv_deint_bob_v1(texture2d<float, access::read>  inY  [[texture(0)]],
     }
 }
 
+// ---------- deinterlace 共通（保持 field・空間内挿） ----------
+//
+// 保持する field は「フレームの先に撮った field」（top-first なら偶数行、bottom-first なら奇数行）。
+// 欠けた行の時間的な推定（前 frame の同じ行と現 frame の同じ行の平均）が、保持 field の時刻を
+// 前後から挟む位置になるので、動きに対しても内挿の誤りを抑えられる（yadif と同じ考え方）。
+// topFieldFirst は function constant（bob / IVTC と共有。.unknown は top-first 仮定）。
+
+static inline uint rv_keptParity() { return topFieldFirst ? 0u : 1u; }
+
+// 欠けた行 y の保持 field の隣接行（画像の端では反対側の行を使う。自分自身 = 別 field の行は読まない）。
+static inline int2 rv_keptNeighbours(int y, int H) {
+    return int2(y - 1 >= 0 ? y - 1 : y + 1, y + 1 <= H ? y + 1 : y - 1);
+}
+
+// 辺の方向に沿った 2 点内挿（edge-directed）。対 (x+a, yu), (x-a, yd) の中点は必ず (x, y) を通る。
+// 費用は 3 画素幅の絶対差の和（1 画素だと細い線で別の線を拾って点線になる）。±5 画素まで探し、
+// 同点なら真っすぐ（a = 0）を選ぶよう a の大きさに小さな罰を足す。結果は 2 点の中間値なので overshoot しない。
+static float rv_spatialInterp(texture2d<float, access::read> inY, int x, int yu, int yd, int W) {
+    int bestA = 0;
+    float bestCost = 1e30;
+    for (int a = -5; a <= 5; a++) {
+        float cost = 0.004 * float(abs(a));
+        for (int k = -1; k <= 1; k++) {
+            float vu = inY.read(uint2(uint(clamp(x + a + k, 0, W)), uint(yu))).r;
+            float vd = inY.read(uint2(uint(clamp(x - a + k, 0, W)), uint(yd))).r;
+            cost += fabs(vu - vd);
+        }
+        if (cost < bestCost) { bestCost = cost; bestA = a; }
+    }
+    return (inY.read(uint2(uint(clamp(x + bestA, 0, W)), uint(yu))).r
+            + inY.read(uint2(uint(clamp(x - bestA, 0, W)), uint(yd))).r) * 0.5;
+}
+
 // ---------- deinterlace: edge-directed（空間方向・単一フレームのみ。05 §5.2） ----------
 //
-// 偶数行は保持（一方の field の線そのまま）。奇数行（他 field が来る線）は源の値を
-// 使わず、保持 field の上下線（y-1, y+1）からの「対称 2 点内挿」で埋める:
-//   対 (x+a, y-1), (x-a, y+1) を結ぶ線分の中点は必ず (x, y) を通る。
-//   a を -4..+4 で走らせ、両端の画素値の差が最小（= 一本の辺を跨ぐ対）a を選ぶ。
-// 等速で動く斜 edge では選ばれる a が実際の傾きに一致し、simple average の
-// gray fringe（comb 低減が働かない）が出ない。平坦部は a の選びようと同じ値 → 無変化。
-// 結果は常に 2 点の中間値なので overshoot 無し。chroma は源のまま（補間しない）。
+// 保持 field の行はそのまま、欠けた行は源の値を使わず保持 field の上下の行から内挿する。
+// 等速で動く斜 edge では選ばれる a が実際の傾きに一致し、単純平均の gray fringe が出ない。
+// 色は保持 field の chroma 行だけから補間（別の瞬間の色を混ぜない — D8）。
 
 kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[texture(0)]],
                                      texture2d<float, access::read>  inUV [[texture(1)]],
@@ -391,36 +420,20 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
     uint w = outY.get_width();
     uint h = outY.get_height();
     if (gid.x >= w || gid.y >= h) return;
-    bool keepRow = (gid.y & 1u) == 0u;   // 偶数行は保持（源の field 線）
-    if (keepRow) {
+    int x = int(gid.x), y = int(gid.y);
+    int W = int(w) - 1, H = int(h) - 1;
+    if ((gid.y & 1u) == rv_keptParity()) {
         outY.write(inY.read(gid), gid);
     } else {
-        int x = int(gid.x), y = int(gid.y);
-        int W = int(w) - 1, H = int(h) - 1;
-        int yu = max(y - 1, 0), yd = min(y + 1, H);   // 保持 field の隣接線（y は奇数 → 偶数行）
-        int bestA = 0;
-        float bestCost = 1e30;
-        for (int a = -4; a <= 4; a++) {
-            float vu = inY.read(uint2(clamp(x + a, 0, W), yu)).r;
-            float vd = inY.read(uint2(clamp(x - a, 0, W), yd)).r;
-            float cost = fabs(vu - vd);
-            if (cost < bestCost) { bestCost = cost; bestA = a; }
-        }
-        float vu = inY.read(uint2(clamp(x + bestA, 0, W), yu)).r;
-        float vd = inY.read(uint2(clamp(x - bestA, 0, W), yd)).r;
-        outY.write(float4((vu + vd) * 0.5, 0.0, 0.0, 1.0), gid);
+        int2 n = rv_keptNeighbours(y, H);
+        outY.write(float4(rv_spatialInterp(inY, x, n.x, n.y, W), 0.0, 0.0, 1.0), gid);
     }
-    // 色（4:2:0）も field 交互（偶数 chroma 行 = 保持した上 field）。前 frame が無い = 全画素を
-    // 「動き」とみなすのと同じで、奇数 chroma 行は保持 field の上下の行から補間する（motion-adaptive の
-    // 動く画素と同じ規則。weave すると別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る）。
     if (gid.x < w / 2u && gid.y < h / 2u) {
         int cy = int(gid.y), cH = int(h / 2u) - 1;
         float2 c = inUV.read(gid).rg;
-        if ((cy & 1) == 1) {
-            float2 up = inUV.read(uint2(gid.x, uint(max(cy - 1, 0)))).rg;
-            float2 down = inUV.read(uint2(gid.x, uint(min(cy + 1, cH)))).rg;
-            // 下端で奇数行の下が無いときは上の行だけ（cy + 1 > cH なら down は自分 = 別 field なので使わない）
-            c = (cy + 1 <= cH) ? (up + down) * 0.5 : up;
+        if ((gid.y & 1u) != rv_keptParity()) {
+            int2 n = rv_keptNeighbours(cy, cH);
+            c = (inUV.read(uint2(gid.x, uint(n.x))).rg + inUV.read(uint2(gid.x, uint(n.y))).rg) * 0.5;
         }
         outUV.write(float4(c.x, c.y, 0.0, 1.0), gid);
     }
@@ -428,17 +441,17 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
 
 // ---------- deinterlace: motion-adaptive（時間 + 空間。05 §5.2 の既定。前 frame が要る） ----------
 //
-// 偶数行は保持（edge-directed と同じ）。奇数行（他 field の線）は画素ごとに動きを測り、
-//   - 静止: 現 frame の他 field の線をそのまま使う（weave。垂直解像度を保つ — 静止した
-//     細い文字・字幕・縞が edge-directed の内挿で崩れない）
-//   - 動き: edge-directed の空間内挿（comb を出さない）
-// を連続的に混ぜる。動きの指標は「前 frame との同位置の差」を、補間行 y とその上下の
-// 保持行 y±1 の 3 点の最大で取る（同 parity 同士の比較なので、field 間の時間差で
-// 静止物を動きと誤判定しない）。しきい値は輝度 [0,1] 正規化値（video range の
-// 約 7〜23 階調）。前 frame が無い / 寸法が違うときは host 側が edge-directed に倒す。
+// 保持 field の行はそのまま。欠けた行は、
+//   空間 S = edge-directed の内挿
+//   時間 D = (前 frame の同じ行 + 現 frame の同じ行) / 2（保持 field の時刻の推定）
+// を、動きの大きさ diff で挟む: 結果 = clamp(S, D - diff, D + diff)（yadif と同じ形）。
+//   - 静止: diff ≈ 0 → D（= 他 field の線そのまま = weave。垂直解像度・静止した細い文字や縞を保つ）
+//   - 動き: diff が大きく S がそのまま通る（comb を出さない）。S が D から外れすぎるときだけ D 側へ寄る
+//     ので、細い線で内挿の方向を間違えても点線にならない。
+// diff は、欠けた行の前 frame との差の半分（= 前後の同 field の差の半分）と、保持 field の
+// 前 frame との差の大きい方を、左右 1 画素まで広げて取る（1 画素ごとに切り替わると縞が出る）。
 
-// 動き指標（輝度。前 frame との同位置差を、左右 1 画素・上下の保持行まで広げた 3x3 の最大）。
-// 1 画素ごとに weave / 空間内挿が切り替わると、動く edge に点線状の縞が出る（実盤 ISO で確認）。
+// 動き指標（輝度。前 frame との同位置差を、左右 1 画素・上下の保持行まで広げた 3x3 の最大）。chroma の判定に使う。
 static float rv_motionAt(texture2d<float, access::read> inY,
                          texture2d<float, access::read> prevY, int x, int y, int W, int H) {
     int yu = max(y - 1, 0), yd = min(y + 1, H);
@@ -462,41 +475,37 @@ kernel void rv_deint_motionAdaptive_v1(texture2d<float, access::read>  inY  [[te
     int h = int(outY.get_height());
     int W = w - 1, H = h - 1;
     int x = int(gid.x), y = int(gid.y);
+    uint kept = rv_keptParity();
     if (x < w && y < h) {
-        bool keepRow = (y & 1) == 0;
-        if (keepRow) {
+        if ((uint(y) & 1u) == kept) {
             outY.write(inY.read(gid), gid);
         } else {
-            int yu = max(y - 1, 0), yd = min(y + 1, H);
-            // 空間内挿（edge-directed と同じ）
-            int bestA = 0;
-            float bestCost = 1e30;
-            for (int a = -4; a <= 4; a++) {
-                float vu = inY.read(uint2(clamp(x + a, 0, W), yu)).r;
-                float vd = inY.read(uint2(clamp(x - a, 0, W), yd)).r;
-                float cost = fabs(vu - vd);
-                if (cost < bestCost) { bestCost = cost; bestA = a; }
+            int2 n = rv_keptNeighbours(y, H);
+            float spatial = rv_spatialInterp(inY, x, n.x, n.y, W);
+            float cur = inY.read(gid).r;
+            float temporal = (cur + prevY.read(gid).r) * 0.5;
+            float diff = 0.0;
+            for (int dx = -1; dx <= 1; dx++) {
+                uint sx = uint(clamp(x + dx, 0, W));
+                float missing = fabs(inY.read(uint2(sx, uint(y))).r - prevY.read(uint2(sx, uint(y))).r) * 0.5;
+                float keptChange = (fabs(inY.read(uint2(sx, uint(n.x))).r - prevY.read(uint2(sx, uint(n.x))).r)
+                                    + fabs(inY.read(uint2(sx, uint(n.y))).r - prevY.read(uint2(sx, uint(n.y))).r)) * 0.5;
+                diff = max(diff, max(missing, keptChange));
             }
-            float spatial = (inY.read(uint2(clamp(x + bestA, 0, W), yu)).r
-                             + inY.read(uint2(clamp(x - bestA, 0, W), yd)).r) * 0.5;
-            float weave = inY.read(gid).r;
-            float k = smoothstep(0.02, 0.07, rv_motionAt(inY, prevY, x, y, W, H));
-            outY.write(float4(mix(weave, spatial, k), 0.0, 0.0, 1.0), gid);
+            outY.write(float4(clamp(spatial, temporal - diff, temporal + diff), 0.0, 0.0, 1.0), gid);
         }
     }
-    // 色（4:2:0）。インターレースでは chroma の行も field 交互（偶数行 = 上 field）なので、
-    // 動く画素の色を weave すると別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る
-    // （chroma upsampling error）。動く画素は、輝度で保持した field（偶数行）の chroma だけから
-    // 補間する。静止画素は従来どおり。
+    // 色（4:2:0）。インターレースでは chroma の行も field 交互なので、動く画素の色を weave すると
+    // 別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る。動く画素は保持 field の chroma だけから
+    // 補間する。静止画素は従来どおり weave。
     int cw = int(outUV.get_width());
     int ch = int(outUV.get_height());
     if (x < cw && y < ch) {
         float2 weaveC = inUV.read(gid).rg;
         float2 outC = weaveC;
-        if ((y & 1) == 1) {
-            float2 up = inUV.read(uint2(x, uint(max(y - 1, 0)))).rg;
-            float2 down = inUV.read(uint2(x, uint(min(y + 1, ch - 1)))).rg;
-            float2 spatialC = (up + down) * 0.5;
+        if ((uint(y) & 1u) != kept) {
+            int2 n = rv_keptNeighbours(y, ch - 1);
+            float2 spatialC = (inUV.read(uint2(x, uint(n.x))).rg + inUV.read(uint2(x, uint(n.y))).rg) * 0.5;
             // 対応する輝度位置（2x, 2y の周辺）の動きを使う。
             float k = smoothstep(0.02, 0.07, rv_motionAt(inY, prevY, min(2 * x, W), min(2 * y, H), W, H));
             outC = mix(weaveC, spatialC, k);

@@ -247,7 +247,8 @@ public final class MetalRenderGraph: @unchecked Sendable {
         }
         var constants: MTLFunctionConstantValues?
         var variant = ""
-        if functionName == "rv_deint_bob_v1" || functionName == "rv_ivtc_weave_v1" {
+        // どの deinterlace kernel も保持 field（先に撮った方）を field 順序で決める。
+        do {
             // field 順序を function constant で渡す（bottom-first 素材は上 field が奇数列 —
             // 04 §3 の PCE 実測。PSO 再作成は field 順序が変わるときだけ）。
             let cv = MTLFunctionConstantValues()
