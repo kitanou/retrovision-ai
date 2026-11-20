@@ -140,12 +140,14 @@ final class MetalPipelineTests: XCTestCase {
         // 実 PSO 生成（colorConvert は bgra8 の render pipeline、deint/detector は compute）
         _ = try Self.context.renderPipeline(vertex: "rv_vs_fullscreen", fragment: "rv_colorConvert_v1",
                                             colorFormat: .bgra8Unorm, label: "test")
-        _ = try Self.context.computePipeline(function: "rv_deint_edgeDirected_v1", label: "test")
         _ = try Self.context.computePipeline(function: "rv_fieldMatch_sad_v1", label: "test")
         let cv = MTLFunctionConstantValues()
         var topFirst = true
         cv.setConstantValue(&topFirst, type: .bool, index: 0)
-        _ = try Self.context.computePipeline(function: "rv_deint_bob_v1", constants: cv, label: "test")
+        // field 順序の function constant が要る kernel（保持 field をそれで決める）
+        for name in ["rv_deint_bob_v1", "rv_deint_edgeDirected_v1", "rv_deint_motionAdaptive_v1"] {
+            _ = try Self.context.computePipeline(function: name, constants: cv, variant: "topFirst=true", label: "test")
+        }
     }
 
     // MARK: - 2. 既知 YUV → RGB（GPU 経路の数値同一性。±3/255）
@@ -414,6 +416,95 @@ final class MetalPipelineTests: XCTestCase {
         let movingGap = abs(Int(moving[6][10].b) - Int(moving[4][10].b))
         XCTAssertGreaterThan(stillGap, 20, "静止は chroma を weave（偶数行と奇数行の色が違うまま）")
         XCTAssertLessThan(movingGap, 6, "動きは偶数行の chroma から補間（奇数行も偶数行と同じ色になる）")
+    }
+
+    // MARK: - 5c. 動く細線・静止の細かい縞を、本物の progressive（真値）と比べる
+
+    private static let sceneW = 96, sceneH = 64
+
+    /// 真値の輝度（時刻 t は field 単位）。左の帯 x < 16 は静止した 1 行ごとの縞（weave で保つべき細部）、
+    /// それ以外は右へ動く 細い斜線・浅い斜線・縁（deinterlace が崩しやすいもの）。
+    private func sceneLuma(x: Int, y: Int, t: Double) -> UInt8 {
+        if x < 16 { return y % 2 == 0 ? 80 : 180 }
+        let fx = Double(x), fy = Double(y)
+        var v = 60.0 + fy * 0.4
+        func line(_ d: Double, width: Double) { v = max(v, 60 + 170 * min(max(width + 0.5 - d, 0), 1)) }
+        let c = 1.5 * t                       // 1 field あたり 1.5 px 右へ
+        line(abs(fx - 0.7 * fy - (30 + c)), width: 0.7)                 // 細い急な斜線
+        line(abs(fy - 0.15 * fx - (22 + 0.0 * c) + 0.15 * c), width: 0.6)   // 浅い線（ELA が苦手）
+        if fx > 70 + c * 0.5 && fx < 90 + c * 0.5 && fy > 6 && fy < 18 { v = 200 }   // 縁のある矩形
+        return UInt8(min(max(v, 16), 235))
+    }
+
+    private func sceneFrame(k: Int, order: FieldOrder) throws -> CVPixelBuffer {
+        let w = Self.sceneW, h = Self.sceneH
+        return try makeNV12(width: w, height: h, luma: { row in
+            let first = (order == .bottomFirst) ? 1 : 0        // 先に撮った field の parity
+            let t = 2.0 * Double(k) + (row % 2 == first ? 0 : 1)
+            return (0..<w).map { self.sceneLuma(x: $0, y: row, t: t) }
+        }, chroma: { _ in [UInt8](repeating: 128, count: w) })
+    }
+
+    private func renderScene(mode: DeinterlaceMode, order: FieldOrder, k: Int) throws
+        -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        let w = Self.sceneW, h = Self.sceneH
+        var input = progressiveInput(try sceneFrame(k: k, order: order), width: w, height: h)
+        input.interlace = InterlaceInfo(fieldCount: 2, fieldOrder: order, cadence: .interlaced22,
+                                        fieldSource: .formatDescription)
+        input.previousPixelBuffer = try sceneFrame(k: k - 1, order: order)
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(11), tier: .metalOnly,
+                              stages: [.init(stage: .deinterlace, parameters: DeinterlaceParameters(mode: mode)),
+                                       .init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        _ = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        return readBack(target)
+    }
+
+    /// 真値（k フレーム目の最初の field の時刻の progressive 画像）。
+    private func sceneTruth(k: Int) throws -> [[(r: UInt8, g: UInt8, b: UInt8)]] {
+        let w = Self.sceneW, h = Self.sceneH
+        let pb = try makeNV12(width: w, height: h, luma: { row in
+            (0..<w).map { self.sceneLuma(x: $0, y: row, t: 2.0 * Double(k)) }
+        }, chroma: { _ in [UInt8](repeating: 128, count: w) })
+        let input = progressiveInput(pb, width: w, height: h)
+        let target = try makeTarget(width: w, height: h)
+        let plan = RenderPlan(id: PlanID(12), tier: .metalOnly,
+                              stages: [.init(stage: .colorConvert, parameters: ColorConvertParameters())],
+                              output: OutputContract(displayPixels: PixelSize(width: Int32(w), height: Int32(h)),
+                                                     aspect: input.aspect, present: .offscreen))
+        _ = try Self.graph.render(input, plan: plan, to: target)
+        drainGPU()
+        return readBack(target)
+    }
+
+    /// (動く領域の平均絶対誤差, 静止帯の平均絶対誤差)。端 4 画素・上下 4 行は除く。
+    private func sceneError(mode: DeinterlaceMode, order: FieldOrder) throws -> (moving: Double, still: Double) {
+        let out = try renderScene(mode: mode, order: order, k: 3)
+        let truth = try sceneTruth(k: 3)
+        var m = 0.0, mn = 0, s = 0.0, sn = 0
+        for y in 4..<(Self.sceneH - 4) {
+            for x in 4..<(Self.sceneW - 4) {
+                let e = abs(Double(out[y][x].r) - Double(truth[y][x].r))
+                if x < 16 { s += e; sn += 1 } else { m += e; mn += 1 }
+            }
+        }
+        return (m / Double(mn), s / Double(sn))
+    }
+
+    /// 改良前（欠けた行を偶数行固定・1 画素の費用で内挿）の誤差は top-first 3.6 / bottom-first 7.7（動く領域）、
+    /// 静止帯 0.35 / 0.52。保持 field を「先に撮った方」にし、時間推定で内挿を挟む（yadif 型）と 2.7 / 2.6、0.13 / 0.12。
+    func testMotionAdaptiveStaysCloseToTheProgressiveTruth() throws {
+        guard gpuGate() else { return }
+        for order in [FieldOrder.topFirst, .bottomFirst] {
+            let ma = try sceneError(mode: .motionAdaptive, order: order)
+            let ed = try sceneError(mode: .edgeDirected, order: order)
+            XCTAssertLessThan(ma.moving, 3.2, "\(order): 動く細線の誤差が大きい（点線・ギザギザ）")
+            XCTAssertLessThan(ma.still, 0.3, "\(order): 静止した細かい縞が崩れた")
+            XCTAssertLessThan(ed.moving, 5.0, "\(order): edge-directed の動く領域の誤差")
+        }
     }
 
     // MARK: - 5e. inverse telecine の weave 復元（画素単位で元の映画コマと一致）
