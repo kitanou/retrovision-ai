@@ -74,6 +74,64 @@ fragment float4 rv_rgbPresent_v1(const VSOut in [[stage_in]],
     return float4(rgb.sample(s, q).rgb, 1.0);
 }
 
+// ---------- RGB の最終拡大 v2（設計 11 §5.6。AI 段の後 / RGB 経路の最終 scale） ----------
+//
+// 軸ごとに倍率で核を選ぶ: 拡大（invScale <= 1）は Catmull-Rom（4 tap）、縮小は三角（tent）核を
+// 倍率に合わせて広げる（半径 = invScale 画素。1 回の bilinear sample では縮小で縞・モアレが出る —
+// PAL を 1080p に出すときの縦 0.9375 倍など）。重みは正規化する。片側の tap は 4 まで（縮小 1/4 まで正確）。
+// 8 bit の drawable へ書くので、量子化の段差を崩す ±0.5 LSB の ordered noise を足す（dither フラグ）。
+
+struct RGBPresentParams {
+    float4 destRect;
+    float2 invScale;   // 出力 1 画素あたりの入力画素数（軸ごと）
+    uint dither;
+    uint pad;
+};
+
+static float rv_catmullRom(float x) {
+    x = fabs(x);
+    if (x < 1.0) { return 1.5 * x * x * x - 2.5 * x * x + 1.0; }
+    if (x < 2.0) { return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0; }
+    return 0.0;
+}
+
+static float rv_resampleWeight(float d, float invScale) {
+    if (invScale <= 1.0) { return rv_catmullRom(d); }
+    return max(0.0, 1.0 - fabs(d) / invScale);
+}
+
+fragment float4 rv_rgbPresent_v2(const VSOut in [[stage_in]],
+                                 constant RGBPresentParams& p [[buffer(0)]],
+                                 texture2d<float, access::read> rgb [[texture(0)]]) {
+    float2 q = (in.uv - p.destRect.xy) / p.destRect.zw;
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return float4(0.0, 0.0, 0.0, 1.0); }
+    float2 size = float2(rgb.get_width(), rgb.get_height());
+    float2 pos = q * size - 0.5;
+    float2 radius = float2(p.invScale.x <= 1.0 ? 2.0 : min(p.invScale.x, 4.0),
+                           p.invScale.y <= 1.0 ? 2.0 : min(p.invScale.y, 4.0));
+    int2 lo = int2(ceil(pos - radius)), hi = int2(floor(pos + radius));
+    int2 maxC = int2(size) - 1;
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    for (int j = lo.y; j <= hi.y; j++) {
+        float wy = rv_resampleWeight(float(j) - pos.y, p.invScale.y);
+        if (wy == 0.0) { continue; }
+        for (int i = lo.x; i <= hi.x; i++) {
+            float wx = rv_resampleWeight(float(i) - pos.x, p.invScale.x);
+            if (wx == 0.0) { continue; }
+            int2 c = clamp(int2(i, j), int2(0), maxC);
+            acc += wx * wy * rgb.read(uint2(c)).rgb;
+            wsum += wx * wy;
+        }
+    }
+    float3 c = acc / max(wsum, 1e-6);
+    if (p.dither != 0u) {
+        float n = fract(52.9829189 * fract(dot(in.pos.xy, float2(0.06711056, 0.00583715))));
+        c += (n - 0.5) / 255.0;
+    }
+    return float4(clamp(c, 0.0, 1.0), 1.0);
+}
+
 // ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
 //
 // 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。
