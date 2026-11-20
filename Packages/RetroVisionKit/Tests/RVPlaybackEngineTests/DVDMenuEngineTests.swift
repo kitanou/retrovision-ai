@@ -86,6 +86,20 @@ final class DVDMenuEngineTests: XCTestCase {
         await source.close()
     }
 
+    func testShowMenuDuringPlaybackReturnsToTheTitleMenu() async throws {
+        let (engine, source) = try await openMenu()
+        _ = await engine.menuInput(.down)
+        _ = await engine.menuInput(.down)
+        _ = await engine.menuInput(.activate)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(engine.isMenuActive, "本編の再生中")
+        await engine.showMenu()
+        let back = try await waitForMenu(engine, seconds: 5)
+        XCTAssertTrue(back, "再生中の「メニュー」操作でメニューに戻る")
+        await engine.close()
+        await source.close()
+    }
+
     func testInputIsIgnoredWithoutAMenu() async {
         let engine = DefaultPlayerEngine()
         let handled = await engine.menuInput(.activate)

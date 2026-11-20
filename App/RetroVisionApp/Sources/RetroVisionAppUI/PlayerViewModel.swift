@@ -337,6 +337,9 @@ final class PlayerViewModel {
 
     func menuActivate() { Task { _ = await engine.menuInput(.activate) } }
 
+    /// 再生中の DVD タイトルからタイトルメニューへ戻る。
+    func showDVDMenu() { Task { await engine.showMenu() } }
+
     func menuPointer(x: Double, y: Double, width: Double, height: Double, click: Bool) {
         guard engine.isMenuActive else { return }
         Task { _ = await engine.menuInput(.pointer(x: x, y: y, viewWidth: width, viewHeight: height, click: click)) }
