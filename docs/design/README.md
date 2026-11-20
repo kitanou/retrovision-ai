@@ -48,6 +48,7 @@ SDK ヘッダで**存在を確認済み**の API（設計の依存先にして�
 | [08-adaptive-control.md](08-adaptive-control.md) | 適応品質制御、メトリクス、ベンチマーク出力形式 | #9 |
 | [09-testing.md](09-testing.md) | テスト戦略、フィクスチャ、CI、性能ゲート | Phase 0〜5 |
 | [10-open-questions.md](10-open-questions.md) | 未決事項の意思決定ログ（実験・判断ゲート・既定値） | 全体 |
+| [11-upscale-pipeline.md](11-upscale-pipeline.md) | 復号からアップスケールまでの詳細設計（寸法・形式・SR の橋渡し・先読み・実装順。05/06/07 との食い違いの整理） | Phase 2〜4 |
 
 ## 設計の追跡マトリクス
 
