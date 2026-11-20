@@ -65,8 +65,8 @@ extension MetalRenderGraph {
             throw PlaybackError(kind: .render(.deviceUnavailable), recovery: .retryWith(.lowerTier),
                                 userMessage: "command buffer を作成できません")
         }
-        let pso = try context.renderPipeline(vertex: "rv_vs_fullscreen", fragment: "rv_rgbPresent_v1",
-                                             colorFormat: target.pixelFormat, label: "rgbPresent_v1")
+        let pso = try context.renderPipeline(vertex: "rv_vs_fullscreen", fragment: "rv_rgbPresent_v2",
+                                             colorFormat: target.pixelFormat, label: "rgbPresent_v2")
         // letterbox の destRect（colorConvert と同じ geometry。source は全面）。
         let geo = Self.geometry(aspect: AspectResolution(targetDAR: aspect.targetDAR,
                                                          cleanAperture: PixelRect(x: 0, y: 0, width: Int32(rgb.width),
@@ -74,7 +74,13 @@ extension MetalRenderGraph {
                                                          source: aspect.source),
                                 codedWidth: rgb.width, codedHeight: rgb.height,
                                 targetWidth: target.width, targetHeight: target.height)
-        var dest = SIMD4<Float>(geo.dest.0, geo.dest.1, geo.dest.2, geo.dest.3)
+        // 軸ごとの倍率（出力 1 画素あたりの入力画素数）。拡大は Catmull-Rom、縮小は tent 核（設計 11 §5.6）。
+        let destW = max(Double(geo.dest.2) * Double(target.width), 1)
+        let destH = max(Double(geo.dest.3) * Double(target.height), 1)
+        var params = RGBPresentParams(
+            destRect: SIMD4<Float>(geo.dest.0, geo.dest.1, geo.dest.2, geo.dest.3),
+            invScale: SIMD2<Float>(Float(Double(rgb.width) / destW), Float(Double(rgb.height) / destH)),
+            dither: target.pixelFormat == .bgra8Unorm || target.pixelFormat == .rgba8Unorm ? 1 : 0, pad: 0)
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target
         pass.colorAttachments[0].loadAction = .clear
@@ -85,9 +91,8 @@ extension MetalRenderGraph {
                                 userMessage: "encoder を作れません")
         }
         enc.setRenderPipelineState(pso)
-        enc.setFragmentBytes(&dest, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        enc.setFragmentBytes(&params, length: MemoryLayout<RGBPresentParams>.stride, index: 0)
         enc.setFragmentTexture(rgb.texture, index: 0)
-        enc.setFragmentSamplerState(context.sampler(minFilterNearest: false), index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         let keepAlive = rgb   // GPU が読み終えるまで buffer を生かす
@@ -119,4 +124,12 @@ extension PixelBufferImporter {
         guard status == kCVReturnSuccess, let cv, let texture = CVMetalTextureGetTexture(cv) else { return nil }
         return BGRATexture(texture: texture, cvTexture: cv)
     }
+}
+
+/// `rv_rgbPresent_v2` の引数（Shaders.swift の `RGBPresentParams` と同じ並び）。
+struct RGBPresentParams {
+    var destRect: SIMD4<Float>
+    var invScale: SIMD2<Float>
+    var dither: UInt32
+    var pad: UInt32
 }
