@@ -361,3 +361,10 @@ Phase 1 の実装・測定（[EXP-001](../experiments/EXP-001-dependency-and-vid
 - **接続**: メニューの表示前に PGC の PRE を評価して初期の選択ボタン（SPRM 8）を決め、ボタンの決定は VM で評価（条件つき・Set・Link に対応。リンクのボタン欄は選択に反映）。実盤 PICHI では初期選択は従来と同じ 1 番（画面で確認）。
 - **取り込みの訂正**: #50 は #49 の取り込み後に積み先のブランチへ入ったため main に入っていなかった。同じ 2 コミットを main へ載せ直した（本 PR）。
 - **次**: タイトルの PGC の POST / CELL（本編の終わり → メニューへ戻る）と、`link` の実行（メニュー内のセル / PGC リンク）。
+
+### 2026-11-20 — #15 実素材の自己抽出（animation-480i-01）
+
+- **決定（運用）**: 所有盤から `Scripts/extract-real-fixture.py` で VOBU 境界の短い VOB を切り出し、`fixtures/local/`（`.gitignore` 済み・非同梱）に置く。manifest の status は `local`（sha256 とレシピを記録）。素材が無い環境のテストは skip にして、失敗にはしない（合成素材の「無ければ失敗」とは別扱い）。
+- **実測（PICHI 第 1 話の 30 s・9000 sector。ffprobe / ffmpeg idet / rvprobe）**: 720x480 の MPEG-2、AC-3、29.97、PCE は `topFieldFirst=true`・`progressiveFrame=false`・`pictureStructure=3`（フレーム符号化）。ffprobe は SAR 8:9（4:3）、AVFoundation の `sampleAspect` は 10:11（clean aperture 704 の前提の値で、AspectResolution が吸収する）。idet の多フレーム判定は TFF 305 / BFF 86 / Progressive 79（473 フレーム）で、純粋な 3:2 でも完全な 2:2 でもない（アニメの混在）。
+- **気づき**: 実盤の field 順は **top-first**（合成素材は bottom-first）。`fieldOrder` は format 側では `topFirst`、decodedBuffer 由来の保持記録では `unknown`（出所による差）。検出器と deinterlace の順序の供給元が実盤でも PCE で一貫するかは、次に実機の描画で確かめる。
+- **未実施**: 同じ盤から 60 s の混在素材（`ntsc480i-mixed-01`。字幕・AC-3 つき）と、劣化盤（`damaged-*`。壊した VOB / IFO を自作する）、実 3:2 の素材。
