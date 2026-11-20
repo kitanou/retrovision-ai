@@ -98,6 +98,17 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
 
     public func clearEnhancement() { lock.withLock { enhancer = nil } }
 
+    // MARK: オーバーレイ（DVD メニューのハイライトなど。映像の上に重ねる）
+
+    /// 直近に描いた映像の geometry（取り込み域・目標比率）。ポインタ座標の変換に使う。
+    public var currentAspect: AspectResolution? { lock.withLock { latestAspect } }
+    private var latestAspect: AspectResolution?
+
+    /// オーバーレイを設定する（nil で消す）。映像と同じ geometry で重なり、すぐ描き直される。
+    public func setOverlay(_ image: OverlayImage?) {
+        presenter.setOverlay(image, aspect: lock.withLock { latestAspect })
+    }
+
     /// 推論を 1 つだけ走らせるための取得。取れなければ false（その frame は非強調で提示する）。
     private func claimEnhancement() -> Bool {
         lock.withLock {
@@ -130,6 +141,8 @@ public final class MetalFramePresenter: VideoFramePresenter, @unchecked Sendable
     public func present(_ frame: DecodedVideoFrame, plan: RenderPlan?) async -> FrameDeliveryOutcome {
         guard let plan else { return .dropped }
         notifyAspect(plan.output.aspect.targetDAR)
+        lock.withLock { latestAspect = plan.output.aspect }
+        presenter.updateOverlayAspect(plan.output.aspect)
         // telecine の判断: interlaced 素材だけ縞スコアを測る（progressive では不要）。
         let interlaced = frame.format.interlace.fieldCount >= 2
         let score = interlaced ? CombMetric.toothScore(frame.pixelBuffer) : 0
