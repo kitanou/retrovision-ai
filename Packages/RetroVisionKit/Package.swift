@@ -85,6 +85,6 @@ let package = Package(
             dependencies: ["RVDecode", "RVMediaCore", "RVMediaSources"]
         ),
         .testTarget(name: "RVPlaybackEngineTests",
-                    dependencies: ["RVPlaybackEngine", "RVDecode", "RVMediaCore", "RVMediaSources"]),
+                    dependencies: ["RVPlaybackEngine", "RVDecode", "RVMediaCore", "RVMediaSources", "RVVideoPipeline"]),
     ]
 )

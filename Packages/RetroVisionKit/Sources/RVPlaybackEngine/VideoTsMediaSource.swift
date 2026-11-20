@@ -15,7 +15,7 @@ import RVDecode
 // SegmentPSDemuxer 頭注。open 時の走査は demuxQueue 側で走り、再 open では作らない —
 // 冪等 cache と同じ思想）。
 
-public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
+public actor VideoTsMediaSource: MediaSource, DemuxerProviding, DVDMenuAssetProviding {
     public let rootURL: URL
     private var chainsByID: [ItemID: VideoTsChain] = [:]
     private var demuxers: [ItemID: any Demuxer] = [:]
@@ -131,6 +131,16 @@ public actor VideoTsMediaSource: MediaSource, DemuxerProviding {
         // VIDEO_TS を直接指す file demuxer へのフォールバックも無い = probe 待ち。
         // ここに来る経路は engine の契約外（open 前に wirePipeline は走らない）。
         return AVFoundationDemuxer(url: rootURL.appendingPathComponent("VIDEO_TS"))
+    }
+
+    /// タイトルメニュー（静止画）の VOB と IFO（同じ名前の .IFO）。
+    public func menuAssets(for item: ItemID) async -> DVDMenuAssets? {
+        guard let chain = chainsByID[item], chain.isTitleMenu, let vob = chain.partURLs.first else { return nil }
+        let dir = vob.deletingLastPathComponent()
+        let base = vob.deletingPathExtension().lastPathComponent
+        let ifo = ["IFO", "ifo"].map { dir.appendingPathComponent("\(base).\($0)") }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+        return DVDMenuAssets(vobURL: vob, ifoURL: ifo, vtsNumber: chain.vtsNumber)
     }
 
     /// demuxer cache を降ろす（DiscImageMediaSource の close から呼ぶ。AVFoundation が

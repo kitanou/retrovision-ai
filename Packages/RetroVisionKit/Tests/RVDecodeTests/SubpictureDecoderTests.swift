@@ -137,4 +137,45 @@ final class SubpictureDecoderTests: XCTestCase {
         spu[dcsq + 4] = 0x42
         XCTAssertNil(SubpictureDecoder.decode(Data(spu)))
     }
+
+    // MARK: program stream からの取り出し
+
+    /// pack header + 指定の PES 1 個（payload = 先頭の substream id + data）の sector。残りは 0 で埋める（読み飛ばされる）。
+    private func sector(id: UInt8, headerData: Int = 0, substream: UInt8, payload: [UInt8]) -> Data {
+        var s = [UInt8](repeating: 0, count: 2048)
+        s.replaceSubrange(0..<14, with: [0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0x01, 0x89, 0xC3, 0xF8])
+        let length = 3 + headerData + 1 + payload.count
+        var pes: [UInt8] = [0, 0, 1, id, UInt8(length >> 8), UInt8(length & 0xFF), 0x81, 0x00, UInt8(headerData)]
+        pes += [UInt8](repeating: 0xFF, count: headerData) + [substream] + payload
+        s.replaceSubrange(14..<(14 + pes.count), with: pes)
+        return Data(s)
+    }
+
+    func testFirstUnitJoinsPayloadsAcrossSectorsAndStopsAtTheDeclaredSize() throws {
+        let rows: [[UInt8]] = (0..<10).map { r in (0..<30).map { UInt8(($0 + r) % 4) } }
+        let spu = [UInt8](makeSPU(pixels: rows, x: 5, y: 7, palette: [0, 1, 2, 3], contrast: [15, 15, 15, 15]))
+        let cut = spu.count / 2
+        var vob = Data()
+        vob.append(sector(id: 0xE0, substream: 0, payload: []).prefix(0))     // 映像の sector は混ぜない（読み飛ばし）
+        vob.append(sector(id: 0xE0, headerData: 0, substream: 0xAA, payload: [1, 2, 3]))
+        vob.append(sector(id: 0xBD, headerData: 5, substream: 0x20, payload: Array(spu[0..<cut])))
+        vob.append(sector(id: 0xBD, substream: 0x20, payload: Array(spu[cut...]) + [0xEE, 0xEE, 0xEE]))   // 次の SPU の頭（切り捨てる）
+        let unit = try XCTUnwrap(SubpictureDecoder.firstUnit(fromProgramStream: vob))
+        XCTAssertEqual([UInt8](unit), spu, "複数の PES に分かれた SPU を、宣言サイズちょうどでつなげる")
+        let decoded = try XCTUnwrap(SubpictureDecoder.decode(unit))
+        XCTAssertEqual(decoded.width, 30); XCTAssertEqual(decoded.height, 10)
+        XCTAssertEqual(decoded.x, 5); XCTAssertEqual(decoded.y, 7)
+    }
+
+    func testFirstUnitCanBeRestrictedToASubstreamAndReturnsNilWhenThereIsNone() {
+        let spu = [UInt8](makeSPU(pixels: [[0, 1], [1, 0]], x: 0, y: 0, palette: [0, 1, 2, 3], contrast: [15, 15, 15, 15]))
+        var vob = Data()
+        vob.append(sector(id: 0xBD, substream: 0x21, payload: spu))
+        XCTAssertNotNil(SubpictureDecoder.firstUnit(fromProgramStream: vob))
+        XCTAssertNotNil(SubpictureDecoder.firstUnit(fromProgramStream: vob, substream: 0x21))
+        XCTAssertNil(SubpictureDecoder.firstUnit(fromProgramStream: vob, substream: 0x20), "指定した substream が無い")
+        XCTAssertNil(SubpictureDecoder.firstUnit(fromProgramStream: Data(count: 2048 * 3)), "字幕が無い")
+        XCTAssertNil(SubpictureDecoder.firstUnit(fromProgramStream: Data()))
+    }
 }
+

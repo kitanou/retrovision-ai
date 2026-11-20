@@ -107,6 +107,8 @@ final class VideoLayerView: NSView {
     /// transport バー再表示のための活動配線（#22 の実装補完。nil の間は nobody に等しい）。
     /// local monitor とは独立の配送経路（両方届いても showControls は冪等なので無害）。
     var onControlsActivity: (@MainActor () -> Void)?
+    /// DVD メニューのマウス操作（view 内の位置・view の大きさ・クリックか）。
+    var onPointer: (@MainActor (_ x: Double, _ y: Double, _ width: Double, _ height: Double, _ click: Bool) -> Void)?
 
     convenience override init(frame frameRect: NSRect) {
         self.init(mode: .current, frame: frameRect)
@@ -172,7 +174,18 @@ final class VideoLayerView: NSView {
     /// showControls は冪等なので無害。
     override func mouseMoved(with event: NSEvent) {
         onControlsActivity?()
+        reportPointer(event, click: false)
         super.mouseMoved(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        reportPointer(event, click: true)
+        super.mouseDown(with: event)
+    }
+
+    private func reportPointer(_ event: NSEvent, click: Bool) {
+        let p = convert(event.locationInWindow, from: nil)   // isFlipped なので左上原点
+        onPointer?(Double(p.x), Double(p.y), Double(bounds.width), Double(bounds.height), click)
     }
 }
 
@@ -183,10 +196,13 @@ struct VideoSurfaceView: NSViewRepresentable {
     /// transport バー再表示の活動配線（#22。window の mouse-moved 生成と owner 配送の
     /// 受け口を確保した上で、View 側に「動きをactivityとして扱う」意図を渡す）。
     var onActivity: (@MainActor () -> Void)? = nil
+    /// DVD メニューのマウス操作の受け口。
+    var onPointer: (@MainActor (_ x: Double, _ y: Double, _ width: Double, _ height: Double, _ click: Bool) -> Void)? = nil
 
     func makeNSView(context: Context) -> VideoLayerView {
         let view = VideoLayerView()
         view.onControlsActivity = onActivity
+        view.onPointer = onPointer
         view.onDrawableResized = onResize
         switch view.mode {
         case .legacy: onLayer(.legacy(view.videoLayer))
@@ -197,6 +213,7 @@ struct VideoSurfaceView: NSViewRepresentable {
 
     func updateNSView(_ nsView: VideoLayerView, context: Context) {
         nsView.onControlsActivity = onActivity
+        nsView.onPointer = onPointer
         nsView.onDrawableResized = onResize
         nsView.needsLayout = true
     }
