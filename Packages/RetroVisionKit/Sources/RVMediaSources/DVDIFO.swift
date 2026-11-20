@@ -72,6 +72,9 @@ public struct DVDTitleSetInfo: Sendable {
     public let menus: [DVDMenuPGC]
     public let timeline: DVDSectorTimeline
 
+    /// IFO が無い・読めないときの空の情報（タイトルもメニューも持たない）。
+    public static let empty = DVDTitleSetInfo(titles: [], titlePGCs: [], menus: [], timeline: DVDSectorTimeline(cells: []))
+
     public func title(_ number: Int) -> DVDTitle? { titles.first { $0.number == number } }
     /// タイトル number のチャプター ptt（どちらも 1 始まり）の開始時刻（VTS の VOB 群の先頭からの秒）。
     public func startTime(title number: Int, chapter ptt: Int) -> Double? {

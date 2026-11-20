@@ -74,6 +74,25 @@ fragment float4 rv_rgbPresent_v1(const VSOut in [[stage_in]],
     return float4(rgb.sample(s, q).rgb, 1.0);
 }
 
+// ---------- オーバーレイ（字幕・メニューのハイライト）: premultiplied の BGRA を映像の上に重ねる ----------
+//
+// 映像と同じ幾何（取り込み域 = sourceRect、目標比率の枠 = destRect）で重ねるので、画面の座標系の絵
+// （DVD の SPU は coded frame の 720x480）が映像に合う。ブレンドは pipeline 側（src + dst × (1 − srcα)）。
+
+struct OverlayParams {
+    float4 sourceRect;
+    float4 destRect;
+};
+
+fragment float4 rv_overlay_v1(const VSOut in [[stage_in]],
+                              constant OverlayParams& p [[buffer(0)]],
+                              texture2d<float> overlay [[texture(0)]],
+                              sampler s [[sampler(0)]]) {
+    float2 q = (in.uv - p.destRect.xy) / p.destRect.zw;
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return float4(0.0); }
+    return overlay.sample(s, p.sourceRect.xy + q * p.sourceRect.zw);
+}
+
 // ---------- colorConvert + bicubic（Catmull-Rom。ScaleFilter.highQuality。拡大時のみ使う） ----------
 //
 // 輝度だけ 4x4 tap の Catmull-Rom で補間する（SD → HD の拡大でエッジを鈍らせない）。
