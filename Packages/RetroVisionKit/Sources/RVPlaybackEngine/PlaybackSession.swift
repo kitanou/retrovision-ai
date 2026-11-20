@@ -154,6 +154,7 @@ public actor PlaybackSession {
 
     public func setVideoPresenter(_ presenter: (any VideoFramePresenter)?) {
         videoPresenter = presenter
+        presenter?.flush()   // presenter は session より長生き: 前の session の先読みを持ち越さない（設計 11 §6.3）
     }
 
     public func setRenderPlan(_ plan: RenderPlan?) {
@@ -341,6 +342,7 @@ public actor PlaybackSession {
         do { _ = try await demuxer.seek(to: target, tolerance: tolerance) }
         catch { outcome.errors.append("seek: \(String(describing: error))") }
         queue.removeAll()
+        videoPresenter?.flush()   // 先読みの入力と結果を捨てる（古い世代の結果は出さない — 設計 11 §6.3）
         cursor = nil
         streamDone = false
         flushDone = false
@@ -582,6 +584,8 @@ public actor PlaybackSession {
         }
         discardBefore = nil
         queue.append(frame)
+        // 先読み（設計 11 §6.1）: 提示より前に AI 段の推論を始める。復号順に同期で渡す（入力の組み立て順を保つ）。
+        videoPresenter?.prepare(frame, plan: renderPlan)
     }
     private var discardBefore: MediaTime?
     private var lastSamplePTS: MediaTime?

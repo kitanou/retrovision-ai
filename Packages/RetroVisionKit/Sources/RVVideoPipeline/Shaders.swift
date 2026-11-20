@@ -74,6 +74,153 @@ fragment float4 rv_rgbPresent_v1(const VSOut in [[stage_in]],
     return float4(rgb.sample(s, q).rgb, 1.0);
 }
 
+// ---------- RGB の最終拡大 v2（設計 11 §5.6。AI 段の後 / RGB 経路の最終 scale） ----------
+//
+// 軸ごとに倍率で核を選ぶ: 拡大（invScale <= 1）は Catmull-Rom（4 tap）、縮小は三角（tent）核を
+// 倍率に合わせて広げる（半径 = invScale 画素。1 回の bilinear sample では縮小で縞・モアレが出る —
+// PAL を 1080p に出すときの縦 0.9375 倍など）。重みは正規化する。片側の tap は 4 まで（縮小 1/4 まで正確）。
+// 8 bit の drawable へ書くので、量子化の段差を崩す ±0.5 LSB の ordered noise を足す（dither フラグ）。
+
+struct RGBPresentParams {
+    float4 destRect;
+    float2 invScale;   // 出力 1 画素あたりの入力画素数（軸ごと）
+    uint dither;
+    uint pad;
+};
+
+static float rv_catmullRom(float x) {
+    x = fabs(x);
+    if (x < 1.0) { return 1.5 * x * x * x - 2.5 * x * x + 1.0; }
+    if (x < 2.0) { return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0; }
+    return 0.0;
+}
+
+static float rv_resampleWeight(float d, float invScale) {
+    if (invScale <= 1.0) { return rv_catmullRom(d); }
+    return max(0.0, 1.0 - fabs(d) / invScale);
+}
+
+fragment float4 rv_rgbPresent_v2(const VSOut in [[stage_in]],
+                                 constant RGBPresentParams& p [[buffer(0)]],
+                                 texture2d<float, access::read> rgb [[texture(0)]]) {
+    float2 q = (in.uv - p.destRect.xy) / p.destRect.zw;
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { return float4(0.0, 0.0, 0.0, 1.0); }
+    float2 size = float2(rgb.get_width(), rgb.get_height());
+    float2 pos = q * size - 0.5;
+    float2 radius = float2(p.invScale.x <= 1.0 ? 2.0 : min(p.invScale.x, 4.0),
+                           p.invScale.y <= 1.0 ? 2.0 : min(p.invScale.y, 4.0));
+    int2 lo = int2(ceil(pos - radius)), hi = int2(floor(pos + radius));
+    int2 maxC = int2(size) - 1;
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    for (int j = lo.y; j <= hi.y; j++) {
+        float wy = rv_resampleWeight(float(j) - pos.y, p.invScale.y);
+        if (wy == 0.0) { continue; }
+        for (int i = lo.x; i <= hi.x; i++) {
+            float wx = rv_resampleWeight(float(i) - pos.x, p.invScale.x);
+            if (wx == 0.0) { continue; }
+            int2 c = clamp(int2(i, j), int2(0), maxC);
+            acc += wx * wy * rgb.read(uint2(c)).rgb;
+            wsum += wx * wy;
+        }
+    }
+    float3 c = acc / max(wsum, 1e-6);
+    if (p.dither != 0u) {
+        float n = fract(52.9829189 * fract(dot(in.pos.xy, float2(0.06711056, 0.00583715))));
+        c += (n - 0.5) / 255.0;
+    }
+    return float4(clamp(c, 0.0, 1.0), 1.0);
+}
+
+// ---------- SR の 16 bit テンソル（NCHW planar）の詰め込み / 展開（設計 11 §5.4） ----------
+//
+// テンソル texture は r16Float、幅 W × 高さ 3H（R の面・G の面・B の面を縦に積む）。
+
+kernel void rv_pack_nchw_f16_v1(texture2d<float, access::read>  rgb    [[texture(0)]],
+                                texture2d<float, access::write> tensor [[texture(1)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint w = rgb.get_width(), h = rgb.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float3 c = rgb.read(gid).rgb;
+    tensor.write(float4(c.r), uint2(gid.x, gid.y));
+    tensor.write(float4(c.g), uint2(gid.x, gid.y + h));
+    tensor.write(float4(c.b), uint2(gid.x, gid.y + 2u * h));
+}
+
+kernel void rv_unpack_nchw_f16_v1(texture2d<float, access::read>  tensor [[texture(0)]],
+                                  texture2d<float, access::write> rgb    [[texture(1)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint w = rgb.get_width(), h = rgb.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float r = tensor.read(uint2(gid.x, gid.y)).r;
+    float g = tensor.read(uint2(gid.x, gid.y + h)).r;
+    float b = tensor.read(uint2(gid.x, gid.y + 2u * h)).r;
+    rgb.write(float4(clamp(float3(r, g, b), 0.0, 1.0), 1.0), gid);
+}
+
+// ---------- SR のタイル（設計 11 §5.4、D4 の予備）: 切り出しと重みつき合成（GPU） ----------
+//
+// 切り出し: 全画面のテンソル（W×3H）から、(x, y) を左上とするタイル（tw×3th）を写す。
+// 合成: 各タイルの出力（tw·s × 3·th·s）を、出力全体の累積 texture（rgba32Float: rgb = Σ w·値、a = Σ w）へ
+// 足し込む。重みは TilePlan.axisWeight と同じ（隣と重なる側だけ、重なり幅で 0→1）。タイルごとの dispatch は
+// 同じ encoder 内で直列に実行される（既定の serial dispatch）。最後に正規化して planar のテンソルへ書く。
+
+struct TensorTileParams {
+    uint2 origin;      // 出力全体での左上（出力 px）
+    uint2 size;        // タイルの出力寸法
+    uint4 neighbours;  // x: 左あり、y: 右あり、z: 上あり、w: 下あり
+    uint ramp;         // 重なり幅（出力 px）
+    uint pad0, pad1, pad2;
+};
+
+kernel void rv_tensor_crop_v1(texture2d<float, access::read>  src  [[texture(0)]],
+                              texture2d<float, access::write> tile [[texture(1)]],
+                              constant uint2& origin [[buffer(0)]],
+                              constant uint2& srcSize [[buffer(1)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint tw = tile.get_width(), th = tile.get_height() / 3u;
+    if (gid.x >= tw || gid.y >= th) return;
+    for (uint c = 0; c < 3u; c++) {
+        float v = src.read(uint2(origin.x + gid.x, c * srcSize.y + origin.y + gid.y)).r;
+        tile.write(float4(v), uint2(gid.x, c * th + gid.y));
+    }
+}
+
+static float rv_tileAxisWeight(uint u, uint length, bool hasPrev, bool hasNext, uint ramp) {
+    float r = float(max(ramp, 1u)) + 1.0;
+    float w = 1.0;
+    if (hasPrev) { w = min(w, float(u + 1u) / r); }
+    if (hasNext) { w = min(w, float(length - u) / r); }
+    return w;
+}
+
+kernel void rv_tensor_tile_accumulate_v1(texture2d<float, access::read>       tile [[texture(0)]],
+                                         texture2d<float, access::read_write> acc  [[texture(1)]],
+                                         constant TensorTileParams& p [[buffer(0)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.size.x || gid.y >= p.size.y) return;
+    float w = rv_tileAxisWeight(gid.x, p.size.x, p.neighbours.x != 0u, p.neighbours.y != 0u, p.ramp)
+            * rv_tileAxisWeight(gid.y, p.size.y, p.neighbours.z != 0u, p.neighbours.w != 0u, p.ramp);
+    float3 v = float3(tile.read(uint2(gid.x, gid.y)).r,
+                      tile.read(uint2(gid.x, p.size.y + gid.y)).r,
+                      tile.read(uint2(gid.x, 2u * p.size.y + gid.y)).r);
+    uint2 o = p.origin + gid;
+    float4 cur = acc.read(o);
+    acc.write(float4(cur.rgb + w * v, cur.a + w), o);
+}
+
+kernel void rv_tensor_tile_resolve_v1(texture2d<float, access::read>  acc [[texture(0)]],
+                                      texture2d<float, access::write> out [[texture(1)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    uint w = acc.get_width(), h = acc.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float4 a = acc.read(gid);
+    float3 v = a.a > 0.0 ? a.rgb / a.a : float3(0.0);
+    out.write(float4(v.r), uint2(gid.x, gid.y));
+    out.write(float4(v.g), uint2(gid.x, gid.y + h));
+    out.write(float4(v.b), uint2(gid.x, gid.y + 2u * h));
+}
+
 // ---------- オーバーレイ（字幕・メニューのハイライト）: premultiplied の BGRA を映像の上に重ねる ----------
 //
 // 映像と同じ幾何（取り込み域 = sourceRect、目標比率の枠 = destRect）で重ねるので、画面の座標系の絵
@@ -219,8 +366,10 @@ kernel void rv_deint_bob_v1(texture2d<float, access::read>  inY  [[texture(0)]],
     uint srcRow = (gid.y / 2u) * 2u + (topFieldFirst ? 0u : 1u);
     float v = inY.read(uint2(gid.x, srcRow)).r;
     outY.write(float4(v, 0.0, 0.0, 1.0), gid);
+    // 色も同じ field の chroma 行だけを行複製する（chroma 行も field 交互。輝度と同じ規則）。
     if (gid.x < w / 2u && gid.y < h / 2u) {
-        outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+        uint cSrc = min((gid.y / 2u) * 2u + (topFieldFirst ? 0u : 1u), h / 2u - 1u);
+        outUV.write(inUV.read(uint2(gid.x, cSrc)), uint2(gid.x, gid.y));
     }
 }
 
@@ -261,8 +410,19 @@ kernel void rv_deint_edgeDirected_v1(texture2d<float, access::read>  inY  [[text
         float vd = inY.read(uint2(clamp(x - bestA, 0, W), yd)).r;
         outY.write(float4((vu + vd) * 0.5, 0.0, 0.0, 1.0), gid);
     }
+    // 色（4:2:0）も field 交互（偶数 chroma 行 = 保持した上 field）。前 frame が無い = 全画素を
+    // 「動き」とみなすのと同じで、奇数 chroma 行は保持 field の上下の行から補間する（motion-adaptive の
+    // 動く画素と同じ規則。weave すると別の瞬間の色が混ざり、動く edge に点線状の色ずれが出る）。
     if (gid.x < w / 2u && gid.y < h / 2u) {
-        outUV.write(inUV.read(uint2(gid.x, gid.y)), uint2(gid.x, gid.y));
+        int cy = int(gid.y), cH = int(h / 2u) - 1;
+        float2 c = inUV.read(gid).rg;
+        if ((cy & 1) == 1) {
+            float2 up = inUV.read(uint2(gid.x, uint(max(cy - 1, 0)))).rg;
+            float2 down = inUV.read(uint2(gid.x, uint(min(cy + 1, cH)))).rg;
+            // 下端で奇数行の下が無いときは上の行だけ（cy + 1 > cH なら down は自分 = 別 field なので使わない）
+            c = (cy + 1 <= cH) ? (up + down) * 0.5 : up;
+        }
+        outUV.write(float4(c.x, c.y, 0.0, 1.0), gid);
     }
 }
 
