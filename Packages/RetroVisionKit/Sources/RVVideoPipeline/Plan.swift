@@ -139,6 +139,25 @@ public struct ColorConvertParameters: StageParameters, Sendable {
 /// 値だけをここで受ける。nil / 0 は「この段を実行しない」（learned 実装は ML 段が担当する）。
 public protocol LumaChromaDenoiseRequest: StageParameters {
     var metalDenoiseStrength: Double? { get }
+    /// 実行する target（設計 11 §5.2）。空なら段を実行しない。
+    var metalDenoiseTargets: MetalDenoiseTargets { get }
+    /// texture の原点の符号化座標（ブロック格子の位相。D11）。graph が取り込む texture は符号化座標そのもの
+    /// （切り出しは色変換の段）なので既定は (0, 0)。
+    var metalDenoiseGridOrigin: (x: Int, y: Int) { get }
+}
+
+public extension LumaChromaDenoiseRequest {
+    var metalDenoiseTargets: MetalDenoiseTargets { [.blocking, .chromaNoise] }
+    var metalDenoiseGridOrigin: (x: Int, y: Int) { (0, 0) }
+}
+
+/// 非 AI のアーティファクト除去の target（RVEnhancement の `DenoiseParameters.Artifact` の写し）。
+public struct MetalDenoiseTargets: OptionSet, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    public static let blocking = MetalDenoiseTargets(rawValue: 1 << 0)
+    public static let ringing = MetalDenoiseTargets(rawValue: 1 << 1)
+    public static let chromaNoise = MetalDenoiseTargets(rawValue: 1 << 2)
 }
 
 public struct ScaleParameters: StageParameters, Sendable {
