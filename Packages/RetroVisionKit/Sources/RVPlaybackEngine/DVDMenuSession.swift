@@ -32,15 +32,17 @@ final class DVDMenuSession {
     let vtsNumber: Int
     let codedWidth: Int, codedHeight: Int
     private(set) var state: DVDMenuState
-    private(set) var registers = DVDRegisters.initial()
+    /// レジスタ（GPRM / SPRM）。メニュー・本編を通して持ち回る（engine が渡し、変わったら受け取る）。
+    private(set) var registers: DVDRegisters
 
-    init(data: DVDMenuData, item: ItemID, vtsNumber: Int) {
+    init(data: DVDMenuData, item: ItemID, vtsNumber: Int, registers: DVDRegisters = .initial()) {
+        self.registers = registers
         self.data = data; self.item = item; self.vtsNumber = vtsNumber
         self.codedWidth = data.canvasWidth; self.codedHeight = data.canvasHeight
         self.state = DVDMenuState(highlight: data.pci.highlight)
         // メニューの PRE コマンドを評価して、初期のボタン選択（SPRM 8）を決める。
-        _ = DVDVM.run(data.preCommands, registers: &registers)
-        state.select(button: registers.highlightedButton)
+        _ = DVDVM.run(data.preCommands, registers: &self.registers)
+        state.select(button: self.registers.highlightedButton)
     }
 
     func render() -> OverlayImage { DVDMenuOverlayRenderer.render(data, state: state) }

@@ -158,9 +158,12 @@ public protocol PlayerEngine: AnyObject {
     var isMenuActive: Bool { get }
     /// メニューへの入力。処理した（メニューが有効だった）なら true。
     @discardableResult func menuInput(_ input: MenuInput) async -> Bool
+    /// 再生中のタイトルから DVD のタイトルメニューへ戻る（メニューが無ければ何もしない）。
+    func showMenu() async
 }
 
 public extension PlayerEngine {
     var isMenuActive: Bool { false }
     func menuInput(_ input: MenuInput) async -> Bool { false }
+    func showMenu() async {}
 }

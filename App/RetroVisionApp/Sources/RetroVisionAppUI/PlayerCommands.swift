@@ -48,6 +48,8 @@ struct PlayerCommands: Commands {
             Divider()
             Button("メニューのボタンを決定") { model.menuActivate() }
                 .keyboardShortcut(.return, modifiers: [])
+            Button("DVD メニューへ戻る") { model.showDVDMenu() }
+                .keyboardShortcut("t", modifiers: .command)
         }
         CommandMenu("映像") {
             Picker("比率", selection: Binding(get: { model.aspectPolicy },
