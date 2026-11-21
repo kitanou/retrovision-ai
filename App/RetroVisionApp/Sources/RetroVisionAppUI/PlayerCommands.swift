@@ -57,14 +57,14 @@ struct PlayerCommands: Commands {
                 Text("16:9").tag(AspectPolicy.explicit(.dar16x9))
             }
             Divider()
-            // 強調化は Phase 3–4 で実働（#17 §3 のプレースホルダ方針: 形だけ先に載せる）。
-            Menu("強調化プリセット") {
-                Button("オフ（Phase 1 の実動作）") {}.disabled(true)
-                Button("控えめ（準備中）") {}.disabled(true)
-                Button("標準（準備中）") {}.disabled(true)
-                Button("最大（準備中）") {}.disabled(true)
+            Picker("強調化", selection: Binding(get: { model.enhancementPreset },
+                                              set: { model.enhancementPreset = $0 })) {
+                ForEach(EnhancementPreset.allCases, id: \.self) { Text($0.displayName).tag($0) }
             }
-            .disabled(true)
+            Button(model.enhancementPreset == .off ? "強調化をオンにする" : "強調化をオフにする") {
+                model.enhancementPreset = model.enhancementPreset == .off ? .standard : .off
+            }
+            .keyboardShortcut("e", modifiers: .command)
         }
         CommandGroup(replacing: .toolbar) {
             Button("全画面") { model.setFullscreen(NSApp.keyWindow) }

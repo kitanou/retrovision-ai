@@ -103,6 +103,36 @@ public struct PlayerSettings: Sendable, Hashable {
     }
 }
 
+/// UI が選ぶ強調化のプリセット（RVEnhancement を import できない App 向けの語彙。07 §5）。
+public enum EnhancementPreset: String, Sendable, CaseIterable, Hashable {
+    case off, conservative, standard, maximum
+
+    public var policy: EnhancementPolicy {
+        switch self {
+        case .off: return .presetOff
+        case .conservative: return .presetConservative
+        case .standard: return .presetStandard
+        case .maximum: return .presetMaximum
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .off: return "オフ"
+        case .conservative: return "控えめ"
+        case .standard: return "標準"
+        case .maximum: return "最大"
+        }
+    }
+}
+
+public extension PlayerSettings {
+    var preset: EnhancementPreset {
+        get { EnhancementPreset.allCases.first { $0.policy == enhancement } ?? .standard }
+        set { enhancement = newValue.policy }
+    }
+}
+
 public struct AdvancedSettings: Sendable, Hashable {
     public var maxDecodedFrameQueue: Int
     public var metricsEnabled: Bool

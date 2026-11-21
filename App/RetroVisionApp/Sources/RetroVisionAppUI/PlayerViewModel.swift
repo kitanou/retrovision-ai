@@ -66,6 +66,10 @@ final class PlayerViewModel {
     var aspectPolicy: AspectPolicy = .followSource {
         didSet { Task { await engine.apply(currentSettings()) } }
     }
+    /// 強調化のプリセット。変更は次の frame から効く（INV-3。engine が plan を差し替える）。
+    var enhancementPreset: EnhancementPreset = .standard {
+        didSet { Task { await engine.apply(currentSettings()) } }
+    }
     var timelineScrubbing: Bool = false
 
     let engine: any PlayerEngine
@@ -447,6 +451,7 @@ final class PlayerViewModel {
     private func currentSettings() -> PlayerSettings {
         var settings = PlayerSettings()
         settings.aspectPolicy = aspectPolicy
+        settings.preset = enhancementPreset
         return settings
     }
 }
