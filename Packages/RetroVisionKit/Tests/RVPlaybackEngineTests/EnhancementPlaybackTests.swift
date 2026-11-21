@@ -400,3 +400,17 @@ final class EnhancementPlaybackTests: XCTestCase {
         await engine.detachEnhancement()
     }
 }
+
+final class EnhancementPresetTests: XCTestCase {
+    func testPresetsRoundTripThroughSettings() {
+        for preset in EnhancementPreset.allCases {
+            var settings = PlayerSettings()
+            settings.preset = preset
+            XCTAssertEqual(settings.preset, preset)
+        }
+        var s = PlayerSettings(); s.preset = .off
+        XCTAssertEqual(s.enhancement.tier, .off)
+        s.preset = .maximum
+        XCTAssertEqual(s.enhancement.tier, .fullML)
+    }
+}
