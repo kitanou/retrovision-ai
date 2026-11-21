@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 REQUIRED_FIXTURE_KEYS = {"id", "status", "kind", "sha256", "seconds", "properties", "license", "expectations"}
-VALID_KINDS = {"videoTsFolder", "discImage", "plainFile", "opticalDisc", "generatedFile"}
-VALID_STATUS = {"pending", "available", "generated"}
+VALID_KINDS = {"videoTsFolder", "discImage", "plainFile", "opticalDisc", "generatedFile", "localExtract"}
+VALID_STATUS = {"pending", "available", "generated", "local"}
 
 
 def main() -> int:
