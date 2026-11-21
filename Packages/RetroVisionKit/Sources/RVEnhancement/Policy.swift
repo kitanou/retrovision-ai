@@ -189,5 +189,13 @@ public enum StageGraphBuilder {
 /// graph（RVVideoPipeline）へ渡す値。metalGuided 実装のときだけ強さを返す（learned は ML 段）。
 extension DenoiseParameters: LumaChromaDenoiseRequest {
     public var metalDenoiseStrength: Double? { implementation == .metalGuided ? strength : nil }
+    /// `.mosquito`（P7b）と `.grain`（触らない）は、この段には対応する処理が無い。
+    public var metalDenoiseTargets: MetalDenoiseTargets {
+        var t: MetalDenoiseTargets = []
+        if targets.contains(.blocking) { t.insert(.blocking) }
+        if targets.contains(.ringing) { t.insert(.ringing) }
+        if targets.contains(.chromaNoise) { t.insert(.chromaNoise) }
+        return t
+    }
 }
 

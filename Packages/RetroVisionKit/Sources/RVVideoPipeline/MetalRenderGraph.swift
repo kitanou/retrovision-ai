@@ -121,9 +121,11 @@ public final class MetalRenderGraph: @unchecked Sendable {
         }
 
         // 2b. ノイズ除去（非 AI の metalGuided。plan に denoise 段があり強さ > 0 のときだけ）
-        if let strength = (plan.stage(of: .denoise)?.parameters as? any LumaChromaDenoiseRequest)?.metalDenoiseStrength,
-           strength > 0 {
+        if let request = plan.stage(of: .denoise)?.parameters as? any LumaChromaDenoiseRequest,
+           let strength = request.metalDenoiseStrength, strength > 0, !request.metalDenoiseTargets.isEmpty {
             try encodeDenoise(strength: Float(min(max(strength, 0), 1)),
+                              targets: request.metalDenoiseTargets,
+                              origin: request.metalDenoiseGridOrigin,
                               y: yTex, uv: uvTex, into: &yTex, uvOut: &uvTex,
                               interim: &interimTextures, command: command)
             timing.denoiseApplied = true
@@ -283,39 +285,70 @@ public final class MetalRenderGraph: @unchecked Sendable {
         _ = stageBegan
     }
 
-    private func encodeDenoise(strength: Float,
+    /// アーティファクト除去（設計 11 §5.2）。target ごとに kernel を直列に並べ、変えない plane は通す。
+    private func encodeDenoise(strength: Float, targets: MetalDenoiseTargets, origin: (x: Int, y: Int),
                                y: any MTLTexture, uv: any MTLTexture,
                                into yOut: inout any MTLTexture, uvOut: inout any MTLTexture,
                                interim: inout [any MTLTexture],
                                command: any MTLCommandBuffer) throws {
         let w = y.width, h = y.height
-        guard let outY = pool.acquire(width: w, height: h, format: .r8Unorm,
-                                      usage: [.shaderRead, .shaderWrite]),
-              let outUV = pool.acquire(width: w / 2, height: h / 2, format: .rg8Unorm,
-                                      usage: [.shaderRead, .shaderWrite]) else {
-            throw PlaybackError(kind: .render(.memoryLimit),
-                                recovery: .retryWith(.lowerTier),
-                                userMessage: "中間テクスチャを確保できません")
+        func acquire(_ width: Int, _ height: Int, _ format: MTLPixelFormat) throws -> any MTLTexture {
+            guard let t = pool.acquire(width: width, height: height, format: format,
+                                       usage: [.shaderRead, .shaderWrite]) else {
+                throw PlaybackError(kind: .render(.memoryLimit),
+                                    recovery: .retryWith(.lowerTier),
+                                    userMessage: "中間テクスチャを確保できません")
+            }
+            interim.append(t)
+            return t
         }
-        interim.append(outY)
-        interim.append(outUV)
-        let pso = try context.computePipeline(function: "rv_denoise_metalGuided_v1", label: "denoise_metalGuided_v1")
-        guard let enc = command.makeComputeCommandEncoder() else {
-            throw PlaybackError(kind: .render(.deviceUnavailable),
-                                recovery: .retryWith(.lowerTier), userMessage: "encoder を作れません")
+        func run(_ function: String, label: String, input: any MTLTexture, output: any MTLTexture,
+                 extra: (any MTLComputeCommandEncoder) -> Void) throws {
+            let pso = try context.computePipeline(function: function, label: label)
+            guard let enc = command.makeComputeCommandEncoder() else {
+                throw PlaybackError(kind: .render(.deviceUnavailable),
+                                    recovery: .retryWith(.lowerTier), userMessage: "encoder を作れません")
+            }
+            enc.setComputePipelineState(pso)
+            enc.setTexture(input, index: 0)
+            enc.setTexture(output, index: 1)
+            extra(enc)
+            enc.dispatchThreads(MTLSize(width: output.width, height: output.height, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            enc.endEncoding()
         }
         var s = strength
-        enc.setComputePipelineState(pso)
-        enc.setTexture(y, index: 0)
-        enc.setTexture(uv, index: 1)
-        enc.setTexture(outY, index: 2)
-        enc.setTexture(outUV, index: 3)
-        enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
-        enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-        enc.endEncoding()
-        yOut = outY
-        uvOut = outUV
+        var currentY = y
+        if targets.contains(.blocking) {
+            var o = SIMD2<Int32>(Int32(origin.x), Int32(origin.y))
+            for direction in 0..<2 {
+                var d = UInt32(direction)
+                let out = try acquire(w, h, .r8Unorm)
+                try run("rv_deblock_v1", label: "deblock_v1", input: currentY, output: out) { enc in
+                    enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
+                    enc.setBytes(&o, length: MemoryLayout<SIMD2<Int32>>.stride, index: 1)
+                    enc.setBytes(&d, length: MemoryLayout<UInt32>.stride, index: 2)
+                }
+                currentY = out
+            }
+        }
+        if targets.contains(.ringing) {
+            let out = try acquire(w, h, .r8Unorm)
+            try run("rv_ringing_v1", label: "ringing_v1", input: currentY, output: out) { enc in
+                enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
+            }
+            currentY = out
+        }
+        var currentUV = uv
+        if targets.contains(.chromaNoise) {
+            let out = try acquire(w / 2, h / 2, .rg8Unorm)
+            try run("rv_denoise_chroma_v1", label: "denoise_chroma_v1", input: uv, output: out) { enc in
+                enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
+            }
+            currentUV = out
+        }
+        yOut = currentY
+        uvOut = currentUV
     }
 
     // MARK: colorConvert + crop/letterbox/scale（単一 pass）
