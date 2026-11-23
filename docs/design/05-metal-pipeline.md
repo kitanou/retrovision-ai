@@ -53,12 +53,14 @@ MTLTextureDescriptor(pixelFormat: .r8Unorm / .rg8Unorm)  // NV12 の luminance /
 
 ```
 [fields] → deinterlace / inverse telecine → color convert → [scale to source display size]
-        → [AI: super-resolution] → [denoise / restoration] → [subtitle composite]
-        → [final scale to drawable] → present
+        → [AI: super-resolution] → [任意: 時間安定化]
+        → [final scale to drawable] → [subtitle composite] → present
 ```
 
-- AI 段の**後に**字幕を合成する（04 §7）。最終スケールで 4K 等のディスプレイに合わせる。
-- ノイズ除去を SR の前か後かに置く設定は 07 §5 で扱うが、既定は上（SR → denoise）とする。SR の前に置くと、モデルがノイズをディテールとして増幅する。
+（設計 11 の D1・D10 で改めた。アーティファクト除去は SR の**前**、字幕・メニューは最終拡大の**後**に drawable 上で合成する。）
+
+- 字幕は最終スケールの**後**に、表示解像度で合成する（設計 11 D10。04 §7 の「AI 段の後」は満たす）。輪郭が鋭く、SR の有無・出力寸法に依存しない。4K 等のディスプレイへは最終スケールで合わせる。
+- アーティファクト除去（ブロック・リンギング・色ノイズ）は SR の**前**に置く（設計 11 D1・§5.2）。SR はブロックノイズを細部として増幅するため。SR の後は、任意の時間安定化（設計 11 §5.5）だけを置く。07 §4 の `ProcessingOrder` の既定はこれに合わせて読み替える。
 - 字幕を合成しない frames（字幕なし区間）は plan から抜く（empty stage を埋めない）。
 
 ## 5. デインターレースとキャデンス
