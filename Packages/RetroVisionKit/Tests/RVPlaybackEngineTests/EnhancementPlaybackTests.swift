@@ -46,6 +46,7 @@ final class EnhancementPlaybackTests: XCTestCase {
             .appendingPathComponent("RVMLRuntimeTests/Models")
     }
     private let modelID = ModelID("test.tiny.invert@1")
+    private static let generousBudgetMS = 60_000.0
 
     /// tiny model の manifest に、plan が選べる条件（種類 superResolution・計測記録あり）をテスト内で足す。
     private func manifest() throws -> ModelManifest {
@@ -100,6 +101,10 @@ final class EnhancementPlaybackTests: XCTestCase {
         presenter.attachLayer(try makeLayer(size: size))
         presenter.setEnhancement(runtime: runtime, model: modelID,
                                  tiling: .init(tileWidth: 32, tileHeight: 32, overlap: 8))
+        // 既定の期限（表示長 × 4 ≒ 133ms）は実時間。負荷の高い runner（nightly の --parallel）では
+        // 初回の Core ML 推論が間に合わず「強調された」を前提にする検査が揺れる。経路の検査では期限を外し、
+        // 取りこぼしを見る検査だけが負の値で期限切れを作る。
+        presenter.enhancementBudgetMS = Self.generousBudgetMS
         return presenter
     }
 
@@ -314,7 +319,7 @@ final class EnhancementPlaybackTests: XCTestCase {
         presenter.enhancementBudgetMS = -1_000
         for i in 1...2 { try await run(i) }                 // 期限切れの取りこぼし → 3 サンプル中 2 → 停止
         XCTAssertEqual(presenter.statistics.suspensions, 1)
-        presenter.enhancementBudgetMS = nil
+        presenter.enhancementBudgetMS = Self.generousBudgetMS
         try await run(10)
         XCTAssertEqual(presenter.statistics.suspended, 1, "止めている間に推論した")
         XCTAssertEqual(presenter.statistics.enhanced, 1)
